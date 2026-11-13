@@ -588,8 +588,8 @@ extern "C" {
     // src0, so weights that the engine fills itself - the MoE expert pools - can use them by being
     // wrapped in this buffer. The caller keeps the alignment (the pools are filled with O_DIRECT reads,
     // so they need 4096-byte alignment and the type's own allocator only promises TENSOR_ALIGNMENT).
-    GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
-    GGML_API ggml_backend_buffer_t      ggml_backend_cpu_repack_buffer_from_ptr(void * ptr, size_t size);
+    GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void);
+    GGML_BACKEND_API ggml_backend_buffer_t      ggml_backend_cpu_repack_buffer_from_ptr(void * ptr, size_t size);
     GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
 
 #ifdef  __cplusplus

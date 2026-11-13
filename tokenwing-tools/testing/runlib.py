@@ -11,6 +11,10 @@ PROMPTS = os.path.join(HERE, "prompts")
 
 def bin_dir(path):
     """Accepts a build directory or its bin directory."""
+    for sub in (("bin", "Release"), ("bin",)):
+        b = os.path.join(path, *sub)
+        if os.path.isdir(b) and any(f.startswith("llama-") for f in os.listdir(b)):
+            return b
     b = os.path.join(path, "bin")
     return b if os.path.isdir(b) else path
 

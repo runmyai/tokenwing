@@ -182,12 +182,17 @@ class GGUFHeader:
         self.parse()
 
     def parse(self):
-        fd = os.open(self.path, os.O_RDONLY)
+        fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
         try:
             n = 1 << 22
             while True:
                 try:
-                    self._parse_buf(os.pread(fd, n, 0))
+                    if hasattr(os, "pread"):
+                        buf = os.pread(fd, n, 0)
+                    else:
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        buf = os.read(fd, n)
+                    self._parse_buf(buf)
                     return
                 except Truncated:
                     if n >= self.file_size:
@@ -294,7 +299,7 @@ def build_index(path, io_align=IO_ALIGN):
         "n_expert_group_used": int(kv_get(hdr.kv, f"{arch}.expert_group_used_count", 0) or 0),
         "n_expert_shared": int(kv_get(hdr.kv, f"{arch}.expert_shared_count", 0) or 0),
         "n_embd": int(kv_get(hdr.kv, f"{arch}.embedding_length", 0) or 0),
-        "n_ff_exp": kv_get(hdr.kv, f"{arch}.expert_feed_forward_length"),
+        "n_ff_exp": kv_get(hdr.kv, f"{arch}.expert_feed_forward_length") or kv_get(hdr.kv, f"{arch}.feed_forward_length"),
         "n_ff_shexp": kv_get(hdr.kv, f"{arch}.expert_shared_feed_forward_length"),
         "alignment": hdr.alignment,
         "header_end": hdr.header_end,

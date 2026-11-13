@@ -109,6 +109,9 @@ struct ggml_riscv_arch_features_type {
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #define GGML_CACHE_ALIGN __declspec(align(GGML_CACHE_LINE))
+#endif
+
+#if defined(_MSC_VER) && !defined(__clang__) && defined(__STDC_NO_ATOMICS__)
 
 typedef volatile LONG atomic_int;
 typedef atomic_int atomic_bool;
@@ -488,9 +491,9 @@ struct ggml_threadpool {
 
     // synchronization primitives
     atomic_int n_graph;       // updated when there is work to be done (i.e each graph) holds graph and active thread counts.
-    atomic_int GGML_CACHE_ALIGN n_barrier;
-    atomic_int GGML_CACHE_ALIGN n_barrier_passed;
-    atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
+    GGML_CACHE_ALIGN atomic_int n_barrier;
+    GGML_CACHE_ALIGN atomic_int n_barrier_passed;
+    GGML_CACHE_ALIGN atomic_int current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
 
     // these are atomic as an annotation for thread-sanitizer
     atomic_bool stop;         // Used for stopping the threadpool altogether
@@ -2132,7 +2135,7 @@ static bool        g_ggml_moe_diag_printed  = false;
 static bool        g_ggml_moe_diag_printed2 = false;
 static bool        g_ggml_moe_diag_printed3 = false;
 static uint64_t    g_ggml_moe_diag[3][GGML_MAX_N_THREADS] = {{0}};
-static pthread_mutex_t g_ggml_moe_diag_mu = PTHREAD_MUTEX_INITIALIZER;
+static atomic_flag g_ggml_moe_diag_mu = ATOMIC_FLAG_INIT;
 
 // returns how long this thread waited, in us (0 when the slice was ready). A wait that started on a copy-back from
 // the VRAM pool in flight (the engine's flag, read at the first spin) is added to *cb_us instead and 0 is returned (no SSD wait)
@@ -2152,7 +2155,7 @@ static int64_t ggml_moe_wait_ready(const struct ggml_moe_pool_slots * e, int a, 
         }
         if (spins == 0) {
             t0 = ggml_time_us();
-            cbw = e->cb && a < e->cb_n && (__atomic_load_n(&e->cb[a], __ATOMIC_RELAXED) & 1) != 0;
+            cbw = e->cb && a < e->cb_n && (atomic_load_explicit((const _Atomic uint8_t *) &e->cb[a], memory_order_relaxed) & 1) != 0;
         }
 
         // _mm_pause() on x86, yield on aarch64. The window is ~1 ms, so polling with a pause is right:
@@ -2583,7 +2586,7 @@ static void ggml_compute_forward_mul_mat_id(
 
     if (ith == 0 && moe_wait && !g_ggml_moe_diag_printed3) {
         g_ggml_moe_diag_printed3 = true;
-        pthread_mutex_lock(&g_ggml_moe_diag_mu);
+        while (atomic_flag_test_and_set(&g_ggml_moe_diag_mu)) {}
         fprintf(stderr, "overlap diag: ne01=%" PRId64 " n_as=%d moe_no_overlap=%d\n",
                 ne01, n_as, (int) moe_no_overlap);
         for (int p = 0; p < 2; p++) {
@@ -2599,7 +2602,7 @@ static void ggml_compute_forward_mul_mat_id(
         }
         fprintf(stderr, "overlap diag:   pass 0 skipped %" PRIu64 " (sum over threads; pass0+pass1 should be n_as*threads)\n", sk);
         memset(g_ggml_moe_diag, 0, sizeof(g_ggml_moe_diag));
-        pthread_mutex_unlock(&g_ggml_moe_diag_mu);
+        atomic_flag_clear(&g_ggml_moe_diag_mu);
     }
 }
 

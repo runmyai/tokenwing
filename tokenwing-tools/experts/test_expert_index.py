@@ -120,7 +120,7 @@ def test_read_expert():
     idx = ExpertIndex.load(INDEX)
     fd = open_direct(idx.path)
     try:
-        blob = read_expert(fd, idx, idx.moe_layers[3], 42)
+        blob = read_expert(fd, idx, idx.moe_layers[min(3, len(idx.moe_layers) - 1)], min(42, idx.n_expert - 1))
     finally:
         os.close(fd)
     assert set(blob) == set(PROJS)

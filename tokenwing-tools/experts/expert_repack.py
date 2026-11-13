@@ -25,6 +25,7 @@ TOOLS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS))
 
 from expert_index import IO_ALIGN, PROJS, build_index, human  # noqa: E402
+from expert_io import open_file, pread_bytes, pread_into, pwrite_from  # noqa: E402
 
 SIDECAR_FORMAT = "tokenwing expert sidecar v1"
 DEFAULT_CHUNK = 32 << 20
@@ -77,14 +78,28 @@ class SeqReader:
         # The window may run past the tensor's end, or the last partial page of the tensor is
         # never loaded and the caller gets the mapping's zeros instead of its bytes
         limit = self.file_end if self.direct else self.end
-        want = min(self.chunk, limit - start)
+        avail = min(self.chunk, limit - start)
+        if avail <= 0:
+            raise EOFError(f"{self.start}: cannot read a full window at {self.cursor}")
         if self.direct:
-            want -= want % self.align
+            if start + avail == self.file_end:
+                want = -(-avail // self.align) * self.align
+                need = avail
+            else:
+                want = avail - avail % self.align
+                need = want
+        else:
+            want = avail
+            need = avail
         if want <= 0:
             raise EOFError(f"{self.start}: cannot read a full window at {self.cursor}")
         got = 0
-        while got < want:
-            n = os.preadv(self.fd, [self.view[got:got + want - got]], start + got)
+        while got < need:
+            sub = self.view[got:got + want - got]
+            try:
+                n = pread_into(self.fd, sub, start + got)
+            finally:
+                sub.release()
             if n == 0:
                 raise EOFError(f"{self.start}: short read at {start + got}")
             got += n
@@ -99,12 +114,12 @@ class SeqReader:
 def header_fingerprint(path, nbytes):
     """sha256 of the GGUF header region, to tie a sidecar to its source model."""
     h = hashlib.sha256()
-    fd = os.open(path, os.O_RDONLY)
+    fd = open_file(path, os.O_RDONLY)
     try:
         left = nbytes
         off = 0
         while left:
-            blk = os.pread(fd, min(left, 1 << 22), off)
+            blk = pread_bytes(fd, min(left, 1 << 22), off)
             if not blk:
                 raise EOFError(f"{path}: header region is only {off} bytes, wanted {nbytes}")
             h.update(blk)
@@ -201,7 +216,7 @@ def write_layer(dst, buf, readers, sizes, block, useful, per_write, base, n_expe
             if pad:
                 buf[i * block + useful:(i + 1) * block] = pad
         want = n * block
-        if os.pwritev(dst, [buf[:want]], base + e * block) != want:
+        if pwrite_from(dst, buf[:want], base + e * block) != want:
             raise OSError(f"short write for layer {layer} at expert {e}")
         written += want
         e += n
@@ -226,11 +241,11 @@ def repack(model_path, out_path, index=None, align=IO_ALIGN, chunk=DEFAULT_CHUNK
     layouts = {}
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | (os.O_DIRECT if use_direct else 0)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     # A split GGUF is several files; one fd each, and a layer reads from the shard its tensors are in
-    srcs = [os.open(sh["path"], os.O_RDONLY | (os.O_DIRECT if direct_read else 0))
+    srcs = [open_file(sh["path"], os.O_RDONLY, direct=direct_read)
             for sh in (m.get("shards") or [{"path": model_path}])]
-    dst = os.open(out_path, flags, 0o644)
+    dst = open_file(out_path, flags, 0o644, direct=use_direct)
 
     block_bytes = plan["read_bytes_per_expert"]
     single_block = len(block_bytes) == 1

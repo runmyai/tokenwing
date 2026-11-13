@@ -8,6 +8,8 @@ The tools are in `tokenwing-tools/`. They run on your own machine and compare ru
 python3 tokenwing-tools/testing/check.py --model SMALL.gguf --build build
 ```
 
+On Windows, `tokenwing-tools\testing\check_windows.cmd SMALL.gguf` finds Visual Studio's x64 C++ environment, configures `build-win` with Ninja if needed, and runs `check.py`.
+
 `SMALL.gguf` is any model with routed experts that fits in your RAM. A few GB is plenty. Logs and the experts file go in `tokenwing-check/` (`--work` changes it), which needs room for about the size of the model, twice over.
 
 | Step | What it proves |

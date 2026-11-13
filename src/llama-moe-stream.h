@@ -39,6 +39,9 @@ enum {
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 
 // TEST ONLY: MOE_STREAM_TEST_REQ_TIMES=1 - one stderr line "TT <us> <tag> <arg>" per step of a request (llama-server writes the
 // same lines from its side), on ggml_time_us = the server's own prompt clock; read once. Off: one test of a static bool per step
@@ -3144,7 +3147,11 @@ struct llama_moe_stream {
         aligned_buf() = default;
         aligned_buf(const aligned_buf &) = delete;
         aligned_buf & operator=(const aligned_buf &) = delete;
+#ifdef _WIN32
+        ~aligned_buf() { _aligned_free(p); }
+#else
         ~aligned_buf() { free(p); }
+#endif
     };
     mutable aligned_buf verify_buf;     // page-aligned scratch: the sidecar's bytes
     mutable aligned_buf verify_buf2;    // and the model's

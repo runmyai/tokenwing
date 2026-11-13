@@ -29,6 +29,8 @@ from expert_io import (  # noqa: E402
     ExpertIndex,
     load_sidecar,
     open_direct,
+    open_file,
+    pread_into,
     read_expert,
     read_expert_block,
     sidecar_block_range,
@@ -73,12 +75,15 @@ def test_repack_size_matches_plan():
     assert size == plan["sidecar_bytes"], (size, plan["sidecar_bytes"])
     assert size == plan["useful_bytes"] + plan["padding_bytes"]
     assert state["meta"]["sidecar_bytes"] == size
-    assert state["meta"]["padding_bytes"] == 0, state["meta"]["padding_bytes"]
+    assert state["meta"]["padding_bytes"] == plan["padding_bytes"], state["meta"]["padding_bytes"]
     assert state["meta"]["moe_layers"] == raw["model"]["moe_layers"]
     assert state["meta"]["n_expert"] == raw["model"]["n_expert"]
+    blk_desc = (human(state["meta"]["block_bytes"])
+                if state["meta"]["block_bytes"] is not None
+                else "/".join(human(b) for b in plan["read_bytes_per_expert"]))
     print(f"  plan {plan['sidecar_bytes']:,} B == file {size:,} B  "
-          f"({human(size)}), padding 0, {len(state['meta']['blocks'])} layers x "
-          f"{state['meta']['n_expert']} experts x {human(state['meta']['block_bytes'])}")
+          f"({human(size)}), padding {plan['padding_bytes']}, {len(state['meta']['blocks'])} layers x "
+          f"{state['meta']['n_expert']} experts x {blk_desc}")
 
 
 @test
@@ -143,8 +148,11 @@ def test_random_blocks_match_gguf():
     finally:
         os.close(fd_sc)
         os.close(fd_gg)
+    blk_desc = (f"{human(meta['block_bytes'])} B"
+                if meta["block_bytes"] is not None
+                else "/".join(human(b) for b in state["raw"]["repack_plan"]["read_bytes_per_expert"]))
     print(f"  {len(picks)} random (layer, expert) blocks identical to the GGUF slices, "
-          f"1 O_DIRECT read each ({human(meta['block_bytes'])} B)")
+          f"1 O_DIRECT read each ({blk_desc})")
 
 
 @test
@@ -172,7 +180,7 @@ def test_all_experts_match():
     sc.close()
     gg.close()
     state["full_check_seconds"] = dt
-    total = n * meta["block_bytes"]
+    total = meta["sidecar_bytes"]
     print(f"  {n:,} experts, {human(total)} compared in {dt:.1f} s "
           f"({2 * total / dt / 1e9:.2f} GB/s of compared data)")
 
@@ -180,9 +188,9 @@ def test_all_experts_match():
 def mmap_ro(path):
     import mmap
 
-    fd = os.open(path, os.O_RDONLY)
+    fd = open_file(path, os.O_RDONLY)
     try:
-        return mmap.mmap(fd, 0, prot=mmap.PROT_READ)
+        return mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
     finally:
         os.close(fd)
 
@@ -206,7 +214,7 @@ def test_read_benchmark():
     raw = state["raw"]
     rng = random.Random(4242)
     picks = [(rng.choice(meta["moe_layers"]), rng.randrange(meta["n_expert"])) for _ in range(BENCH_N)]
-    total_bytes = BENCH_N * meta["block_bytes"]
+    total_bytes = sum(meta["blocks"][str(il)]["block_bytes"] for il, _ in picks)
 
     def run_api(label, path, fetch):
         fds = [open_direct(path) for _ in range(BENTHREADS)]
@@ -253,9 +261,15 @@ def test_read_benchmark():
         mv = memoryview(buf)
 
         def work(i):
-            for o, l in per[i]:
-                os.preadv(fds[i], [mv[:l]], o)
-            os.close(fds[i])
+            try:
+                for o, l in per[i]:
+                    sub = mv[:l]
+                    try:
+                        pread_into(fds[i], sub, o)
+                    finally:
+                        sub.release()
+            finally:
+                os.close(fds[i])
 
         dt = timed([threading.Thread(target=work, args=(i,)) for i in range(BENTHREADS)])
         mv.release()

@@ -75,12 +75,12 @@ def main():
         print("1. build", flush=True)
         if not os.path.isdir(a.build):
             raise SystemExit("%s does not exist: configure it first, for example cmake -B build -DCMAKE_BUILD_TYPE=Release" % a.build)
-        result(subprocess.run(["cmake", "--build", a.build, "-j", str(a.j)]).returncode == 0, "the build")
+        result(subprocess.run(["cmake", "--build", a.build, "--config", "Release", "-j", str(a.j)]).returncode == 0, "the build")
         if fails:
             sys.exit(1)
     if not a.no_ctest:
         print("2. tests", flush=True)
-        r = subprocess.run(["ctest", "--test-dir", a.build, "-j", "1", "-E", "test-tokenizers-ggml-vocabs"], capture_output=True, text=True)
+        r = subprocess.run(["ctest", "--test-dir", a.build, "-C", "Release", "-j", "1", "-E", "test-tokenizers-ggml-vocabs"], capture_output=True, text=True)
         tail = [ln for ln in r.stdout.splitlines() if "tests passed" in ln or "tests failed" in ln]
         result(r.returncode == 0, "ctest", tail[-1].strip() if tail else "")
         if r.returncode:
@@ -89,8 +89,9 @@ def main():
     index = os.path.join(a.work, "model.index.json")
     if not os.path.exists(index):
         subprocess.run([sys.executable, os.path.join(tools, "expert_index.py"), a.model, "-o", index], capture_output=True)
-    env = dict(os.environ, TMPDIR=os.path.abspath(a.work))     # the repack test writes a file as large as the experts
-    for t, targs in (("test_expert_index.py", [a.model, index]), ("test_expert_repack.py", [a.model])):
+    wdir = os.path.abspath(a.work)
+    env = dict(os.environ, TMPDIR=wdir, TEMP=wdir, TMP=wdir)   # the repack test writes a file as large as the experts
+    for t, targs in (("test_expert_index.py", [a.model, index]), ("test_expert_repack.py", [a.model]), ("test_make_model_file.py", [])):
         r = subprocess.run([sys.executable, os.path.join(tools, t)] + targs, capture_output=True, text=True, cwd=tools, env=env)
         result(r.returncode == 0, t)
         if r.returncode:

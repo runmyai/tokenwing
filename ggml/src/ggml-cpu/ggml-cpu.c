@@ -1524,6 +1524,9 @@ static ggml_vec_dot_x4_t ggml_cpu_vec_dot_x4(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_MXFP4:  return ggml_vec_dot_mxfp4_q8_0_x4;
         case GGML_TYPE_IQ4_XS: return ggml_vec_dot_iq4_xs_q8_K_x4;
+        case GGML_TYPE_Q3_K:   return ggml_vec_dot_q3_K_q8_K_x4;
+        case GGML_TYPE_Q4_0:   return ggml_vec_dot_q4_0_q8_0_x4;
+        case GGML_TYPE_Q2_0:   return ggml_vec_dot_q2_0_q8_0_x4;
         default:               return NULL;
     }
 }
@@ -1857,7 +1860,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
                 int64_t ir0 = iir0;
 #ifdef GGML_CPU_HAVE_MXFP4_X4
-                // 4 rows per call for plain MXFP4; and IQ4_XS (same bits as the 1-row kernels, see ggml_cpu_vec_dot_x4)
+                // 4 rows per call where the weight type has a 4-row kernel (same bits as the 1-row kernels, see ggml_cpu_vec_dot_x4)
                 if (x4fn) {
                     for (; ir0 + 3 < iir0 + blck_0 && ir0 + 3 < ir0_end; ir0 += 4) {
                         x4fn(ne00, &tmp[ir0 - iir0], src0_cur + ir0*nb01, nb01, src1_col, x4, x4_pf);
@@ -4270,7 +4273,7 @@ static void ggml_compute_forward_mul_mat_id_one_token(const struct ggml_compute_
     const int x4    = params->threadpool->mxfp4_x4;
     const int x4_pf = params->threadpool->mxfp4_x4_pf;
 #ifdef GGML_CPU_HAVE_MXFP4_X4
-    const ggml_vec_dot_x4_t x4fn = x4 ? ggml_cpu_vec_dot_x4(type) : NULL;   // MXFP4 and IQ4_XS
+    const ggml_vec_dot_x4_t x4fn = x4 ? ggml_cpu_vec_dot_x4(type) : NULL;   // MXFP4, IQ4_XS, Q3_K, Q4_0 and Q2_0
 #endif
     int64_t waited = 0, waited_cb = 0;   // (the copy-back waits apart)
     const int n_chunks = n_ids * cpi;
@@ -4429,7 +4432,7 @@ static void ggml_compute_forward_moe_up_gate_fused(
     const int x4    = params->threadpool->mxfp4_x4;   // the graph's snapshot
     const int x4_pf = params->threadpool->mxfp4_x4_pf;
 #ifdef GGML_CPU_HAVE_MXFP4_X4
-    const ggml_vec_dot_x4_t x4fn = x4 ? ggml_cpu_vec_dot_x4(type) : NULL;   // MXFP4 and IQ4_XS
+    const ggml_vec_dot_x4_t x4fn = x4 ? ggml_cpu_vec_dot_x4(type) : NULL;   // MXFP4, IQ4_XS, Q3_K, Q4_0 and Q2_0
 #endif
     int64_t waited_g = 0, waited_u = 0, waited_cb_g = 0, waited_cb_u = 0;   // (the copy-back waits apart)
     const int n_chunks = n_ids * cpi;

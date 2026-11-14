@@ -4500,8 +4500,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--moe-stream-cpu-x4"}, "0|1|2",
-        "the CPU expert matmul on plain MXFP4 pools: 0 = one row per call (ggml's kernel), 1 = a 4-row AVX-512 VNNI kernel "
-        "with 256-bit registers, 2 = the same with 512-bit registers; exactly the same output; x86 only (default: 0; "
+        "the CPU expert matmul on plain MXFP4, IQ4_XS, Q3_K, Q4_0 and Q2_0 pools: 0 = one row per call (ggml's kernel), 1 = a 4-row "
+        "AVX-512 VNNI kernel with 256-bit registers, 2 = the same with 512-bit registers; exactly the same output; x86 only (default: 0; "
         "1 was the faster one on the CPU measured)",
         [](common_params & params, int value) {
             if (value < 0 || value > 2) {   // clamped with a warning

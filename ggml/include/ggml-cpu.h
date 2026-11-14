@@ -136,9 +136,9 @@ extern "C" {
 
     // The CPU MoE switches. Process-wide: every model in the process uses the last value set (two models: the last
     // one wins). Each graph compute takes one snapshot of them before its threads start.
-    // ggml_cpu_set_mxfp4_kernel: the kernel mul_mat_id uses on plain MXFP4: 0 = ggml_vec_dot_mxfp4_q8_0, one row per call
+    // ggml_cpu_set_mxfp4_kernel: the kernel mul_mat_id uses on plain MXFP4, IQ4_XS, Q3_K, Q4_0 and Q2_0: 0 = one row per call
     // (default); 1 = the 4-row AVX-512 VNNI kernel with 256-bit registers; 2 = the same with 512-bit registers. Same bits
-    // as kernel 0. prefetch_blocks: > 0 = that many 17-byte blocks ahead in the row, < 0 = the same block of the next
+    // as kernel 0. prefetch_blocks: > 0 = that many blocks ahead in the row, < 0 = the same block of the next
     // 4-row group, 0 = none (kernels 1 and 2 only; x86 only, other CPUs keep kernel 0).
     GGML_BACKEND_API void ggml_cpu_set_mxfp4_kernel(int kernel, int prefetch_blocks);
     // ggml_cpu_set_moe_fuse: run mul_mat_id(gate) + mul_mat_id(up) + swiglu (or Ling's clamped silu/clamp/mul) of one token

@@ -2490,8 +2490,9 @@ static void ggml_compute_forward_mul_mat_id(
         // ik's kernels, where they beat ours: enough rows routed to this expert (its bytes have landed: the wait above; each thread
         // does its share of the weight rows, no barrier). Otherwise - and whenever they cannot take it - ggml's own path
         if (iqk_node) {
-            const int iqk_min = ggml_cpu_get_iqk();
-            const bool take = cne1 >= (type == GGML_TYPE_Q8_0 ? MAX(8, iqk_min/4) : iqk_min) && iqk_port_can(type, cne1, ne00);
+            const int  iqk_min    = ggml_cpu_get_iqk();
+            const bool legacy_min = type == GGML_TYPE_Q2_0 || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0;
+            const bool take       = cne1 >= (legacy_min ? MAX(8, iqk_min/4) : iqk_min) && iqk_port_can(type, cne1, ne00);
             if (take) {
                 if (moe_wait && moe_slot0 + cur_a < moe_slots->n_as &&   // what the streaming check reads: the flag at the moment the kernels start
                         !atomic_load_explicit((const _Atomic uint32_t *) &moe_slots->ready[moe_slot0 + cur_a], memory_order_acquire)) {

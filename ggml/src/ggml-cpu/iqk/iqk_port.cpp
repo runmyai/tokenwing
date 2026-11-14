@@ -93,6 +93,7 @@ struct MulMat {
     }
     static bool prepare(int typeA, int typeB, int ne00, MulMat & mm) {
         switch (typeA) {
+            case GGML_TYPE_Q3_K:
             case GGML_TYPE_Q4_K:
             case GGML_TYPE_Q5_K:
             case GGML_TYPE_IQ4_XS:
@@ -101,6 +102,8 @@ struct MulMat {
                 return iqk_set_kernels_kquants(ne00, typeA, typeB, mm.funcs, mm.func16);
             case GGML_TYPE_IQ3_S:
                 return iqk_set_kernels_iquants(ne00, typeA, typeB, mm.funcs, mm.func16);
+            case GGML_TYPE_Q2_0:
+            case GGML_TYPE_Q4_0:
             case GGML_TYPE_Q8_0:
             case GGML_TYPE_Q8_1:
             case GGML_TYPE_Q8_0_R8:
@@ -119,10 +122,18 @@ struct MulMat {
         const int q8_k_type = GGML_TYPE_Q8_K_R8, q8_0_type = GGML_TYPE_Q8_0_R8, k_min_nrc_y = 32;
 #endif
         switch (type) {
+            case GGML_TYPE_Q3_K:
+#ifdef HAVE_FANCY_SIMD
+                return nrc_y >= k_min_nrc_y ? q8_k_type : type;
+#else
+                return type;
+#endif
             case GGML_TYPE_IQ4_XS: return nrc_y >= k_min_nrc_y ? q8_k_type : type;
             case GGML_TYPE_IQ3_S:  return nrc_y >= 32 ? q8_k_type : type;
             case GGML_TYPE_Q4_K:
             case GGML_TYPE_Q5_K:   return nrc_y >= 32 ? (int) GGML_TYPE_Q8_1 : type;
+            case GGML_TYPE_Q2_0:
+            case GGML_TYPE_Q4_0:   return nrc_y >= k_min_nrc_y ? q8_0_type : type;
             case GGML_TYPE_Q8_0:   return nrc_y >= 32 ? q8_0_type : type;
             default:               return type;
         }
@@ -335,12 +346,15 @@ static work_buffer_t & thread_local_work_buffer() {
 
 static bool convert_repack(int typeA, int n, const void * vx, size_t bx, void * vy, int nrc_x) {
     switch (typeA) {
+        case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_IQ4_XS:
             return iqk_convert_kquants_q8X_r8(typeA, n, vx, bx, vy, nrc_x);
         case GGML_TYPE_IQ3_S:
             return iqk_convert_iquants_q80_r8(typeA, n, vx, bx, vy, nrc_x);
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
             return iqk_convert_legacy_quants_q8_r8(typeA, n, vx, bx, vy, nrc_x);
         default:
@@ -355,7 +369,7 @@ extern "C" {
 int iqk_port_available(void) { return 1; }
 
 // which activation layout ik's kernels want: 1 = ik's Q8_K (our Q8_K rows converted), 2 = Q8_2_X4 (quantized from the floats)
-int iqk_port_b_kind(int type) { return type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ3_S ? 1 : 2; }
+int iqk_port_b_kind(int type) { return type == GGML_TYPE_Q3_K || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ3_S ? 1 : 2; }
 
 size_t iqk_port_b_row_size(int type, long n) {
     return iqk_port_b_kind(type) == 1 ? iqk_port_q8k_row_size(n) : (size_t) n / QK8_2 * sizeof(block_q8_2);
@@ -430,11 +444,15 @@ void iqk_port_q8_2_x4_row(const float * x, void * vy, long k) {
 
 int iqk_port_node_ok(int type, long ne00, long ne01) {
     switch (type) {
+        case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
             return ne00 % QK_K == 0 && ne01 % 16 == 0;   // whole blocks, weight rows the 16-row kernels can tile
+        case GGML_TYPE_Q2_0:
+            return ne00 % QK2_0 == 0 && ne01 % 16 == 0;
+        case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
             return ne00 % QK8_0 == 0 && ne01 % 16 == 0;
         default:
@@ -464,6 +482,11 @@ void iqk_port_q8k_quant_range(const float * x, void * ours_row, void * ik_row, l
 
 // can the kernels take an expert with Ny rows (the same test iqk_port_mmid makes)
 int iqk_port_can(int typeA, long Ny, long ne00) {
+#ifndef HAVE_FANCY_SIMD
+    if (typeA == GGML_TYPE_Q3_K && Ny > 32) {
+        return 0;   // without AVX-512 VNNI, ggml's tiled path overtakes Q3_K above 32 rows
+    }
+#endif
     MulMat mm;
     const int typeB = iqk_port_b_kind(typeA) == 1 ? (int) GGML_TYPE_Q8_K : GGML_TYPE_Q8_2_X4;
     const int dequant_type = MulMat::is_dequant_better(typeA, (int) Ny);

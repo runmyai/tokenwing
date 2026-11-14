@@ -168,7 +168,7 @@ extern "C" {
     GGML_BACKEND_API int64_t ggml_cpu_get_mmid_merge_count(void);   // the groups whose activation unpack was saved (all graphs)
 
     // ggml_cpu_set_iqk(N) = MUL_MAT_ID at prompt sizes (32+ tokens, x86 with AVX2 or AVX-512) uses ik_llama.cpp's kernels for the experts that
-    // get N or more rows (Q8_0: max(8, N/4)), in the formats where they win (Q4_K, Q5_K, IQ4_XS, IQ3_S, Q8_0; not Q6_K). Rounding-level differences.
+    // get N or more rows (Q2_0, Q4_0, Q8_0: max(8, N/4)), in the formats where they win (Q3_K, Q4_K, Q5_K, IQ4_XS, IQ3_S, Q2_0, Q4_0, Q8_0; not Q6_K). Rounding-level differences.
     // 0 = off (default); GGML_CPU_IQK=N also (test tools). Counts: experts computed by the port, experts it left to ggml's own path, their rows, experts started before their bytes landed (a stream test: must be 0)
     GGML_BACKEND_API void ggml_cpu_set_iqk(int min_rows);
     GGML_BACKEND_API int  ggml_cpu_get_iqk(void);

@@ -97,4 +97,30 @@ if (NOT ${AVX512_FOUND})
     set(GGML_AVX512 OFF)
 else()
     set(GGML_AVX512 ON)
+    set(AVX512_VNNI_CODE "
+        #include <immintrin.h>
+        int main()
+        {
+            __m512i a = _mm512_setzero_si512();
+            a = _mm512_dpbusd_epi32(a, a, a);
+            return _mm512_cvtsi512_si32(a);
+        }
+    ")
+    set(AVX512_VBMI_CODE "
+        #include <immintrin.h>
+        int main()
+        {
+            __m512i a = _mm512_setzero_si512();
+            a = _mm512_permutexvar_epi8(a, a);
+            return _mm512_cvtsi512_si32(a);
+        }
+    ")
+    check_sse("AVX512_VNNI" "/arch:AVX512")
+    if (${AVX512_VNNI_FOUND})
+        set(GGML_AVX512_VNNI ON)
+    endif()
+    check_sse("AVX512_VBMI" "/arch:AVX512")
+    if (${AVX512_VBMI_FOUND})
+        set(GGML_AVX512_VBMI ON)
+    endif()
 endif()

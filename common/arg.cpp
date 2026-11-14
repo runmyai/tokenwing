@@ -4607,7 +4607,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-stream-cpu-iqk"}, "N",
         "N > 0 = with --moe-stream: the CPU's picked-expert matmul (MUL_MAT_ID) in calls of 32+ tokens uses ik_llama.cpp's kernels (x86, AVX2 or AVX-512) for each "
-        "expert that gets N or more rows (Q8_0 experts: max(8, N/4)), for Q4_K, Q5_K, IQ4_XS, IQ3_S and Q8_0 weights; every other expert, format or machine keeps "
+        "expert that gets N or more rows (Q2_0, Q4_0 and Q8_0 experts: max(8, N/4)), for Q3_K, Q4_K, Q5_K, IQ4_XS, IQ3_S, Q2_0, Q4_0 and Q8_0 weights; every other expert, format or machine keeps "
         "the plain path. Replies are not touched. Rounding-level differences (default: 0 = off)",
         [](common_params & params, int value) {
             if (value < 0) {

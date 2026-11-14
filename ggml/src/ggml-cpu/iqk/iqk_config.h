@@ -10,6 +10,25 @@
 #undef IQK_IMPLEMENT
 #endif
 
+#ifdef _MSC_VER
+#define IQK_NOINLINE __declspec(noinline)
+#define IQK_ALWAYS_INLINE inline
+#if !defined __x86_64__ && defined _M_X64
+#define __x86_64__
+#endif
+#if defined(__AVX2__) || defined(__AVX512F__)
+#ifndef __FMA__
+#define __FMA__
+#endif
+#ifndef __F16C__
+#define __F16C__
+#endif
+#endif
+#else
+#define IQK_NOINLINE __attribute__((__noinline__))
+#define IQK_ALWAYS_INLINE __attribute__((__always_inline__))
+#endif
+
 // x86 only for now (not carried over to ARM)
 #if defined __AVX2__ && defined __x86_64__
 #define IQK_IMPLEMENT
@@ -27,17 +46,6 @@
 #    endif
 #else
 #    define IQK_API
-#endif
-
-#ifdef _MSC_VER
-#define IQK_NOINLINE __declspec(noinline)
-#define IQK_ALWAYS_INLINE inline
-#if !defined __x86_64__ && defined _M_X64
-#define __x86_64__
-#endif
-#else
-#define IQK_NOINLINE __attribute__((__noinline__))
-#define IQK_ALWAYS_INLINE __attribute__((__always_inline__))
 #endif
 
 #if defined __x86_64__

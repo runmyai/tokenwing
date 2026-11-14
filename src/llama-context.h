@@ -437,6 +437,8 @@ private:
     // has one (lm_hbuf is then empty), else in lm_hbuf with lm_hid
     int32_t                   lm_phase = 0;
     ggml_tensor *             lm_x   = nullptr;
+    ggml_tensor *             lm_moe = nullptr;
+    ggml_tensor *             lm_inj = nullptr;
     ggml_tensor *             lm_ids = nullptr;
     ggml_tensor *             lm_w   = nullptr;
     // The moving window's signals: the call reached its end (lm_call_end's `complete`),

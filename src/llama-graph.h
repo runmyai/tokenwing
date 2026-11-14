@@ -851,6 +851,8 @@ struct llm_graph_params {
     // tokens, each chunk's routed output added into lm_hid); 0 = whole layers
     int32_t       lm_phase = 0;
     ggml_tensor * lm_x     = nullptr;
+    ggml_tensor * lm_moe   = nullptr;   // optional [n_embd, T] routed-expert accumulator when hidden state has hyper-connection streams
+    ggml_tensor * lm_inj   = nullptr;   // optional [hc, T] FFN hyper-connection scatter weights from lm_phase 1
     ggml_tensor * lm_ids   = nullptr;
     ggml_tensor * lm_w     = nullptr;
     int64_t       lm_chunk = 0;
@@ -1164,10 +1166,12 @@ struct llm_graph_context {
     int32_t       lm_phase = 0;
     ggml_tensor * lm_hid   = nullptr;
     ggml_tensor * lm_x     = nullptr;
+    ggml_tensor * lm_moe   = nullptr;
     ggml_tensor * lm_ids   = nullptr;
     ggml_tensor * lm_w     = nullptr;
     int64_t       lm_row0  = 0;
     int64_t       lm_chunk = 0;
+    mutable std::vector<ggml_tensor *> lm_moe_chunks;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;

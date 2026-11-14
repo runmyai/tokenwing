@@ -1261,8 +1261,8 @@ struct llama_moe_stream {
     // llama_context, after tail_ubatch: VRAM places for a layer-major call's tensors of these sizes (one buffer + address each); false =
     // not every one fits (the caller's own buffer then)
     bool     lm_lend_place(const std::vector<int64_t> & sizes, ggml_backend_buffer_t * bufs, char ** addrs);
-    // the most tokens a layer-major call's tensors (2 of big bytes per token, 2 of small) can take in the pool's places (0 = no lending)
-    int64_t  lm_lend_max_tokens(int64_t big, int64_t small, int64_t kv0 = 0) const;   // (kv0: the call's first position)
+    // the most tokens a layer-major call's tensors (per-token byte sizes in bytes_per_tok) can take in the pool's places (0 = no lending)
+    int64_t  lm_lend_max_tokens(const std::vector<int64_t> & bytes_per_tok, int64_t kv0 = 0) const;   // (kv0: the call's first position)
     int64_t  lend_call_kv = 0;   // llama_context: the context (KV cells) the running call reaches (the lent room for it)
     bool     lm_lend_on() const { return vx_ready && !vx_groups.empty() && vf_fill_fn != nullptr && vf_drain_fn != nullptr && lm_tail_ext <= 0; }
     // VRAM lending for prompts: a prompt call's GPU compute buffer is planned by ggml's allocator as

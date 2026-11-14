@@ -4931,7 +4931,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "next (the hidden state kept between them, the attention memory applied once and replayed), and each streamed layer's experts "
         "run once for the whole call, so each expert is read about once per call. The engine raises -b to the context "
         "size (see --moe-stream-layer-major-batch) so a whole prompt arrives in one call. Runs only where the model has a layer range "
-        "(Ling-3.0), without MTP snapshot slots and with one sequence per call; otherwise the plain path. Default 0 = off",
+        "(Ling-3.0, Flint, qwen4exp), without MTP snapshot slots and with one sequence per call; otherwise the plain path. Default 0 = off",
         [](common_params & params, int value) {
             params.moe_stream_layer_major = value;
         }
@@ -4940,7 +4940,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--moe-stream-layer-major-batch"}, "N",
         "with --moe-stream-layer-major 1 the engine raises -b to the context size; N > 0 caps that raise at N tokens per call (a "
         "larger -b given by the user stays). A call's own tensors take (2 x n_embd + 2 x top-k) x 4 bytes per token (Ling-3.0-flash: "
-        "20.1 KiB, 321 MiB at 16k): in the VRAM pool's tail with --moe-stream-vram-free (places that hold experts between prompts), "
+        "20.1 KiB, 321 MiB at 16k; ((hc + 2) x n_embd + hc + 2 x top-k) x 4 bytes with hc > 1 hyper-connection streams, 60.1 KiB on qwen4exp): "
+        "in the VRAM pool's tail with --moe-stream-vram-free (places that hold experts between prompts), "
         "else a buffer of their own while the prompt runs. Default 0 = no cap",
         [](common_params & params, int value) {
             params.moe_stream_layer_major_batch = value;

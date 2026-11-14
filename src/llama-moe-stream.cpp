@@ -16419,11 +16419,11 @@ static bool lm_lend_plan(const std::vector<int64_t> & sizes, const std::vector<i
     return true;
 }
 
-int64_t llama_moe_stream::lm_lend_max_tokens(int64_t big, int64_t small, int64_t kv0) const {
-    if (!lm_lend_on()) {
+int64_t llama_moe_stream::lm_lend_max_tokens(const std::vector<int64_t> & bytes_per_tok, int64_t kv0) const {
+    if (!lm_lend_on() || bytes_per_tok.empty()) {
         return 0;
     }
-    std::vector<int64_t> per(vx_groups.size(), 0), cap(vx_groups.size(), 0), skip(vx_groups.size(), 0);
+    std::vector<int64_t> per(vx_groups.size(), 0), cap(vx_groups.size(), 0), skip(vx_groups.size(), 0), sz(bytes_per_tok.size(), 0);
     for (size_t g = 0; g < vx_groups.size(); g++) {
         const auto & G = vx_groups[g];
         per[g]  = G.gate_up && G.buf ? (int64_t) (2*ggml_row_size(G.t_gate, G.ne_gate[0])*G.ne_gate[1]) : 0;
@@ -16431,14 +16431,17 @@ int64_t llama_moe_stream::lm_lend_max_tokens(int64_t big, int64_t small, int64_t
     }
     std::vector<int32_t> used, grp, cum;
     int64_t lo = 0, hi = 1 << 22;
-    while (lo < hi) {   // the largest T whose four tensors fit
+    while (lo < hi) {   // the largest T whose call tensors all fit
         const int64_t t = (lo + hi + 1)/2;
         // (the held places only, less VRAM lending's front places at the context the call reaches)
         const auto bud = lend_places_at(kv0 + t);
         for (size_t g = 0; g < vx_groups.size(); g++) {
             cap[g] = vx_groups[g].n_real - (g < bud.size() ? bud[g] : 0);
         }
-        if (lm_lend_plan({ t*big, t*big, t*small, t*small }, per, cap, skip, used, grp, cum)) { lo = t; } else { hi = t - 1; }
+        for (size_t i = 0; i < bytes_per_tok.size(); i++) {
+            sz[i] = t*bytes_per_tok[i];
+        }
+        if (lm_lend_plan(sz, per, cap, skip, used, grp, cum)) { lo = t; } else { hi = t - 1; }
     }
     return lo;
 }

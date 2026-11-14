@@ -459,51 +459,111 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    auto * inp = build_inp_mem_hybrid();
+    // Layer-major (--moe-stream-layer-major 1): lm_phase 2 = the expert graph of streamed layer lm_il0 for the whole call.
+    // build_moe_ffn accumulates the waves + VRAM pass into params.lm_moe [n_embd, T] in chunks of lm_chunk tokens; each chunk then
+    // adds its shared expert and runs one hyper-connection combine into params.lm_hid [n_embd*hc, T], matching the single-pass order
+    if (params.lm_phase == 2) {
+        const int il = params.lm_il0;
+        GGML_ASSERT(params.lm_hid && params.lm_x && params.lm_moe && params.lm_inj && params.lm_ids && params.lm_w);
+        build_moe_ffn(params.lm_x,
+                model.layers[il].ffn_gate_inp,
+                model.layers[il].ffn_up_exps,
+                model.layers[il].ffn_gate_exps,
+                model.layers[il].ffn_down_exps,
+                nullptr,
+                n_expert, n_expert_used,
+                LLM_FFN_SILU, true,
+                hparams.expert_weights_scale,
+                LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+                nullptr, model.layers[il].ffn_gate_up_exps,
+                model.layers[il].ffn_up_exps_s,
+                model.layers[il].ffn_gate_exps_s,
+                model.layers[il].ffn_down_exps_s);
+        const int64_t T  = params.lm_x->ne[1];
+        const int64_t ch = params.lm_chunk > 0 ? params.lm_chunk : T;
+        GGML_ASSERT((int64_t) lm_moe_chunks.size() == (T + ch - 1) / ch);
+        for (size_t c = 0; c < lm_moe_chunks.size(); ++c) {
+            const int64_t c0 = (int64_t) c * ch;
+            const int64_t nc = std::min(ch, T - c0);
+            ggml_tensor * moe_c = lm_moe_chunks[c];
+            GGML_ASSERT(moe_c != nullptr);
+            ggml_tensor * x_c   = ggml_view_2d(ctx0, params.lm_x, n_embd, nc, params.lm_x->nb[1], c0 * params.lm_x->nb[1]);
+            ggml_tensor * sh_c  = build_layer_shexp(x_c, il);
+            ggml_tensor * out_c = sh_c ? ggml_add(ctx0, moe_c, sh_c) : moe_c;
+            ggml_tensor * h_dst = ggml_view_2d(ctx0, params.lm_hid, n_embd * hc, nc, params.lm_hid->nb[1], c0 * params.lm_hid->nb[1]);
+            ggml_tensor * res_c = ggml_reshape_3d(ctx0, h_dst, n_embd, hc, nc);
+            ggml_tensor * inj_c = ggml_view_2d(ctx0, params.lm_inj, hc, nc, params.lm_inj->nb[1], c0 * params.lm_inj->nb[1]);
+            ggml_tensor * comb  = build_hc_combine(res_c, out_c, inj_c, il);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_reshape_2d(ctx0, comb, n_embd * hc, nc), h_dst));
+        }
+        return;
+    }
+
+    const int  lm_b    = params.lm_il0;
+    const int  lm_e    = params.lm_il1 < 0 ? n_layer : std::min((int) n_layer, (int) params.lm_il1);
+    const bool lm_last = params.lm_il1 < 0;
+    bool has_ple = false;
+    bool has_qsa = false;
+    for (int il = lm_b; il < lm_e; ++il) {
+        has_ple = has_ple || hparams.is_ple(il);
+        has_qsa = has_qsa || !hparams.is_recr(il);
+    }
+
+    auto * inp = lm_b < lm_e ? build_inp_mem_hybrid() : nullptr;
 
     // qwen4exp always builds llama_memory_hybrid_idx, so this downcast is safe
     // the indexer cache inside it is absent when the GGUF has no indexer tensors
-    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp->mctx);
+    const auto * mctx_hyb = inp ? static_cast<const llama_memory_hybrid_idx_context *>(inp->mctx) : nullptr;
 
-    const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
+    const llama_kv_cache_context * mctx_idx = mctx_hyb ? mctx_hyb->get_idx() : nullptr;
     if (mctx_idx) {
         GGML_ASSERT(mctx_idx->get_n_kv() == inp->mctx->get_attn()->get_n_kv() &&
                 "the indexer cache must track the attention cache cell for cell");
     }
 
     ggml_tensor * ple_emb = nullptr;
-    if (hparams.ple_n_heads > 0) {
+    if (mctx_hyb && hparams.ple_n_heads > 0 && has_ple) {
         ple_emb = build_inp_ple(mctx_hyb);
         // make sure ple_emb and build_inp_embd are in the same graph split
         ggml_build_forward_expand(gf, ple_emb);
     }
 
-    ggml_tensor * inpL = build_inp_embd(model.tok_embd);
-    cb(inpL, "model.input_embed", -1);
-    ggml_build_forward_expand(gf, inpL);
-
     // the QSA layers share one set of k-pool inputs
     // the CUDA lightning indexer takes 32 or 64 heads, QSA has a few, so it scores with plain ops
     llm_graph_input_kpool * inp_kpool = nullptr;
-    if (mctx_idx && hparams.indexer_kpool > 0) {
+    if (mctx_idx && hparams.indexer_kpool > 0 && has_qsa) {
         inp_kpool = build_inp_kpool(mctx_hyb);
     }
 
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_pos     = has_qsa ? build_inp_pos() : nullptr;
+    ggml_tensor * inp_out_ids = lm_last ? build_inp_out_ids() : nullptr;
 
-    // the wide residual starts as hc identical copies of the embedding
-    ggml_tensor * res_hc = ggml_repeat_4d(ctx0,
-            ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
-            n_embd, hc, n_tokens, 1);
-    cb(res_hc, "hc_init", -1);
-    // make sure hc_init is in the same graph split as the first layer (-sm tensor)
-    ggml_build_forward_expand(gf, res_hc);
+    ggml_tensor * res_hc = nullptr;
+    if (params.lm_hid && lm_b > 0) {
+        ggml_tensor * hid_in = ggml_view_2d(ctx0, params.lm_hid, n_embd * hc, n_tokens, params.lm_hid->nb[1],
+                params.lm_row0 * params.lm_hid->nb[1]);
+        res_hc = ggml_reshape_3d(ctx0, hid_in, n_embd, hc, n_tokens);
+    } else if (lm_b > 0) {
+        ggml_tensor * inpL = build_inp_embd(nullptr);
+        res_hc = ggml_reshape_3d(ctx0, inpL, n_embd, hc, n_tokens);
+    } else {
+        ggml_tensor * inpL = build_inp_embd(model.tok_embd);
+        cb(inpL, "model.input_embed", -1);
+        ggml_build_forward_expand(gf, inpL);
+
+        // the wide residual starts as hc identical copies of the embedding
+        res_hc = ggml_repeat_4d(ctx0,
+                ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
+                n_embd, hc, n_tokens, 1);
+        cb(res_hc, "hc_init", -1);
+        // make sure hc_init is in the same graph split as the first layer (-sm tensor)
+        ggml_build_forward_expand(gf, res_hc);
+    }
 
     // The expert streaming's word-start guesses (shared code, llama-graph.cpp; nothing without --moe-stream-wordstart)
     llm_graph_moe_ws ws = moe_ws_begin();
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = lm_b; il < lm_e; ++il) {
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = hc_stream_mean(ctx0, res_hc);
             cb(res->t_layer_inp[il], "layer_inp", il);
@@ -578,14 +638,46 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
         ggml_tensor * ffn_in_n = cur;   // a word-start source's guess input without --moe-stream-pred-shared
         cur = build_layer_ffn(cur, il, &g, shexp);
-        cb(cur, "ffn_out", il);
+        if (cur == nullptr) {   // the routed experts + shared expert + HC combine come later, in the layer's expert graph
+            GGML_ASSERT(params.lm_phase == 1 && params.lm_x && params.lm_inj);
+            ggml_tensor * x_dst = ggml_view_2d(ctx0, params.lm_x, n_embd, n_tokens, params.lm_x->nb[1],
+                    params.lm_row0 * params.lm_x->nb[1]);
+            ggml_tensor * inj_dst = ggml_view_2d(ctx0, params.lm_inj, hc, n_tokens, params.lm_inj->nb[1],
+                    params.lm_row0 * params.lm_inj->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ffn_in_n, x_dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ffn_mix.inject, inj_dst));
+        } else {
+            cb(cur, "ffn_out", il);
 
-        res_hc = build_hc_combine(res_hc, cur, ffn_mix.inject, il);
+            res_hc = build_hc_combine(res_hc, cur, ffn_mix.inject, il);
 
-        moe_ws_layer(model, il, res_hc, g.pred_base, ffn_in_n, ws, base ? guess_in : nullptr);   // a word-start source's guesses
+            moe_ws_layer(model, il, res_hc, g.pred_base, ffn_in_n, ws, base ? guess_in : nullptr);   // a word-start source's guesses
 
-        // "l_last" is the layer output name that build_cvec and imatrix look for
-        cb(res_hc, "l_last", il);
+            // "l_last" is the layer output name that build_cvec and imatrix look for
+            cb(res_hc, "l_last", il);
+        }
+    }
+
+    if (!lm_last) {
+        ggml_tensor * hid_flat = ggml_reshape_2d(ctx0, ggml_is_contiguous(res_hc) ? res_hc : ggml_cont(ctx0, res_hc),
+                n_embd * hc, n_tokens);
+        if (params.lm_hid) {
+            ggml_tensor * dst = ggml_view_2d(ctx0, params.lm_hid, n_embd * hc, n_tokens, params.lm_hid->nb[1],
+                    params.lm_row0 * params.lm_hid->nb[1]);
+            res->t_lm_hidden = ggml_cpy(ctx0, hid_flat, dst);
+            ggml_build_forward_expand(gf, res->t_lm_hidden);
+            return;
+        }
+        ggml_set_output(hid_flat);
+        res->t_lm_hidden = hid_flat;
+        ggml_build_forward_expand(gf, hid_flat);
+        return;
+    }
+
+    if (lm_b == n_layer && crop_before_nextn(inp_out_ids)) {
+        res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+        res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
+        res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
     }
 
     // the MTP head reads the hc-wide residual, before the final mixer
@@ -1336,6 +1428,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             g->gate_inp_next, g->probs_b_next, g->pred_in,
             g->gate_inp_next2, g->probs_b_next2, g->gate_inp_next3, g->probs_b_next3,
             g->rec_on ? &g->rec : nullptr);
+    if (moe_out == nullptr) {   // lm_phase == 1: the routed experts, shared expert and HC combine run in lm_phase == 2
+        return nullptr;
+    }
     cb(moe_out, "ffn_moe_out", il);
 
     if (shexp == nullptr) {   // built before the routed experts when the guess needed it

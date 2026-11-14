@@ -130,10 +130,31 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 // The model graphs that can build a layer range for --moe-stream-layer-major (llm_graph_params lm_*): Ling-3.0
-// (bailingmoe3.cpp) and Flint (flint.cpp). Flint's sliding-window cache replays an earlier ubatch with that ubatch's own cell records
-// (llama_kv_cache_context::cells_rec)
+// (bailingmoe3.cpp), Flint (flint.cpp) and qwen4exp (qwen4exp.cpp). Flint's sliding-window cache replays an earlier ubatch with
+// that ubatch's own cell records (llama_kv_cache_context::cells_rec); qwen4exp's hybrid-idx memory replays its k-pool layout prefixes
 static bool llama_arch_layer_major(llm_arch arch) {
-    return arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_FLINT;
+    return arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_FLINT || arch == LLM_ARCH_QWEN4EXP;
+}
+
+static std::vector<int64_t> lm_call_bytes_per_tok(const llama_hparams & hp, bool split = true) {
+    const int64_t hc  = std::max<int64_t>(1, hp.dsv4_hc_mult);
+    const int64_t big = (int64_t) hp.n_embd * 4;
+    const int64_t sm  = (int64_t) hp.n_expert_used() * 4;
+    if (!split) {
+        return { hc * big };
+    }
+    if (hc > 1) {
+        return { hc * big, big, big, hc * 4, sm, sm };
+    }
+    return { big, big, sm, sm };
+}
+
+static int64_t lm_call_bytes_sum(const llama_hparams & hp, bool split = true) {
+    int64_t s = 0;
+    for (int64_t b : lm_call_bytes_per_tok(hp, split)) {
+        s += b;
+    }
+    return s;
 }
 
 llama_context::llama_context(
@@ -649,18 +670,19 @@ llama_context::llama_context(
             // free VRAM alone (with no cap, a prompt over ~5k tokens failed that allocation with a 131k context on a 6 GB card)
             const bool lm_gpu_own = !ms->lm_lend_on() && gdev != nullptr && ggml_backend_dev_type(model.dev_layer(0)) != GGML_BACKEND_DEVICE_TYPE_CPU;
             if (ms->p1.layer_major && cparams.n_batch > cparams.n_ubatch && llama_arch_layer_major(model.arch) && (ms->lm_lend_on() || lm_gpu_own)) {
-                const int64_t big = (int64_t) model.hparams.n_embd*4, small = (int64_t) model.hparams.n_expert_used()*4;
+                const auto    bpt       = lm_call_bytes_per_tok(model.hparams);
+                const int64_t bpt_total = lm_call_bytes_sum(model.hparams);
                 size_t vfree = 0, vtot = 0;
                 // (the own buffer is made on layer 0's device - with several GPUs maybe not the VRAM pool's)
                 ggml_backend_dev_memory(lm_gpu_own ? model.dev_layer(0) : gdev, &vfree, &vtot);
-                const int64_t t_lend = ms->lm_lend_max_tokens(big, small);
+                const int64_t t_lend = ms->lm_lend_max_tokens(bpt);
                 // (a margin for growth: with the pool off, the engine's own growth estimate - the lazy CUDA memory still to come, as the
                 // pool's fit uses it - instead of a fixed 512 MiB, which on a 4.6 GB start left 0 tokens for 221 MiB free. Only
                 // where vx_prewarm created the cuBLAS handle and mapped the scratch pool before this check: the estimate leaves them out
                 // (~130 MiB, created later without the VRAM pool's flags), so otherwise the 512 MiB stays)
                 const int64_t margin = lm_gpu_own && ms->vx_prewarmed ? ms->vx_growth_bytes(cparams.n_ubatch, cparams.n_ctx, nullptr) :
                                        ((int64_t) 512 << 20);
-                const int64_t t_free = std::max<int64_t>(0, (int64_t) vfree - margin)/(2*big + 2*small);
+                const int64_t t_free = std::max<int64_t>(0, (int64_t) vfree - margin)/bpt_total;
                 const int64_t t_fit  = std::max(t_lend, t_free)/cparams.n_ubatch*cparams.n_ubatch;
                 if (t_fit < (int64_t) cparams.n_batch) {
                     const uint32_t nb = (uint32_t) std::max<int64_t>(cparams.n_ubatch, t_fit);
@@ -2607,8 +2629,7 @@ int64_t llama_context::rg_call_need(uint32_t n_tokens_all, const llama_memory_co
     const size_t elt = cparams.flash_attn ? 2 : 4;   // the mask's element (build_attn_inp_kq_mask)
     int64_t need = 0;
     if (lm_layer_major_ok(n_tokens_all) && ggml_backend_dev_type(model.dev_layer(0)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-        const int64_t split = lm_group_test() ? 0 : 1;   // (2b: + the expert input and the picks / weights)
-        need += (int64_t) n_tokens_all*((1 + split)*(int64_t) hparams.n_embd*4 + split*(int64_t) hparams.n_expert_used()*8);
+        need += (int64_t) n_tokens_all * lm_call_bytes_sum(hparams, !lm_group_test());
     }
     need += (int64_t) mctx.replay_keep_bytes(elt);
     if (backend_cpu != nullptr && ggml_backend_sched_get_buffer_type(sched.get(), backend_cpu) == ggml_backend_cpu_buffer_type()) {
@@ -3183,7 +3204,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (c.lm_hctx) {   // the per-call tensors go once the call's graphs are done with them (in the tail's
                                // extension: before the next call refills the tail)
                 ggml_backend_sched_synchronize(c.sched.get());
-                c.lm_hid = c.lm_x = c.lm_ids = c.lm_w = nullptr; c.lm_hbuf.reset(); c.lm_hctx.reset();
+                c.lm_hid = c.lm_x = c.lm_moe = c.lm_inj = c.lm_ids = c.lm_w = nullptr; c.lm_hbuf.reset(); c.lm_hctx.reset();
             }
         }
     } lm_reset { *this };
@@ -3193,9 +3214,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // sliding window stays whole). Only where the pieces before the last ask for no output (a prompt's), and no token carries an embedding
     // or a state; else the call runs as it is (the pool gives way, never a failure)
     if (auto * ms = model.moe_stream(); lm_on && !lm_force_off && ms && ms->lend_owner == this && ms->lend_on && ms->lm_lend_on()) {
-        const int64_t big = (int64_t) model.hparams.n_embd*4, small = (int64_t) model.hparams.n_expert_used()*4;
         const int64_t kv0 = (int64_t) balloc->get_batch().pos[0];
-        const int64_t t_fit = ms->lm_lend_max_tokens(big, small, kv0)/cparams.n_ubatch*cparams.n_ubatch;
+        const int64_t t_fit = ms->lm_lend_max_tokens(lm_call_bytes_per_tok(model.hparams), kv0)/cparams.n_ubatch*cparams.n_ubatch;
         if (t_fit >= (int64_t) cparams.n_ubatch && t_fit < (int64_t) n_tokens_all) {
             bool ok = true;
             for (int64_t i = 0; i < t_fit && ok; i++) {
@@ -3267,7 +3287,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         lm_h.clear();
         if (lm_hctx) {
             ggml_backend_sched_synchronize(sched.get());
-            lm_hid = lm_x = lm_ids = lm_w = nullptr; lm_hbuf.reset(); lm_hctx.reset();
+            lm_hid = lm_x = lm_moe = lm_inj = lm_ids = lm_w = nullptr; lm_hbuf.reset(); lm_hctx.reset();
         }
         lm_force_off = true;
         r = decode(batch_inp);
@@ -3318,22 +3338,32 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // a tail they all live in the tail's extension (vacated for this call's GPU-wave graphs first), else in a buffer of their own
         if (lm_last0 > 0) {
             auto * ms = model.moe_stream();
-            const int64_t k = hparams.n_expert_used();
-            ggml_init_params ip = { 4*ggml_tensor_overhead(), nullptr, true };
+            const int64_t k  = hparams.n_expert_used();
+            const int64_t hc = std::max<int64_t>(1, hparams.dsv4_hc_mult);
+            ggml_init_params ip = { 6*ggml_tensor_overhead(), nullptr, true };
             lm_hctx.reset(ggml_init(ip));
-            lm_hid = ggml_new_tensor_2d(lm_hctx.get(), GGML_TYPE_F32, hparams.n_embd, n_tokens_all);
+            lm_hid = ggml_new_tensor_2d(lm_hctx.get(), GGML_TYPE_F32, hparams.n_embd*hc, n_tokens_all);
             ggml_set_name(lm_hid, "lm_hidden");
             if (lm_split) {
                 lm_x   = ggml_new_tensor_2d(lm_hctx.get(), GGML_TYPE_F32, hparams.n_embd, n_tokens_all);
+                if (hc > 1) {
+                    lm_moe = ggml_new_tensor_2d(lm_hctx.get(), GGML_TYPE_F32, hparams.n_embd, n_tokens_all);
+                    lm_inj = ggml_new_tensor_2d(lm_hctx.get(), GGML_TYPE_F32, hc, n_tokens_all);
+                    ggml_set_name(lm_moe, "lm_moe_out");
+                    ggml_set_name(lm_inj, "lm_hc_inject");
+                }
                 lm_ids = ggml_new_tensor_2d(lm_hctx.get(), GGML_TYPE_I32, k, n_tokens_all);
                 lm_w   = ggml_new_tensor_2d(lm_hctx.get(), GGML_TYPE_F32, k, n_tokens_all);
                 ggml_set_name(lm_x, "lm_expert_in"); ggml_set_name(lm_ids, "lm_ids"); ggml_set_name(lm_w, "lm_weights");
             }
+            const auto lm_all_tensors = [&]() {
+                return std::array<ggml_tensor *, 6>{ lm_hid, lm_x, lm_moe, lm_inj, lm_ids, lm_w };
+            };
             bool placed = false;
             if (ms && ms->tail_on) {
                 const size_t al = 256;
                 size_t total = 0;
-                for (ggml_tensor * t : { lm_hid, lm_x, lm_ids, lm_w }) {
+                for (ggml_tensor * t : lm_all_tensors()) {
                     if (t) { total += GGML_PAD(ggml_nbytes(t), al); }
                 }
                 // vacates the tail's copy places when this call's ubatches are GPU-wave graphs, and the extension places these tensors
@@ -3343,7 +3373,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 char * taddr = nullptr;
                 if (ms->lm_tail_region((int64_t) total, &tbuf, &taddr)) {
                     size_t off = 0;
-                    for (ggml_tensor * t : { lm_hid, lm_x, lm_ids, lm_w }) {
+                    for (ggml_tensor * t : lm_all_tensors()) {
                         if (t) {
                             GGML_ASSERT(ggml_backend_tensor_alloc(tbuf, t, taddr + off) == GGML_STATUS_SUCCESS);
                             off += GGML_PAD(ggml_nbytes(t), al);
@@ -3356,7 +3386,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 // Expert places of the VRAM pool lent for this call, each tensor in one pool group (with or without a tail)
                 std::vector<ggml_tensor *> tv;
                 std::vector<int64_t> sz;
-                for (ggml_tensor * t : { lm_hid, lm_x, lm_ids, lm_w }) {
+                for (ggml_tensor * t : lm_all_tensors()) {
                     if (t) {
                         tv.push_back(t);
                         sz.push_back((int64_t) ggml_nbytes(t));
@@ -3378,7 +3408,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 if (!lm_hbuf) {
                     LLAMA_LOG_ERROR("%s: layer-major: could not allocate the call's tensors (%.1f MiB of hidden state on %s)\n", __func__,
                             ggml_nbytes(lm_hid)/1048576.0, ggml_backend_dev_name(dev));
-                    lm_hid = lm_x = lm_ids = lm_w = nullptr; lm_hctx.reset();
+                    lm_hid = lm_x = lm_moe = lm_inj = lm_ids = lm_w = nullptr; lm_hctx.reset();
                     if (!lm_force_off) {   // nothing has run yet, the memory is as before the call - ubatch by ubatch
                         fprintf(stderr, "%s: layer-major: the call's tensors did not fit on %s - this call runs ubatch by ubatch instead (no "
                                 "layer-major for it; slower)\n", __func__, ggml_backend_dev_name(dev));
@@ -3394,8 +3424,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             static int said_where = -1;
             if (said_where != (int) placed) {
                 said_where = (int) placed;
+                size_t call_bytes = 0;
+                for (ggml_tensor * t : lm_all_tensors()) {
+                    if (t) { call_bytes += ggml_nbytes(t); }
+                }
                 fprintf(stderr, "%s: layer-major: the call's tensors (%d tokens, %.1f MiB) %s\n", __func__, (int) n_tokens_all,
-                        (ggml_nbytes(lm_hid) + (lm_x ? ggml_nbytes(lm_x) + ggml_nbytes(lm_ids) + ggml_nbytes(lm_w) : 0))/1048576.0,
+                        call_bytes/1048576.0,
                         placed ? "in the VRAM pool (its tail / expert places lent for the call)" : (std::string("in a buffer of their own on ") + ggml_backend_dev_name(dev)).c_str());
             }
         }
@@ -4432,9 +4466,10 @@ void llama_context::lm_measure_expert_graph() {
     const int64_t room_nodes = gf_res_reserve->get_max_nodes(), scratch_nodes = 4*room_nodes + 4096;
     std::unique_ptr<llm_graph_result> res(new llm_graph_result(scratch_nodes));
     const int64_t scratch_gmem = (int64_t) ggml_graph_overhead_custom((size_t) scratch_nodes, false);   // (the graph object, not counted)
+    const int64_t hc = std::max<int64_t>(1, hp.dsv4_hc_mult);
     ggml_init_params ip = { 8*ggml_tensor_overhead(), nullptr, true };
     ggml_context_ptr hctx(ggml_init(ip));
-    const auto save = std::make_tuple(lm_il0, lm_il1, lm_phase, lm_row0, lm_hid, lm_x, lm_ids, lm_w, lm_reapply);
+    const auto save = std::make_tuple(lm_il0, lm_il1, lm_phase, lm_row0, lm_hid, lm_x, lm_moe, lm_inj, lm_ids, lm_w, lm_reapply);
     const auto n_outputs_save = n_outputs;
     int64_t base_n = 0, per_n = 0, base_m = 0, per_m = 0;
     int w[2] = { 0, 0 };
@@ -4449,15 +4484,17 @@ void llama_context::lm_measure_expert_graph() {
         for (int c = 0; c < 2; c++) {
             const int64_t T = (m + c)*(int64_t) ub;
             // stand-ins of the call's tensors, T rows (the expert graph takes its row count from them)
-            ggml_tensor * hid = ggml_new_tensor_2d(hctx.get(), GGML_TYPE_F32, hp.n_embd, T);
+            ggml_tensor * hid = ggml_new_tensor_2d(hctx.get(), GGML_TYPE_F32, hp.n_embd*hc, T);
             ggml_tensor * x   = ggml_new_tensor_2d(hctx.get(), GGML_TYPE_F32, hp.n_embd, T);
+            ggml_tensor * moe = hc > 1 ? ggml_new_tensor_2d(hctx.get(), GGML_TYPE_F32, hp.n_embd, T) : nullptr;
+            ggml_tensor * inj = hc > 1 ? ggml_new_tensor_2d(hctx.get(), GGML_TYPE_F32, hc, T) : nullptr;
             ggml_tensor * ids = ggml_new_tensor_2d(hctx.get(), GGML_TYPE_I32, k, T);
             ggml_tensor * wt  = ggml_new_tensor_2d(hctx.get(), GGML_TYPE_F32, k, T);
             llama_batch_allocr balloc_x(hp.n_pos_per_embd());
             llama_ubatch ubatch = balloc_x.ubatch_reserve((uint32_t) T, 1);
             ubatch_prepare_reserve(ubatch, (uint32_t) T, sampling.samplers, cparams.n_outputs_max_per_seq);
             lm_il0 = il; lm_il1 = il + 1; lm_phase = 2; lm_row0 = 0; lm_reapply = true;
-            lm_hid = hid; lm_x = x; lm_ids = ids; lm_w = wt;
+            lm_hid = hid; lm_x = x; lm_moe = moe; lm_inj = inj; lm_ids = ids; lm_w = wt;
             n_outputs = (int32_t) T;
             res->reset();
             const auto gparams = graph_params(res.get(), ubatch, nullptr, ctx_type_to_graph_type(cparams.ctx_type));
@@ -4478,7 +4515,7 @@ void llama_context::lm_measure_expert_graph() {
             base_m = std::max(base_m, mm[0] - cw0*pm);
         }
     }
-    std::tie(lm_il0, lm_il1, lm_phase, lm_row0, lm_hid, lm_x, lm_ids, lm_w, lm_reapply) = save;
+    std::tie(lm_il0, lm_il1, lm_phase, lm_row0, lm_hid, lm_x, lm_moe, lm_inj, lm_ids, lm_w, lm_reapply) = save;
     n_outputs = n_outputs_save;
     if (per_n <= 0 && per_m <= 0) {
         fprintf(stderr, "%s: layer-major: an expert graph does not grow with its chunks (%lld nodes, %lld B) - no chunk limit\n", __func__,
@@ -4532,21 +4569,24 @@ bool llama_context::lend_lm_graphs(const llama_memory_context_i * mctx, const st
     const uint32_t ub = std::min(cparams.n_ctx, cparams.n_ubatch);
     const int64_t  R  = std::max<int64_t>(ub, std::min<int64_t>({ (int64_t) cparams.n_batch, 4*(int64_t) ub, (int64_t) cparams.n_ctx })/ub*ub);
     const int64_t  k  = hp.n_expert_used();
-    ggml_init_params ip = { 4*ggml_tensor_overhead(), nullptr, true };
+    const int64_t  hc = std::max<int64_t>(1, hp.dsv4_hc_mult);
+    ggml_init_params ip = { 6*ggml_tensor_overhead(), nullptr, true };
     ggml_context_ptr hctx(ggml_init(ip));
-    ggml_tensor * hid = ggml_new_tensor_2d(hctx.get(), GGML_TYPE_F32, hp.n_embd, R);
+    ggml_tensor * hid = ggml_new_tensor_2d(hctx.get(), GGML_TYPE_F32, hp.n_embd*hc, R);
     ggml_tensor * x   = split ? ggml_new_tensor_2d(hctx.get(), GGML_TYPE_F32, hp.n_embd, R) : nullptr;
+    ggml_tensor * moe = split && hc > 1 ? ggml_new_tensor_2d(hctx.get(), GGML_TYPE_F32, hp.n_embd, R) : nullptr;
+    ggml_tensor * inj = split && hc > 1 ? ggml_new_tensor_2d(hctx.get(), GGML_TYPE_F32, hc, R) : nullptr;
     ggml_tensor * ids = split ? ggml_new_tensor_2d(hctx.get(), GGML_TYPE_I32, k, R) : nullptr;
     ggml_tensor * w   = split ? ggml_new_tensor_2d(hctx.get(), GGML_TYPE_F32, k, R) : nullptr;
-    for (ggml_tensor * t : { hid, x, ids, w }) {
+    for (ggml_tensor * t : { hid, x, moe, inj, ids, w }) {
         if (t) {
             t->buffer = ms->vx_groups[0].buf;          // (a stand-in: the call's tensors live in the pool's places or a GPU buffer)
             t->data   = ms->vx_groups[0].gate_up->data;
         }
     }
-    const auto save = std::make_tuple(lm_il0, lm_il1, lm_phase, lm_row0, lm_hid, lm_x, lm_ids, lm_w, lm_reapply);
+    const auto save = std::make_tuple(lm_il0, lm_il1, lm_phase, lm_row0, lm_hid, lm_x, lm_moe, lm_inj, lm_ids, lm_w, lm_reapply);
     const int32_t n_outputs_save = n_outputs;
-    std::set<std::array<int, 4>> kinds;
+    std::set<std::array<int, 5>> kinds;
     int first_streamed = -1;
     bool ok = true;
     for (int il = 0; il < (int) hp.n_layer() && ok; il++) {
@@ -4554,23 +4594,23 @@ bool llama_context::lend_lm_graphs(const llama_memory_context_i * mctx, const st
         if (ph == 1 && first_streamed < 0) {
             first_streamed = il;
         }
-        if (!kinds.insert({ ph, hp.is_swa(il) ? 1 : 0, hp.is_recr(il) ? 1 : 0, (uint32_t) il < hp.n_layer_dense_lead ? 1 : 0 }).second) {
+        if (!kinds.insert({ ph, hp.is_swa(il) ? 1 : 0, hp.is_recr(il) ? 1 : 0, (uint32_t) il < hp.n_layer_dense_lead ? 1 : 0, hp.is_ple(il) ? 1 : 0 }).second) {
             continue;
         }
         lm_il0 = il; lm_il1 = il + 1; lm_phase = ph; lm_row0 = R - ub; lm_reapply = il > 0;
-        lm_hid = hid; lm_x = x; lm_ids = ids; lm_w = w;
+        lm_hid = hid; lm_x = x; lm_moe = moe; lm_inj = inj; lm_ids = ids; lm_w = w;
         ok = each();
     }
     if (ok && first_streamed >= 0) {   // the expert graph: one "ubatch" of R rows, no memory
         lm_il0 = first_streamed; lm_il1 = first_streamed + 1; lm_phase = 2; lm_row0 = 0; lm_reapply = true;
-        lm_hid = hid; lm_x = x; lm_ids = ids; lm_w = w;
+        lm_hid = hid; lm_x = x; lm_moe = moe; lm_inj = inj; lm_ids = ids; lm_w = w;
         ms->lm_expert_graph = true;
         lm_lend_rows = R;
         ok = each();
         lm_lend_rows = 0;
         ms->lm_expert_graph = false;
     }
-    std::tie(lm_il0, lm_il1, lm_phase, lm_row0, lm_hid, lm_x, lm_ids, lm_w, lm_reapply) = save;
+    std::tie(lm_il0, lm_il1, lm_phase, lm_row0, lm_hid, lm_x, lm_moe, lm_inj, lm_ids, lm_w, lm_reapply) = save;
     n_outputs = n_outputs_save;
     return ok;
 }
@@ -4988,6 +5028,8 @@ llm_graph_params llama_context::graph_params(
     p.lm_row0 = lm_row0;
     p.lm_phase = lm_phase;
     p.lm_x     = lm_phase != 0 ? lm_x   : nullptr;
+    p.lm_moe   = lm_phase != 0 ? lm_moe : nullptr;
+    p.lm_inj   = lm_phase != 0 ? lm_inj : nullptr;
     p.lm_ids   = lm_phase != 0 ? lm_ids : nullptr;
     p.lm_w     = lm_phase != 0 ? lm_w   : nullptr;
     p.lm_chunk = cparams.n_ubatch;

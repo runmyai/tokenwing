@@ -91,6 +91,7 @@ public:
 
     const kpool_layout & kpool_layout_update();
     const kpool_layout & kpool_layout_get() const;
+    kpool_layout       & kpool_layout_mut();
 
     // The pooled keys persist in the idx cache across batches. A sequence edit can regroup the pools
     // from some position on, which stales every pooled key at or after it. POS_CLEAN means none.
@@ -175,8 +176,12 @@ public:
     // llama_memory_context_i
     //
 
-    bool next()  override;
-    bool apply() override;
+    bool next()    override;
+    bool apply()   override;
+    bool rewind()  override;
+    bool reapply() override;
+
+    size_t replay_keep_bytes(size_t mask_elt) const override;
 
     //
     // llama_memory_hybrid_idx_context specific API
@@ -229,6 +234,12 @@ private:
 
     // Whether this context tracks k-pool states.
     bool kpool_track() const;
+
+    // Per-ubatch k-pool layout prefix and state recorded on the first pass for rewind()/reapply()
+    struct kpool_snap;
+    std::vector<kpool_snap>                       kpool_snaps;
+    std::unique_ptr<llama_memory_hybrid_idx::kpool_layout> kpool_lay_full;
+    bool                                          kpool_replay_ok = true;
 
     // Positions each sequence must re-pool from, cleared only after the first ubatch succeeds
     llama_memory_hybrid_idx::stale_pos_t mem_idx_stale_batch = llama_memory_hybrid_idx::stale_pos_clean();

@@ -357,6 +357,43 @@ struct llama_memory_hybrid_idx_context::kpool_state {
     uint32_t n_new_g     = 1; // graph size of the new pool list, stable across decode steps
 };
 
+struct llama_memory_hybrid_idx_context::kpool_snap {
+    struct seq_prefix {
+        llama_seq_id s         = 0;
+        llama_pos    pos_min   = 0;
+        uint32_t     strm      = 0;
+        size_t       cells_len = 0;
+        size_t       pools_len = 0;
+        size_t       j_next    = 0;
+        uint64_t     hash      = 0;
+    };
+
+    std::vector<seq_prefix> seqs;
+    uint32_t n_pool_real = 0;
+
+    std::vector<uint32_t> is_new;
+    uint32_t generation  = 0;
+    uint32_t st_pool_real = 0;
+    uint32_t n_new       = 0;
+    uint32_t n_new_g     = 1;
+};
+
+static uint64_t kpool_prefix_hash(const llama_memory_hybrid_idx::kpool_layout::seq & sq, size_t cells_len, size_t pools_len) {
+    uint64_t h = 14695981039346656037ull;
+    const auto mix = [&](uint64_t v) {
+        h ^= v;
+        h *= 1099511628211ull;
+    };
+    for (size_t i = 0; i < cells_len; ++i) {
+        mix((uint64_t) (uint32_t) sq.cells[i].first);
+        mix((uint64_t) sq.cells[i].second);
+    }
+    for (size_t i = 0; i < pools_len; ++i) {
+        mix((uint64_t) sq.pools[i]);
+    }
+    return h;
+}
+
 namespace {
 
 // The last padded pool is always unused.
@@ -376,6 +413,12 @@ int64_t kpool_rank(const std::vector<std::pair<llama_pos, uint32_t>> & cells, ll
 llama_memory_hybrid_idx::~llama_memory_hybrid_idx() = default;
 
 const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_layout_get() const {
+    GGML_ASSERT(kpool_lay != nullptr);
+
+    return *kpool_lay;
+}
+
+llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_layout_mut() {
     GGML_ASSERT(kpool_lay != nullptr);
 
     return *kpool_lay;
@@ -543,15 +586,133 @@ bool llama_memory_hybrid_idx_context::apply() {
 
     // Extend the pool layout with this ubatch's cells, then pick what it must re-pool.
     if (res && kpool_track()) {
-        mem->kpool_layout_update();
+        const auto & lay = mem->kpool_layout_update();
         if (!kpool_st) {
             kpool_st = std::make_unique<kpool_state>();
         }
         kpool_build_state(get_ubatch());
         i_kpool  = i_cur;
+
+        if (ns_ubatch.size() > 1) {
+            if (i_cur != kpool_snaps.size()) {
+                kpool_replay_ok = false;
+            } else if (kpool_replay_ok) {
+                kpool_snap snap;
+                snap.n_pool_real  = lay.n_pool_real;
+                snap.is_new       = kpool_st->is_new;
+                snap.generation   = kpool_st->generation;
+                snap.st_pool_real = kpool_st->n_pool_real;
+                snap.n_new        = kpool_st->n_new;
+                snap.n_new_g      = kpool_st->n_new_g;
+                for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                    const auto & sq = lay.seqs[s];
+                    if (sq.cells.empty() && sq.pools.empty()) {
+                        continue;
+                    }
+                    snap.seqs.push_back({
+                        s,
+                        sq.pos_min,
+                        sq.strm,
+                        sq.cells.size(),
+                        sq.pools.size(),
+                        sq.j_next,
+                        kpool_prefix_hash(sq, sq.cells.size(), sq.pools.size()),
+                    });
+                }
+                kpool_snaps.push_back(std::move(snap));
+            }
+        }
     }
 
     return res;
+}
+
+bool llama_memory_hybrid_idx_context::rewind() {
+    if (!llama_memory_hybrid_context::rewind()) {
+        return false;
+    }
+    if (ctx_idx && !ctx_idx->rewind()) {
+        return false;
+    }
+    if (kpool_track()) {
+        if (!kpool_replay_ok || kpool_snaps.size() != ns_ubatch.size()) {
+            return false;
+        }
+        if (!kpool_lay_full) {
+            kpool_lay_full = std::make_unique<llama_memory_hybrid_idx::kpool_layout>(mem->kpool_layout_get());
+            for (const auto & snap : kpool_snaps) {
+                for (const auto & sp : snap.seqs) {
+                    const auto & full = kpool_lay_full->seqs[sp.s];
+                    if (full.pos_min != sp.pos_min || full.strm != sp.strm ||
+                            full.cells.size() < sp.cells_len || full.pools.size() < sp.pools_len ||
+                            kpool_prefix_hash(full, sp.cells_len, sp.pools_len) != sp.hash) {
+                        kpool_replay_ok = false;
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    i_cur   = 0;
+    i_kpool = SIZE_MAX;
+    return true;
+}
+
+bool llama_memory_hybrid_idx_context::reapply() {
+    bool res = llama_memory_hybrid_context::reapply();
+    if (ctx_idx) {
+        res = res & ctx_idx->reapply();
+    }
+    if (!res) {
+        return false;
+    }
+    if (kpool_track()) {
+        static const bool test_no_kpool = getenv("MOE_STREAM_TEST_NO_KPOOL_REPLAY") &&
+                                          atoi(getenv("MOE_STREAM_TEST_NO_KPOOL_REPLAY")) != 0;   // TEST ONLY
+        if (!kpool_replay_ok || !kpool_lay_full || !kpool_st || i_cur >= kpool_snaps.size()) {
+            return false;
+        }
+        if (!test_no_kpool) {
+            const auto & snap = kpool_snaps[i_cur];
+            auto & lay = mem->kpool_layout_mut();
+            lay.n_pool_real = snap.n_pool_real;
+            std::array<bool, LLAMA_MAX_SEQ> seen = {};
+            for (const auto & sp : snap.seqs) {
+                seen[sp.s] = true;
+                auto & dst       = lay.seqs[sp.s];
+                const auto & src = kpool_lay_full->seqs[sp.s];
+                dst.pos_min = sp.pos_min;
+                dst.strm    = sp.strm;
+                dst.j_next  = sp.j_next;
+                if (dst.cells.size() > sp.cells_len) {
+                    dst.cells.resize(sp.cells_len);
+                } else if (dst.cells.size() < sp.cells_len) {
+                    dst.cells.insert(dst.cells.end(), src.cells.begin() + dst.cells.size(), src.cells.begin() + sp.cells_len);
+                }
+                if (dst.pools.size() > sp.pools_len) {
+                    dst.pools.resize(sp.pools_len);
+                } else if (dst.pools.size() < sp.pools_len) {
+                    dst.pools.insert(dst.pools.end(), src.pools.begin() + dst.pools.size(), src.pools.begin() + sp.pools_len);
+                }
+            }
+            for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (!seen[s] && (!lay.seqs[s].cells.empty() || !lay.seqs[s].pools.empty())) {
+                    lay.seqs[s] = llama_memory_hybrid_idx::kpool_layout::seq();
+                }
+            }
+            kpool_st->is_new      = snap.is_new;
+            kpool_st->generation  = snap.generation;
+            kpool_st->n_pool_real = snap.st_pool_real;
+            kpool_st->n_new       = snap.n_new;
+            kpool_st->n_new_g     = snap.n_new_g;
+        }
+        i_kpool = i_cur;
+    }
+    return true;
+}
+
+size_t llama_memory_hybrid_idx_context::replay_keep_bytes(size_t mask_elt) const {
+    return llama_memory_hybrid_context::replay_keep_bytes(mask_elt) + (ctx_idx ? ctx_idx->replay_keep_bytes(0) : 0);
 }
 
 bool llama_memory_hybrid_idx_context::kpool_track() const {

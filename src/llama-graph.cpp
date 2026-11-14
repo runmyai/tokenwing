@@ -1124,25 +1124,31 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
-    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-    mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    // An input no node of this graph reads has no buffer (a layer-major group graph without an attention or a
+    // recurrent layer) and is not filled
+    if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
+        mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+    }
+    if (inp_attn->self_v_idxs && inp_attn->self_v_idxs->buffer) {
+        mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+    }
 
     // leave the mask unallocated if all attention layers have their own (e.g. qwen4exp QSA)
-    if (inp_attn->self_kq_mask->buffer) {
+    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
         mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
     }
 
-    if (inp_attn->self_k_rot) {
+    if (inp_attn->self_k_rot && inp_attn->self_k_rot->buffer) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
     }
 
-    if (inp_attn->self_v_rot) {
+    if (inp_attn->self_v_rot && inp_attn->self_v_rot->buffer) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1544,6 +1550,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
         lm_phase = params.lm_phase;
         lm_hid   = params.lm_hid;
         lm_x     = params.lm_x;
+        lm_moe   = params.lm_moe;
         lm_ids   = params.lm_ids;
         lm_w     = params.lm_w;
         lm_row0  = params.lm_row0;
@@ -3945,14 +3952,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * vram_ids = nullptr;
 
             // The expert graph of a layer-major call - each wave's matmuls in chunks of lm_chunk tokens, each chunk's
-            // result added into its rows of the call's residual (lm_hid); the chain of each chunk's adds orders the waves
+            // result added into its rows of the call's residual (lm_hid) or routed-expert accumulator (lm_moe); the chain orders the waves
+            ggml_tensor * lm_acc = lm_moe ? lm_moe : lm_hid;
             const int64_t lm_nc = lm_phase == 2 ? (n_tokens + lm_chunk - 1)/lm_chunk : 0;
             std::vector<ggml_tensor *> lm_h_cur((size_t) lm_nc, nullptr);
             const auto lm_add_chunk = [&](int64_t c, ggml_tensor * add) {
                 const int64_t c0 = c*lm_chunk, nc = std::min<int64_t>(lm_chunk, n_tokens - c0);
-                ggml_tensor * dst = ggml_view_2d(ctx0, lm_hid, n_embd, nc, lm_hid->nb[1], c0*lm_hid->nb[1]);
-                ggml_tensor * prev = lm_h_cur[(size_t) c] ? lm_h_cur[(size_t) c] : dst;
-                lm_h_cur[(size_t) c] = ggml_cpy(ctx0, ggml_add(ctx0, prev, add), dst);
+                ggml_tensor * dst = ggml_view_2d(ctx0, lm_acc, n_embd, nc, lm_acc->nb[1], c0*lm_acc->nb[1]);
+                if (lm_moe && !lm_h_cur[(size_t) c]) {
+                    lm_h_cur[(size_t) c] = ggml_cpy(ctx0, add, dst);
+                } else {
+                    ggml_tensor * prev = lm_h_cur[(size_t) c] ? lm_h_cur[(size_t) c] : dst;
+                    lm_h_cur[(size_t) c] = ggml_cpy(ctx0, ggml_add(ctx0, prev, add), dst);
+                }
                 ggml_build_forward_expand(gf, lm_h_cur[(size_t) c]);
             };
             const auto lm_chunk_views = [&](int64_t c, ggml_tensor * ids_all, ggml_tensor ** ids_c, ggml_tensor ** x_c, ggml_tensor ** w_c) {
@@ -4060,7 +4072,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 }
             }
 
-            if (lm_phase == 2) {   // the VRAM pass per chunk, added into the residual; the graph's result is lm_hid
+            if (lm_phase == 2) {   // the VRAM pass per chunk, added into the residual / accumulator; the graph's result is lm_hid / lm_moe_chunks
                 if (vram_ids) {
                     ggml_tensor * vids_dev = lm_ids_on_dev(vram_ids);
                     for (int64_t c = 0; c < lm_nc; c++) {
@@ -4069,6 +4081,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                         lm_add_chunk(c, build_vram_chain(ids_c, x_c, w_c));
                     }
                 }
+                lm_moe_chunks = std::move(lm_h_cur);
                 GGML_ASSERT(vram_out_early == nullptr);
                 return nullptr;
             }

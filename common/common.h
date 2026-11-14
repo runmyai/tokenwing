@@ -936,6 +936,7 @@ struct common_params {
     bool        moe_stream_plan_only = false; // print the plan and stop
     std::string moe_stream_oracle = "";    // trace prefix to replay instead of predicting
     int32_t     moe_stream_oracle_lead = -1; // oracle lookahead in MoE layers, -1 = 1
+    std::string quant_plugin = "";         // shared library (.so / .dll) registering GGML_TYPE_EXT0..EXT3
     // optional callback for model loading progress and cancellation:
     // called with a progress value between 0.0 and 1.0.
     // return false from callback to abort model loading or true to continue

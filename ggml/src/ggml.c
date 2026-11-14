@@ -637,7 +637,7 @@ FILE * ggml_fopen(const char * fname, const char * mode) {
 
 }
 
-static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
+static struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     [GGML_TYPE_I8] = {
         .type_name                = "i8",
         .blck_size                = 1,
@@ -951,7 +951,55 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
+    [GGML_TYPE_EXT0] = {
+        .type_name                = "ext0",
+        .blck_size                = 0,
+        .type_size                = 0,
+        .is_quantized             = false,
+    },
+    [GGML_TYPE_EXT1] = {
+        .type_name                = "ext1",
+        .blck_size                = 0,
+        .type_size                = 0,
+        .is_quantized             = false,
+    },
+    [GGML_TYPE_EXT2] = {
+        .type_name                = "ext2",
+        .blck_size                = 0,
+        .type_size                = 0,
+        .is_quantized             = false,
+    },
+    [GGML_TYPE_EXT3] = {
+        .type_name                = "ext3",
+        .blck_size                = 0,
+        .type_size                = 0,
+        .is_quantized             = false,
+    },
 };
+
+void ggml_internal_set_ext_type_traits(
+        enum ggml_type  type,
+        const char *    type_name,
+        int64_t         blck_size,
+        size_t          type_size,
+        ggml_to_float_t to_float,
+        ggml_from_float_t from_float_ref);
+
+void ggml_internal_set_ext_type_traits(
+        enum ggml_type  type,
+        const char *    type_name,
+        int64_t         blck_size,
+        size_t          type_size,
+        ggml_to_float_t to_float,
+        ggml_from_float_t from_float_ref) {
+    assert(type >= GGML_TYPE_EXT0 && type <= GGML_TYPE_EXT3);
+    type_traits[type].type_name      = type_name;
+    type_traits[type].blck_size      = blck_size;
+    type_traits[type].type_size      = type_size;
+    type_traits[type].is_quantized   = (blck_size > 1 && type_size > 0);
+    type_traits[type].to_float       = to_float;
+    type_traits[type].from_float_ref = from_float_ref;
+}
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
     assert(type >= 0);

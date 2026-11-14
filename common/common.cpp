@@ -1199,6 +1199,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         params.moe_stream_nonpool.cache_ram = params.moe_stream_srv_set && params.cache_ram_mib > 0 ? (int64_t) params.cache_ram_mib << 20 : 0;
         params.moe_stream_nonpool.pinned    = params.moe_stream_slots > 0;
     }
+    if (!params.quant_plugin.empty()) {
+        if (!ggml_quant_plugin_load(params.quant_plugin.c_str())) {
+            LOG_ERR("%s: failed to load quant plugin '%s'\n", __func__, params.quant_plugin.c_str());
+            return;
+        }
+    }
     if (params.moe_stream_plan_only) {
             if (params.moe_stream.empty()) {
             LOG_ERR("%s: --moe-stream-plan-only needs --moe-stream <sidecar.json>\n", __func__);
@@ -1935,6 +1941,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_stream_plan_only        = params.moe_stream_plan_only;
     mparams.moe_stream_oracle           = params.moe_stream_oracle.empty() ? NULL : params.moe_stream_oracle.c_str();
     mparams.moe_stream_oracle_lead      = params.moe_stream_oracle_lead;
+    mparams.quant_plugin                = params.quant_plugin.empty() ? NULL : params.quant_plugin.c_str();
     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     return mparams;

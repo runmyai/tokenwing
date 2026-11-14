@@ -1,6 +1,7 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "ggml-quant-plugin.h"
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -30,6 +31,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/mmid.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -1892,6 +1894,10 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     }
 }
 
+static inline bool ggml_cuda_is_ext_type(ggml_type type) {
+    return type >= GGML_TYPE_EXT0 && type <= GGML_TYPE_EXT3;
+}
+
 static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate,
                                           const ggml_tensor * glu,
@@ -1915,6 +1921,10 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     GGML_ASSERT(ffn_up && ffn_gate && glu);
 
     if (!is_mul_mat && !is_mul_mat_id) {
+        return false;
+    }
+
+    if (ggml_cuda_is_ext_type(ffn_up->src[0]->type) || ggml_cuda_is_ext_type(ffn_gate->src[0]->type)) {
         return false;
     }
 
@@ -2018,6 +2028,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
+
+    if (ggml_cuda_is_ext_type(src0->type)) {
+        return false;
+    }
 
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
@@ -2159,6 +2173,26 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ggml_quant_plugin_has_cuda(src0->type, /*is_id =*/ false)) {
+        const ggml_quant_plugin_api * api = ggml_quant_plugin_get();
+        GGML_ASSERT(api != nullptr && api->mul_mat_cuda != nullptr);
+        const int32_t rc = api->mul_mat_cuda(
+            (int32_t) src0->type,
+            src0->data, (const float *) src1->data, (float *) dst->data,
+            ne00, ne01, ne02, ne03,
+            nb01, nb02, nb03,
+            ne11, ne12, ne13,
+            nb11, nb12, nb13,
+            nb1,  nb2,  nb3,
+            (int32_t) ggml_cuda_get_physical_device(ctx.device),
+            (void *) ctx.stream());
+        if (rc != 0) {
+            const char * why = api->last_error ? api->last_error() : "mul_mat_cuda failed";
+            GGML_ABORT("quant plugin mul_mat_cuda failed (%d): %s", (int) rc, why ? why : "");
+        }
+        return;
+    }
+
     if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
     }
@@ -2277,6 +2311,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return true;
     }
 
+    if (ggml_quant_plugin_has_cuda(src0->type, /*is_id =*/ true)) {
+        return false;
+    }
+
     if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
         if (ggml_is_quantized(src0->type)) {
             if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
@@ -2307,6 +2345,38 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    if (ggml_quant_plugin_has_cuda(src0->type, /*is_id =*/ true)) {
+        GGML_ASSERT(ids->type == GGML_TYPE_I32);
+        const ggml_quant_plugin_api * api = ggml_quant_plugin_get();
+        GGML_ASSERT(api != nullptr && api->mul_mat_id_cuda != nullptr);
+
+        int32_t first_zero = ggml_cuda_moe_zero_first_of(src0->data);
+        const int n_zero_tail = ggml_cuda_moe_zero_tail_of(dst);
+        if (n_zero_tail > 0 && n_zero_tail < ne02) {
+            const int32_t fz_tail = (int32_t) (ne02 - n_zero_tail);
+            first_zero = (first_zero >= 0 && first_zero < fz_tail) ? first_zero : fz_tail;
+        }
+
+        const int32_t rc = api->mul_mat_id_cuda(
+            (int32_t) src0->type,
+            src0->data, (const float *) src1->data, (const int32_t *) ids->data, (float *) dst->data,
+            ne00, ne01, ne02,
+            nb01, nb02,
+            ne11, ne12,
+            nb11, nb12,
+            ids->ne[0],
+            ids->nb[0], ids->nb[1],
+            nb1,        nb2,
+            first_zero,
+            (int32_t) ggml_cuda_get_physical_device(ctx.device),
+            (void *) ctx.stream());
+        if (rc != 0) {
+            const char * why = api->last_error ? api->last_error() : "mul_mat_id_cuda failed";
+            GGML_ABORT("quant plugin mul_mat_id_cuda failed (%d): %s", (int) rc, why ? why : "");
+        }
+        return;
+    }
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
@@ -4751,7 +4821,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             bool feeds = false;
             for (int j = i + 2; j < cgraph->n_nodes && j < i + 18 && !feeds; j++) {
                 const ggml_tensor * t = cgraph->nodes[j];
-                feeds = t->op == GGML_OP_MUL_MAT && t->src[1] == out && ggml_is_quantized(t->src[0]->type);
+                feeds = t->op == GGML_OP_MUL_MAT && t->src[1] == out && ggml_is_quantized(t->src[0]->type) && !ggml_cuda_is_ext_type(t->src[0]->type);
             }
             if (feeds) {
                 ggml_cuda_op_rms_norm_mul_q8_1(*cuda_ctx, node, cgraph->nodes[i + 1]);
@@ -6221,6 +6291,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
                         return true;
+                    case GGML_TYPE_EXT0:
+                    case GGML_TYPE_EXT1:
+                    case GGML_TYPE_EXT2:
+                    case GGML_TYPE_EXT3:
+                        return b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                               ggml_quant_plugin_has_cuda(a->type, op->op == GGML_OP_MUL_MAT_ID);
                     default:
                         return false;
                 }

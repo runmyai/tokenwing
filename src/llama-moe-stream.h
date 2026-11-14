@@ -3479,3 +3479,5 @@ void llama_moe_stream_pred2(ggml_tensor * dst, const ggml_tensor * a, int ith, i
 // Test only (MOE_STREAM_TEST_DOWN_SCALE_COUNT=1): an in-place op on a skipped layer's down input that only reads it - per row,
 // whether its max |x| is above 1024 (the scale step would have scaled it) and above 2^22 (the skip would not be bit-exact)
 void llama_moe_stream_down_scale_count(struct ggml_tensor * dst, const struct ggml_tensor * a, int ith, int nth, void * userdata);
+
+std::string llama_moe_os_read_file_range(const std::string & path, uint64_t off, uint64_t size);

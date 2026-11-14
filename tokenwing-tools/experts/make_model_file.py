@@ -55,7 +55,7 @@ SUMS_LAYERS_KEY = "tokenwing.sums.layers"
 SUMS_VALUES_KEY = "tokenwing.sums.values"
 SUMS_ALGO_KEY = "tokenwing.sums.algorithm"
 SUMS_ALGO = "fnv1a-64"
-BLOB_NAMES = ("correction", "vram_experts", "usage_seed", "layer_order")
+BLOB_NAMES = ("correction", "vram_experts", "usage_seed", "layer_order", "quant_plugin_aux")
 BLOB_JSON_FORMATS = {
     "vram_experts": "tokenwing vram-experts v1",
     "usage_seed": "tokenwing usage v1",
@@ -443,6 +443,7 @@ def main():
     ap.add_argument("--vram-list", help="a 'tokenwing vram-experts v1' JSON to append (used by --moe-stream-vram-experts-file model)")
     ap.add_argument("--usage-seed", help="a 'tokenwing usage v1' JSON to append (the usage table's first seed)")
     ap.add_argument("--layer-order", help="a 'tokenwing layer order v1' JSON to append (the hot-first layer order)")
+    ap.add_argument("--quant-plugin", help="shared library (.so / .dll) implementing ggml_quant_plugin_get_api for external quant conversion")
     ap.add_argument("--no-check", action="store_true", help="skip reading the finished file back and comparing it with the source")
     ap.add_argument("--jobs", type=int, default=0, help="processes for the checksums (default: up to 8)")
     args = ap.parse_args()
@@ -463,6 +464,13 @@ def main():
         blob_sizes = {name: check_blob(name, p) for name, p in blob_files.items()}
 
         t_start = time.time()
+        if args.quant_plugin:
+            from quant_plugin_convert import convert_with_quant_plugin
+            convert_with_quant_plugin(
+                sys.modules[__name__], src, out_path, tmp_path, args.quant_plugin,
+                blob_files, blob_sizes, n_jobs, args.no_check, t_start,
+            )
+            return
         if not os.path.isfile(src):
             raise Refuse(f"{src}: no such file")
         try:

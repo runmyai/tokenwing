@@ -1201,6 +1201,10 @@ static std::string os_read_file_range(const std::string & path, uint64_t off, ui
     return out;
 }
 
+std::string llama_moe_os_read_file_range(const std::string & path, uint64_t off, uint64_t size) {
+    return os_read_file_range(path, off, size);
+}
+
 struct moe_model_file_info {
     std::vector<std::array<uint64_t, 9>>                 sums;       // [n_layer_all]
     std::vector<uint8_t>                                 has_sums;   // [n_layer_all]

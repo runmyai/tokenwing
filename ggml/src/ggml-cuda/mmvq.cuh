@@ -7,6 +7,7 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 // Register an expert pool whose slices [first_zero, ...) are all zeros (false when the table is full)
 bool ggml_cuda_moe_zero_register(const void * pool, int first_zero);
 bool ggml_cuda_moe_zero_unregister(const void * pool);
+int  ggml_cuda_moe_zero_first_of(const void * pool);
 
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
 // based on the quantization type and GPU architecture (compute capability).

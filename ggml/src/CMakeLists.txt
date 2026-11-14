@@ -195,6 +195,7 @@ add_library(ggml-base
             ../include/ggml-backend.h
             ../include/ggml-cpp.h
             ../include/ggml-opt.h
+            ../include/ggml-quant-plugin.h
             ../include/gguf.h
             ggml.c
             ggml.cpp
@@ -202,11 +203,16 @@ add_library(ggml-base
             ggml-backend.cpp
             ggml-backend-meta.cpp
             ggml-opt.cpp
+            ggml-quant-plugin.cpp
             ggml-threading.cpp
             ggml-threading.h
             ggml-quants.c
             ggml-quants.h
             gguf.cpp)
+
+if (UNIX AND CMAKE_DL_LIBS)
+    target_link_libraries(ggml-base PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 set_target_properties(ggml-base PROPERTIES
     VERSION ${GGML_VERSION}

@@ -738,9 +738,14 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
 
             // check that row size is divisible by block size
             if (blck_size == 0 || info.t.ne[0] % blck_size != 0) {
-                GGML_LOG_ERROR("%s: tensor '%s' of type %d (%s) has %" PRId64 " elements per row, "
-                    "not a multiple of block size (%" PRId64 ")\n",
-                    __func__, info.t.name, (int) info.t.type, ggml_type_name(info.t.type), info.t.ne[0], blck_size);
+                if (blck_size == 0 && info.t.type >= GGML_TYPE_EXT0 && info.t.type <= GGML_TYPE_EXT3) {
+                    GGML_LOG_ERROR("%s: tensor '%s' uses extension type %d (%s), which requires --quant-plugin <path>\n",
+                        __func__, info.t.name, (int) info.t.type, ggml_type_name(info.t.type));
+                } else {
+                    GGML_LOG_ERROR("%s: tensor '%s' of type %d (%s) has %" PRId64 " elements per row, "
+                        "not a multiple of block size (%" PRId64 ")\n",
+                        __func__, info.t.name, (int) info.t.type, ggml_type_name(info.t.type), info.t.ne[0], blck_size);
+                }
                 ok = false;
                 break;
             }

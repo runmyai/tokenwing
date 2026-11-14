@@ -165,6 +165,77 @@ def main():
             r = run(src, "-o", WORK / "b.out.gguf", "--usage-seed", bad)
             assert r.returncode == 1 and "tokenwing usage v1" in r.stderr, r.stderr
 
+        @case
+        def refuses_missing_quant_plugin():
+            r = run(src, "-o", WORK / "qp.out.gguf", "--quant-plugin", WORK / "missing_plugin.so")
+            assert r.returncode == 1 and "--quant-plugin" in r.stderr, r.stderr
+            assert not (WORK / "qp.out.gguf").exists()
+
+        @case
+        def converts_and_merges_with_quant_plugin():
+            if os.name == "nt" or not shutil.which("cc"):
+                return
+            inc = TOOLS.parent.parent / "ggml" / "include"
+            c_src = WORK / "mock_plugin.c"
+            so_path = WORK / "libmock_plugin.so"
+            c_src.write_text(
+                '#include <string.h>\n'
+                '#include "ggml-quant-plugin.h"\n'
+                'static int32_t mock_init(void) { return 0; }\n'
+                'static const char * mock_err(void) { return "mock error"; }\n'
+                'static int32_t mock_ti(int32_t i, struct ggml_quant_plugin_type_info * o) {\n'
+                '    memset(o, 0, sizeof(*o));\n'
+                '    if (i == 0) { o->enabled = 1; o->type_name = "ext0"; o->blck_size = 64; o->type_size = 32; o->vec_dot_type = 8; }\n'
+                '    return 0;\n'
+                '}\n'
+                'static void * mock_cc(void) { static int d = 1; return &d; }\n'
+                'static void mock_cd(void * c) { (void)c; }\n'
+                'static int32_t mock_probe(void * c, const char * nm, int32_t st, int32_t nd, const uint64_t * ne,\n'
+                '        const void * hb, size_t hl, uint64_t ms, struct ggml_quant_plugin_tensor_plan * p) {\n'
+                '    (void)c; (void)hb; (void)hl; (void)ms;\n'
+                '    memset(p, 0, sizeof(*p)); p->out_type = st; p->out_n_dims = nd;\n'
+                '    for (int i = 0; i < nd && i < 4; ++i) p->out_ne[i] = ne[i];\n'
+                '    if (strstr(nm, "_exps.weight") && nd == 3) {\n'
+                '        uint64_t nel = ne[0] * ne[1] * ne[2];\n'
+                '        p->action = GGML_QUANT_PLUGIN_TENSOR_TRANSCODE; p->out_type = 43;\n'
+                '        p->src_nbytes = nel * 4; p->out_nbytes = (nel / 64) * 32;\n'
+                '    }\n'
+                '    return 0;\n'
+                '}\n'
+                'static uint64_t mock_aux_sz(void * c) { (void)c; return 64; }\n'
+                'static int32_t mock_tc(void * c, const char * nm, int32_t st, int32_t nd, const uint64_t * ne,\n'
+                '        const void * sb, size_t sl, void * db, size_t dl) {\n'
+                '    (void)c; (void)nm; (void)st; (void)nd; (void)ne; (void)sl;\n'
+                '    const unsigned char * s = (const unsigned char *)sb; unsigned char * d = (unsigned char *)db;\n'
+                '    for (size_t i = 0; i < dl; ++i) d[i] = (unsigned char)(s[i] ^ 0x5Au);\n'
+                '    return 0;\n'
+                '}\n'
+                'static int32_t mock_fin(void * c, void * o, size_t cap, size_t * w) {\n'
+                '    (void)c; if (cap < 64) return -1; memset(o, 0xA5, 64); *w = 64; return 0;\n'
+                '}\n'
+                'static const struct ggml_quant_plugin_api API = {\n'
+                '    1, "mock", "1.0", mock_init, NULL, mock_err, mock_ti, NULL, NULL, NULL,\n'
+                '    mock_cc, mock_cd, mock_probe, mock_aux_sz, mock_tc, mock_fin\n'
+                '};\n'
+                'const struct ggml_quant_plugin_api * ggml_quant_plugin_get_api(void) { return &API; }\n'
+            )
+            cc = subprocess.run(["cc", "-O2", "-shared", "-fPIC", f"-I{inc}", str(c_src), "-o", str(so_path)], capture_output=True, text=True)
+            assert cc.returncode == 0, cc.stderr
+            (WORK / "qp_sp").mkdir()
+            p1, _ = write_split(WORK / "qp_sp" / "m", 2048, experts_in_second=True)
+            merged_out = WORK / "qp_sp" / "merged.tw.gguf"
+            r = run(p1, "-o", merged_out, "--quant-plugin", so_path, "--jobs", 1)
+            assert r.returncode == 0, r.stderr + r.stdout
+            gguf.GGML_QUANT_SIZES[gguf.GGMLQuantizationType.EXT0] = (64, 32)
+            try:
+                rd = gguf.GGUFReader(str(merged_out))
+                assert "split.count" not in rd.fields
+                assert int(rd.fields["tokenwing.blob.quant_plugin_aux.size"].contents()) == 64
+                exps = [t for t in rd.tensors if t.name.endswith("_exps.weight")]
+                assert len(exps) == 9 and all(t.tensor_type == gguf.GGMLQuantizationType.EXT0 for t in exps)
+            finally:
+                gguf.GGML_QUANT_SIZES[gguf.GGMLQuantizationType.EXT0] = (1, 0)
+
         for fn in cases:
             try:
                 fn()

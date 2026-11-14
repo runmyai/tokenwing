@@ -10,10 +10,12 @@
 #include "llama-model-loader.h"
 #include "llama-model-saver.h"
 #include "llama-model.h"
+#include "llama-moe-stream.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "ggml-backend.h"
+#include "ggml-quant-plugin.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -369,6 +371,28 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {0, model_ptr.release()};
         }
 
+        if (!params.no_alloc) {
+            const ggml_quant_plugin_api * api = ggml_quant_plugin_get();
+            if (api != nullptr && api->load_aux_blob != nullptr && ml.metadata != nullptr && !ml.file_paths.empty()) {
+                const int64_t k_off = gguf_find_key(ml.metadata, "tokenwing.blob.quant_plugin_aux.offset");
+                const int64_t k_sz  = gguf_find_key(ml.metadata, "tokenwing.blob.quant_plugin_aux.size");
+                if (k_off >= 0 && k_sz >= 0 &&
+                        gguf_get_kv_type(ml.metadata, k_off) == GGUF_TYPE_UINT64 &&
+                        gguf_get_kv_type(ml.metadata, k_sz)  == GGUF_TYPE_UINT64) {
+                    const uint64_t aux_off = gguf_get_val_u64(ml.metadata, k_off);
+                    const uint64_t aux_sz  = gguf_get_val_u64(ml.metadata, k_sz);
+                    if (aux_sz > 0) {
+                        const std::string blob = llama_moe_os_read_file_range(ml.file_paths[0], aux_off, aux_sz);
+                        const int32_t rc = api->load_aux_blob(blob.data(), blob.size());
+                        if (rc != 0) {
+                            const char * why = api->last_error ? api->last_error() : "load_aux_blob failed";
+                            throw std::runtime_error(format("quant plugin load_aux_blob failed (%d): %s", (int) rc, why ? why : ""));
+                        }
+                    }
+                }
+            }
+        }
+
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
@@ -411,6 +435,13 @@ static struct llama_model * llama_model_load_from_file_impl(
     if (!params.vocab_only && ggml_backend_reg_count() == 0) {
         LLAMA_LOG_ERROR("%s: no backends are loaded. hint: use ggml_backend_load() or ggml_backend_load_all() to load a backend before calling this function\n", __func__);
         return nullptr;
+    }
+
+    if (params.quant_plugin != nullptr && params.quant_plugin[0] != '\0') {
+        if (!ggml_quant_plugin_load(params.quant_plugin)) {
+            LLAMA_LOG_ERROR("%s: failed to load quant plugin '%s'\n", __func__, params.quant_plugin);
+            return nullptr;
+        }
     }
 
     unsigned cur_percentage = 0;

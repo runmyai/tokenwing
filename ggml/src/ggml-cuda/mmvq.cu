@@ -283,6 +283,9 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 
 // Host function: returns the max batch size for the current arch+type at runtime.
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+    if (type >= GGML_TYPE_EXT0 && type <= GGML_TYPE_EXT3) {
+        return 0;
+    }
     // NVIDIA: P100, Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         if (cc == GGML_CUDA_CC_PASCAL || cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
@@ -316,7 +319,7 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
 }
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
-    if (!ggml_is_quantized(type)) {
+    if (!ggml_is_quantized(type) || (type >= GGML_TYPE_EXT0 && type <= GGML_TYPE_EXT3)) {
         return false;
     }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
@@ -681,6 +684,15 @@ bool ggml_cuda_moe_zero_unregister(const void * pool) {
         }
     }
     return false;
+}
+
+int ggml_cuda_moe_zero_first_of(const void * pool) {
+    for (int i = 0; i < g_moe_zero_host_n; ++i) {
+        if (g_moe_zero_host[i].pool == pool) {
+            return g_moe_zero_host[i].first_zero;
+        }
+    }
+    return -1;
 }
 
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>

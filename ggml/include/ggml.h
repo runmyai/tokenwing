@@ -430,7 +430,11 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_EXT0    = 43,
+        GGML_TYPE_EXT1    = 44,
+        GGML_TYPE_EXT2    = 45,
+        GGML_TYPE_EXT3    = 46,
+        GGML_TYPE_COUNT   = 47,
     };
 
     // [TAG_GGML_PREC]
@@ -3082,6 +3086,12 @@ extern "C" {
     GGML_API struct ggml_threadpool_params ggml_threadpool_params_default(int n_threads);
     GGML_API void                          ggml_threadpool_params_init   (struct ggml_threadpool_params * p, int n_threads);
     GGML_API bool                          ggml_threadpool_params_match  (const struct ggml_threadpool_params * p0, const struct ggml_threadpool_params * p1);
+
+    struct ggml_quant_plugin_api;
+    GGML_API bool                               ggml_quant_plugin_load             (const char * path);
+    GGML_API const struct ggml_quant_plugin_api * ggml_quant_plugin_get            (void);
+    GGML_API bool                               ggml_quant_plugin_has_cuda         (enum ggml_type type, bool is_id);
+    GGML_API void                               ggml_quant_plugin_register_cpu_hook(void (*hook)(const struct ggml_quant_plugin_api * api));
 
 #ifdef  __cplusplus
 }

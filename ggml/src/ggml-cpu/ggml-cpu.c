@@ -13,6 +13,7 @@
 #include "vec.h"
 #include "ops.h"
 #include "ggml.h"
+#include "ggml-quant-plugin.h"
 #include "common.h"
 #include "tiled/tiled.h"
 #include "iqk/iqk_port.h"
@@ -213,7 +214,7 @@ typedef pthread_t ggml_thread_t;
 #include <TargetConditionals.h>
 #endif
 
-static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
+static struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
         .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_f32,
@@ -416,7 +417,31 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     },
 };
 
+static void ggml_cpu_apply_quant_plugin(const struct ggml_quant_plugin_api * api) {
+    if (api == NULL || api->get_type_info == NULL) {
+        return;
+    }
+    for (int32_t i = 0; i < GGML_QUANT_PLUGIN_MAX_TYPES; ++i) {
+        struct ggml_quant_plugin_type_info info;
+        memset(&info, 0, sizeof(info));
+        if (api->get_type_info(i, &info) != 0 || !info.enabled) {
+            continue;
+        }
+        const enum ggml_type t = (enum ggml_type) (GGML_TYPE_EXT0 + i);
+        type_traits_cpu[t].from_float   = (ggml_from_float_t) info.from_float_ref;
+        type_traits_cpu[t].vec_dot      = (ggml_vec_dot_t) info.vec_dot;
+        type_traits_cpu[t].vec_dot_type = (enum ggml_type) info.vec_dot_type;
+        type_traits_cpu[t].nrows        = 1;
+    }
+}
+
 const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type) {
+    if (type >= GGML_TYPE_EXT0 && type <= GGML_TYPE_EXT3 && type_traits_cpu[type].vec_dot == NULL) {
+        const struct ggml_quant_plugin_api * api = ggml_quant_plugin_get();
+        if (api != NULL) {
+            ggml_cpu_apply_quant_plugin(api);
+        }
+    }
     return &type_traits_cpu[type];
 }
 
@@ -5730,6 +5755,8 @@ void ggml_cpu_init(void) {
                 ggml_cpu_set_track(atoi(env));
             }
         }
+
+        ggml_quant_plugin_register_cpu_hook(ggml_cpu_apply_quant_plugin);
 
         is_first_call = false;
     }

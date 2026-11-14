@@ -14,6 +14,7 @@ Each mechanism is a flag. Most are off by default, so plain TokenWing behaves li
 | `-ctv, --cache-type-v TYPE` | KV cache data type for V allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1 (default: f16) (env: LLAMA_ARG_CACHE_TYPE_V) |
 | `-np, --parallel N` | number of server slots (default: -1, -1 = auto) (env: LLAMA_ARG_N_PARALLEL) |
 | `-m, --model FNAME` | model path to load (env: LLAMA_ARG_MODEL) |
+| `--quant-plugin PATH` | shared library (.so / .dll) registering external GGML quantization types GGML_TYPE_EXT0..EXT3 (default: none) (env: LLAMA_ARG_QUANT_PLUGIN) |
 | `--host HOST` | IP addresses to listen on, comma-separated, or UNIX socket paths ending in .sock; with multiple TCP addresses, :: binds IPv6 only; overlapping addresses result in undefined behavior (default: 127.0.0.1) (env: LLAMA_ARG_HOST) |
 | `--port PORT` | port to listen (default: 8080) (env: LLAMA_ARG_PORT) |
 | `--api-key KEY` | API key to use for authentication, multiple keys can be provided as a comma-separated list (default: none) (env: LLAMA_API_KEY) |

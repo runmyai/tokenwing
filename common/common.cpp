@@ -1942,6 +1942,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_stream_oracle           = params.moe_stream_oracle.empty() ? NULL : params.moe_stream_oracle.c_str();
     mparams.moe_stream_oracle_lead      = params.moe_stream_oracle_lead;
     mparams.quant_plugin                = params.quant_plugin.empty() ? NULL : params.quant_plugin.c_str();
+    mparams.moe_router_min_w            = params.moe_router_min_w;
+    mparams.moe_router_k_min            = params.moe_router_k_min;
     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     return mparams;

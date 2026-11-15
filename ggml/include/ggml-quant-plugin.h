@@ -8,7 +8,7 @@ extern "C" {
 #endif
 
 #define GGML_QUANT_PLUGIN_ABI_VERSION 1
-#define GGML_QUANT_PLUGIN_MAX_TYPES   4
+#define GGML_QUANT_PLUGIN_MAX_TYPES   6
 #define GGML_QUANT_PLUGIN_ENTRY_NAME  "ggml_quant_plugin_get_api"
 
 enum ggml_quant_plugin_tensor_action {
@@ -23,6 +23,10 @@ typedef void (*ggml_quant_plugin_vec_dot_t)(
         int n, float * s, size_t bs,
         const void * vx, size_t bx,
         const void * vy, size_t by, int nrc);
+typedef void (*ggml_quant_plugin_vec_dot_x4_t)(
+        int n, float * s,
+        const void * vx, size_t bx,
+        const void * vy, int width, int pf);
 
 struct ggml_quant_plugin_type_info {
     int32_t     enabled;
@@ -31,9 +35,10 @@ struct ggml_quant_plugin_type_info {
     size_t      type_size;
     int32_t     vec_dot_type;
     int32_t     has_cuda;
-    ggml_quant_plugin_to_float_t   to_float;
-    ggml_quant_plugin_from_float_t from_float_ref;
-    ggml_quant_plugin_vec_dot_t    vec_dot;
+    ggml_quant_plugin_to_float_t     to_float;
+    ggml_quant_plugin_from_float_t   from_float_ref;
+    ggml_quant_plugin_vec_dot_t      vec_dot;
+    ggml_quant_plugin_vec_dot_x4_t   vec_dot_x4;
 };
 
 struct ggml_quant_plugin_tensor_plan {
@@ -98,6 +103,13 @@ struct ggml_quant_plugin_api {
             void * dst_bytes, size_t dst_len);
     int32_t  (*converter_finalize_aux)(
             void * conv, void * out_aux, size_t out_aux_cap, size_t * out_aux_written);
+
+    // Optional on-load host RAM slot repacking for --moe-stream-cpu-repack.
+    // When dst_slot == NULL and src_plain == NULL, probes whether (ggml_type_id, ne0, ne1)
+    // supports equal-byte in-slot repacking (returns 0 if supported, non-zero otherwise).
+    int32_t  (*repack_expert_slot)(
+            int32_t ggml_type_id, void * dst_slot, const void * src_plain,
+            int64_t ne0, int64_t ne1);
 };
 
 typedef const struct ggml_quant_plugin_api * (*ggml_quant_plugin_get_api_t)(void);

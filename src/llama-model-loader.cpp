@@ -788,7 +788,9 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_EXT0:
             case GGML_TYPE_EXT1:
             case GGML_TYPE_EXT2:
-            case GGML_TYPE_EXT3:    ftype = LLAMA_FTYPE_ALL_F32;        break;
+            case GGML_TYPE_EXT3:
+            case GGML_TYPE_EXT4:
+            case GGML_TYPE_EXT5:    ftype = LLAMA_FTYPE_ALL_F32;        break;
             default:
                 {
                     LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));

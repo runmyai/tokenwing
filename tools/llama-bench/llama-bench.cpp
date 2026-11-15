@@ -337,6 +337,7 @@ struct cmd_params {
     std::vector<std::string>         hf_repo;
     std::vector<std::string>         hf_file;
     std::string                      hf_token;
+    std::string                      quant_plugin;
     bool                             offline;
     std::vector<int>                 n_prompt;
     std::vector<int>                 n_gen;
@@ -383,6 +384,7 @@ static const cmd_params cmd_params_defaults = {
     /* hf_repo              */ {},
     /* hf_file              */ {},
     /* hf_token             */ "",
+    /* quant_plugin         */ "",
     /* offline              */ false,
     /* n_prompt             */ { 512 },
     /* n_gen                */ { 128 },
@@ -458,6 +460,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("                                                    (default: value from HF_TOKEN environment variable)\n");
     printf("  --offline                                         Offline mode: forces use of cache, prevents network access\n");
     printf("                                                    (default: disabled)\n");
+    printf("  --quant-plugin <fname>                            load external ggml quantization plugin shared library\n");
     printf("  -p, --n-prompt <n>                                (default: %s)\n", join(cmd_params_defaults.n_prompt, ",").c_str());
     printf("  -n, --n-gen <n>                                   (default: %s)\n", join(cmd_params_defaults.n_gen, ",").c_str());
     printf("  -pg <pp,tg>                                       (default: %s)\n", join(transform_to_str(cmd_params_defaults.n_pg, pair_str), ",").c_str());
@@ -543,6 +546,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
     }
+    if (const char * env = getenv("GGML_QUANT_PLUGIN")) {
+        params.quant_plugin = env;
+    }
 
     for (int i = 1; i < argc; i++) {
         arg = argv[i];
@@ -586,6 +592,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.hf_token = argv[i];
             } else if (arg == "--offline") {
                 params.offline = true;
+            } else if (arg == "--quant-plugin") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.quant_plugin = argv[i];
             } else if (arg == "-p" || arg == "--n-prompt") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1238,11 +1250,15 @@ struct cmd_params_instance {
     bool               repack;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
+    std::string        quant_plugin;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
 
         mparams.n_gpu_layers = n_gpu_layers;
+        if (!quant_plugin.empty()) {
+            mparams.quant_plugin = quant_plugin.c_str();
+        }
         if (!devices.empty()) {
             mparams.devices = const_cast<ggml_backend_dev_t *>(devices.data());
         }
@@ -1299,6 +1315,7 @@ struct cmd_params_instance {
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                load_mode == other.load_mode && lazy_mode == other.lazy_mode &&
                devices == other.devices && no_host == other.no_host && repack == other.repack &&
+               quant_plugin == other.quant_plugin &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
 
@@ -1386,6 +1403,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .repack                = */ rpk,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .quant_plugin          = */ params.quant_plugin,
             };
             instances.push_back(instance);
         }
@@ -1424,6 +1442,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .repack                = */ rpk,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .quant_plugin          = */ params.quant_plugin,
             };
             instances.push_back(instance);
         }
@@ -1462,6 +1481,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .repack                = */ rpk,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .quant_plugin          = */ params.quant_plugin,
             };
             instances.push_back(instance);
         }

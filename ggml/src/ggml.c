@@ -975,6 +975,18 @@ static struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
+    [GGML_TYPE_EXT4] = {
+        .type_name                = "ext4",
+        .blck_size                = 0,
+        .type_size                = 0,
+        .is_quantized             = false,
+    },
+    [GGML_TYPE_EXT5] = {
+        .type_name                = "ext5",
+        .blck_size                = 0,
+        .type_size                = 0,
+        .is_quantized             = false,
+    },
 };
 
 void ggml_internal_set_ext_type_traits(
@@ -992,7 +1004,7 @@ void ggml_internal_set_ext_type_traits(
         size_t          type_size,
         ggml_to_float_t to_float,
         ggml_from_float_t from_float_ref) {
-    assert(type >= GGML_TYPE_EXT0 && type <= GGML_TYPE_EXT3);
+    assert(type >= GGML_TYPE_EXT0 && type <= GGML_TYPE_EXT5);
     type_traits[type].type_name      = type_name;
     type_traits[type].blck_size      = blck_size;
     type_traits[type].type_size      = type_size;

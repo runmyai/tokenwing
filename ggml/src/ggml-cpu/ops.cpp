@@ -5479,6 +5479,8 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_EXT1:
         case GGML_TYPE_EXT2:
         case GGML_TYPE_EXT3:
+        case GGML_TYPE_EXT4:
+        case GGML_TYPE_EXT5:
             {
                 ggml_compute_forward_get_rows_q(params, dst);
             } break;
@@ -6242,6 +6244,12 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_I32:
         case GGML_TYPE_I64:
         case GGML_TYPE_F64:
+        case GGML_TYPE_EXT0:
+        case GGML_TYPE_EXT1:
+        case GGML_TYPE_EXT2:
+        case GGML_TYPE_EXT3:
+        case GGML_TYPE_EXT4:
+        case GGML_TYPE_EXT5:
         case GGML_TYPE_COUNT:
             {
                 GGML_ABORT("fatal error");

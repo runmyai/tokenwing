@@ -5830,6 +5830,8 @@ class GGMLQuantizationType(IntEnum):
     EXT1    = 44
     EXT2    = 45
     EXT3    = 46
+    EXT4    = 47
+    EXT5    = 48
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6028,6 +6030,8 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.EXT1:    (1, 0),
     GGMLQuantizationType.EXT2:    (1, 0),
     GGMLQuantizationType.EXT3:    (1, 0),
+    GGMLQuantizationType.EXT4:    (1, 0),
+    GGMLQuantizationType.EXT5:    (1, 0),
 }
 
 

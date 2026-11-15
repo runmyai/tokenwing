@@ -538,7 +538,7 @@ struct llama_moe_stream_layer {
     int32_t               vx_li    = -1;   // this layer's index in its group (its slice of the group's vp_table)
     bool                  vp_built = false;   // the last one-token graph built this layer's device pass in its launch
     std::vector<int32_t>  vx_seen;    // remap scratch: the distinct VRAM-held experts of a call
-    bool vx_held(int32_t e) const { return !vx_slot.empty() && vx_slot[e] >= 0; }
+    bool vx_held(int32_t e) const { return e >= 0 && (size_t) e < vx_slot.size() && vx_slot[e] >= 0; }
 
     // stats, one set per phase: prompt processing and decode, so that ms/token means the same
     // thing on both sides of the phase change (the old single set divided the stall by all
@@ -3071,6 +3071,7 @@ struct llama_moe_stream {
     // on every job and it is written by the loader, later, on another thread: a plain bool let -O3 keep
     // it in a register, so the reads kept taking the plain path into a repacked pool (garbage output).
     std::atomic<bool> cpu_repack_on{false};
+    std::atomic<bool> plugin_repack_on{false};
     bool              gpu_waves_warned = false;   // the repacked-pool warning is printed once
     // THE rule "the expert waves of a graph judged by n_tok rows run on the GPU" - n_tok =
     // the ubatch's rows, or a layer-major expert graph's chunk (n_ubatch). The graph's own wave flag and cparams.op_offload are the

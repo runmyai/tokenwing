@@ -866,6 +866,9 @@ struct llama_model {
     // The load's retry passed a shortened --moe-stream-gpu-layers-list it owns - no pointer to it after the load
     void moe_stream_forget_gpu_layers_list() { params.moe_stream_gpu_layers_list = nullptr; }
 
+    float   moe_router_min_w() const { return params.moe_router_min_w; }
+    int32_t moe_router_k_min() const { return params.moe_router_k_min; }
+
 protected:
     llama_model_params params;
 

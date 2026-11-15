@@ -199,6 +199,8 @@ llama_context::llama_context(
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
+    cparams.moe_router_min_w        = model.moe_router_min_w();
+    cparams.moe_router_k_min        = model.moe_router_k_min();
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
@@ -330,7 +332,7 @@ llama_context::llama_context(
     // With --moe-stream-layer-major 1 the engine raises n_batch so a whole prompt arrives in one call (a layer-major
     // call reads each streamed layer's experts about once); --moe-stream-layer-major-batch N caps the raise. n_ubatch keeps the
     // user's value (the line below reads params.n_batch, not the raised one). Tools that cut a prompt themselves read llama_n_batch().
-    if (const auto * ms = model.moe_stream(); ms && ms->p1.layer_major && cparams.causal_attn && llama_arch_layer_major(model.arch)) {
+    if (const auto * ms = ctx_moe_stream(); ms && ms->p1.layer_major && cparams.causal_attn && llama_arch_layer_major(model.arch)) {
         const uint32_t cap = ms->p1.layer_major_batch > 0 ? std::min(cparams.n_ctx, ms->p1.layer_major_batch) : cparams.n_ctx;
         if (cap > cparams.n_batch) {
             fprintf(stderr, "%s: --moe-stream-layer-major 1 raises n_batch %u -> %u (%s) so a prompt of up to %u tokens is one call\n",
@@ -492,8 +494,8 @@ llama_context::llama_context(
         // were short, once per process, so the reload with one whole layer fewer (common) can be tested
         static std::atomic<bool> test_ctx_fail_done{false};
         static const bool test_ctx_fail = getenv("MOE_STREAM_TEST_CTX_ALLOC_FAIL") && atoi(getenv("MOE_STREAM_TEST_CTX_ALLOC_FAIL")) != 0;
-        if (test_ctx_fail && !model.no_alloc() && model.moe_stream() && !model.moe_stream()->gpu_layers.empty() && !test_ctx_fail_done.exchange(true)) {
-            llama_memory_note_alloc_failure(true, model.moe_stream()->pool_dev);   // (as if on the GPU of the VRAM pool)
+        if (test_ctx_fail && !model.no_alloc() && ctx_moe_stream() && !ctx_moe_stream()->gpu_layers.empty() && !test_ctx_fail_done.exchange(true)) {
+            llama_memory_note_alloc_failure(true, ctx_moe_stream()->pool_dev);   // (as if on the GPU of the VRAM pool)
             throw std::runtime_error("failed to allocate buffer for kv cache (TEST ONLY: MOE_STREAM_TEST_CTX_ALLOC_FAIL)");
         }
 
@@ -559,10 +561,10 @@ llama_context::llama_context(
 
         // Not with streamed MoE layers: its copies of every input that crosses devices (4) would hold the RAM pools that the prompt matmuls
         // copy to a GPU (85-234 GiB asked for before the retry without it); whole layers only keep it
-        if (pipeline_parallel && model.moe_stream() != nullptr && !model.moe_stream()->il_of_moe.empty()) {
+        if (pipeline_parallel && ctx_moe_stream() != nullptr && !ctx_moe_stream()->il_of_moe.empty()) {
             pipeline_parallel = false;
             fprintf(stderr, "%s: pipeline parallelism: off - %zu MoE layers are streamed (its copies of every input that crosses devices would "
-                    "include the RAM pools)\n", __func__, model.moe_stream()->il_of_moe.size());
+                    "include the RAM pools)\n", __func__, ctx_moe_stream()->il_of_moe.size());
         }
 
         cparams.pipeline_parallel = pipeline_parallel;
@@ -576,7 +578,7 @@ llama_context::llama_context(
         // --moe-stream-vram-experts: the VRAM expert pool is allocated here, after the KV cache and the compute
         // buffers, so the free VRAM it checks against is what is really left; the compute buffers are then reserved again,
         // because the graphs now carry the pool's device pass. The placement line is printed for every streaming run.
-        if (auto * ms = model.moe_stream()) {
+        if (auto * ms = ctx_moe_stream()) {
             ggml_backend_dev_t         gdev  = nullptr;
             ggml_backend_buffer_type_t gbuft = nullptr;
             ggml_backend_t             gback = ms_pool_backend();   // the GPU of the VRAM pool (--moe-stream-vram-device, else the first GPU)
@@ -754,17 +756,19 @@ llama_context::llama_context(
     // The GPU half of the read-back check. The experts of a whole MoE layer are read by
     // the stock loader out of the model file into VRAM, and nothing else in the engine ever looks at
     // them, so this is the only place where a wrong offset in that path would be caught.
-    llama_moe_stream_verify_gpu_tier(this);
+    if (ctx_moe_stream()) {
+        llama_moe_stream_verify_gpu_tier(this);
+    }
 
     // The context (and the VRAM expert pool) is built - idle-time loading may start after its pause (off: nothing); with
     // --moe-stream-idle-load 2 the RAM pools are filled here first (not for a model loaded without memory)
-    if (auto * ms = model.moe_stream()) {
+    if (auto * ms = ctx_moe_stream()) {
         ms->idle_arm(/* may_fill = */ !model.no_alloc());
     }
 }
 
 llama_context::~llama_context() {
-    if (auto * ms = model.moe_stream(); ms && ms->lend_owner == this) {
+    if (auto * ms = ctx_moe_stream(); ms && ms->lend_owner == this) {
         ms->lend_owner = nullptr;   // (a later context may lend)
         ms->lend_on    = false;
         ms->lend_free_pieces(lend_bufs);
@@ -778,7 +782,7 @@ llama_context::~llama_context() {
         }
     }
 
-    if (model.moe_stream() != nullptr && sched) {   // what the scheduler's re-plans and the VRAM lending place hook cost
+    if (ctx_moe_stream() != nullptr && sched) {   // what the scheduler's re-plans and the VRAM lending place hook cost
         int64_t pl = 0, sy = 0, pn = 0; int nr = 0;
         ggml_backend_sched_get_alloc_times(sched.get(), &pl, &sy, &pn, &nr);
         int why[4];
@@ -938,10 +942,10 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
     // --moe-stream-vram-device, or streamed layers with several GPUs: the prompt matmuls of the RAM pools on the pool's GPU only (without
     // the flag that is the first GPU, where the offload went anyway; with it fixed, the pool's tail can take their copies)
-    if (auto * ms = model.moe_stream(); ms && (ms->pool_dev_set || (!ms->il_of_moe.empty() && sched_n_gpu() > 1))) {
+    if (auto * ms = ctx_moe_stream(); ms && (ms->pool_dev_set || (!ms->il_of_moe.empty() && sched_n_gpu() > 1))) {
         ggml_backend_sched_set_op_offload_backend(sched.get(), ms_pool_backend());
     }
-    if (auto * ms = model.moe_stream()) {   // this context's prompt graphs may plan into lent pool places
+    if (auto * ms = ctx_moe_stream()) {   // this context's prompt graphs may plan into lent pool places
         static const bool lend_off = getenv("MOE_STREAM_TEST_LEND_OFF") && atoi(getenv("MOE_STREAM_TEST_LEND_OFF")) != 0;
         ms->lend_test_off = lend_off;
         ms->lend_free_pieces(lend_bufs);   // (a new scheduler: nothing set on it; the old one's allocator never frees given pieces)
@@ -1019,7 +1023,7 @@ void llama_context::sched_reserve() {
     // VRAM lending for prompts: with the VRAM pool sized from free VRAM, a prompt call's GPU plan lives in lent pool places and the real
     // compute buffer holds only the reply graphs (the prompt graphs below are then planned, not allocated)
     bool lend_now = false;
-    if (auto * ms = model.moe_stream(); ms && ms->lend_owner == this) {
+    if (auto * ms = ctx_moe_stream(); ms && ms->lend_owner == this) {
         lend_clear();
         ms->lend_on = false;
         if (ms->lend_possible() && !model.no_alloc() && !cparams.pipeline_parallel) {
@@ -1042,7 +1046,7 @@ void llama_context::sched_reserve() {
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
-        auto * ms_w = model.moe_stream();
+        auto * ms_w = ctx_moe_stream();
         const bool wide_fail = ms_w && ms_w->el_wide && ms_w->el_test_wide_fail;   // TEST ONLY: the wide reserve "fails"
         // MOE_STREAM_TEST_PROMPT_RESERVE_RESERVE_ABOVE=<rows> (test only) - a prompt reserve of more rows "fails"
         // (not in vx_setup's trials); MOE_STREAM_TEST_PROMPT_RESERVE_TRIAL_FAIL=<n> (test only): the n-th trial reserve of the pool sizing "fails"
@@ -1161,7 +1165,7 @@ void llama_context::sched_reserve() {
 
     // --moe-stream-nonpool-measured 1: the first context's own KV cache and host compute buffers, before a slot holds an expert. The buffers
     // are written once here, so their pages count in the process's memory from now on and every later look can subtract them whole
-    if (auto * ms = model.moe_stream(); ms && ms->p1.nonpool && !ms->np_started && !model.no_alloc()) {
+    if (auto * ms = ctx_moe_stream(); ms && ms->p1.nonpool && !ms->np_started && !model.no_alloc()) {
         int64_t kv_host = 0, compute_host = 0;
         if (memory) {
             for (const auto & [buft, size] : memory->memory_breakdown()) {
@@ -1187,7 +1191,7 @@ void llama_context::synchronize() {
     }
 
     const int64_t t_ho = g_llama_handoff ? ggml_time_us() : 0;
-    auto * ms_tt = model.moe_stream() && model.moe_stream()->vf_test_tick_timers ? model.moe_stream() : nullptr;   // TEST ONLY
+    auto * ms_tt = ctx_moe_stream() && ctx_moe_stream()->vf_test_tick_timers ? ctx_moe_stream() : nullptr;   // TEST ONLY
     const int64_t t_tt = ms_tt ? ggml_time_us() : 0;
     const int64_t t_prof = ggml_prof_enabled() ? ggml_time_us() : 0;
     ggml_backend_sched_synchronize(sched.get());
@@ -1202,7 +1206,7 @@ void llama_context::synchronize() {
     }
 
     // The graph of the last recorded word is done (a no-op unless --moe-stream-record is on)
-    if (auto * mstream = model.moe_stream()) {
+    if (auto * mstream = ctx_moe_stream()) {
         mstream->rec_word_end(ggml_time_us());
     }
 
@@ -1239,6 +1243,10 @@ const llama_model & llama_context::get_model() const {
 
 const llama_cparams & llama_context::get_cparams() const {
     return cparams;
+}
+
+llama_moe_stream * llama_context::ctx_moe_stream() const {
+    return cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ? get_model().moe_stream() : nullptr;
 }
 
 ggml_backend_sched_t llama_context::get_sched() const {
@@ -1886,10 +1894,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // A GPU-wave graph's pool copies live in the VRAM pool's tail - before the graph is built or reused, no expert
     // may be held there (a no-op for every other ubatch and with the feature off)
-    if (auto * ms_t = model.moe_stream(); ms_t && ms_t->tail_on) {
+    if (auto * ms_t = ctx_moe_stream(); ms_t && ms_t->tail_on) {
         ms_t->tail_ubatch(lm_phase == 2 ? (int64_t) cparams.n_ubatch : (int64_t) ubatch.n_tokens);   // layer-major: by the chunk
     }
-    if (auto * ms_p = model.moe_stream(); ms_p && ms_p->ps_slot != nullptr) {
+    if (auto * ms_p = ctx_moe_stream(); ms_p && ms_p->ps_slot != nullptr) {
         ms_p->ps_ubatch(lm_phase == 2 ? 0 : (int64_t) ubatch.n_tokens);   // before the graph (never a layer-major expert graph)
     }
     if (g_tt_ub.on) { g_tt_ub.tail += ggml_time_us() - tt1; }
@@ -1925,19 +1933,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
         // The GPU producer's "router done" - the CPU split of a marked layer gets its inputs from the router slot
-        if (model.moe_stream() && model.moe_stream()->ne_gpu_on()) {
-            ggml_backend_sched_set_input_hook(sched.get(), llama_moe_stream_sched_input_hook, model.moe_stream());
+        if (ctx_moe_stream() && ctx_moe_stream()->ne_gpu_on()) {
+            ggml_backend_sched_set_input_hook(sched.get(), llama_moe_stream_sched_input_hook, ctx_moe_stream());
         }
         // The GPU producer for the word-start sources - the split hook queues each source for the helper once its launch is issued
-        if (model.moe_stream()) {
-            model.moe_stream()->psplit_no_cb = model.moe_stream()->psplit_no_cb || cparams.cb_eval != nullptr;
+        if (ctx_moe_stream()) {
+            ctx_moe_stream()->psplit_no_cb = ctx_moe_stream()->psplit_no_cb || cparams.cb_eval != nullptr;
         }
-        if (model.moe_stream() && (model.moe_stream()->ws_gpu || model.moe_stream()->p1.prompt_split)) {   // (prompt split: the split end)
-            ggml_backend_sched_set_split_hook(sched.get(), llama_moe_stream_sched_split_hook, model.moe_stream());
+        if (ctx_moe_stream() && (ctx_moe_stream()->ws_gpu || ctx_moe_stream()->p1.prompt_split)) {   // (prompt split: the split end)
+            ggml_backend_sched_set_split_hook(sched.get(), llama_moe_stream_sched_split_hook, ctx_moe_stream());
         }
         // No pipeline parallelism (the scheduler's events), or it stays off. With several GPUs the scheduler keeps a pending copy per GPU
         // and waits for each before a CPU split writes the CPU compute buffer (MOE_STREAM_TEST_MULTI_GPU_NO_ASYNC_H2D=1, test only: off there)
-        if (model.moe_stream() && model.moe_stream()->p1.async_h2d) {
+        if (ctx_moe_stream() && ctx_moe_stream()->p1.async_h2d) {
             static const bool test_no_h2d = getenv("MOE_STREAM_TEST_MULTI_GPU_NO_ASYNC_H2D") && atoi(getenv("MOE_STREAM_TEST_MULTI_GPU_NO_ASYNC_H2D")) != 0;
             int n_gpu = 0;
             for (auto & backend : backends) {
@@ -2023,7 +2031,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             // (the engine's one rule: waves_on_gpu)
             bool gpu_waves = false;
             if (moe_waves) {
-                if (auto * mstream = model.moe_stream()) {
+                if (auto * mstream = ctx_moe_stream()) {
                     const int64_t n_w = lm_phase == 2 ? cparams.n_ubatch : ubatch.n_tokens;   // layer-major: by the chunk
                     gpu_waves = mstream->waves_on_gpu(n_w);
                     mstream->n_onewave_host += lm_phase != 2 && mstream->onewave_host(n_w) ? 1 : 0;   // a graph built with them on the CPU
@@ -2034,7 +2042,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             res->ms_chunk      = lm_phase == 2 ? (int64_t) cparams.n_ubatch : 0;
 
             // This graph's pool copies (waves on the GPU) get their memory in the VRAM pool's tail
-            if (auto * ms_t = model.moe_stream(); ms_t && ms_t->tail_on) {
+            if (auto * ms_t = ctx_moe_stream(); ms_t && ms_t->tail_on) {
                 const bool want = moe_waves && gpu_waves && ms_t->tail_hook_ready();
                 ms_t->tail_real = want;
                 ggml_backend_sched_set_copy_hook(sched.get(), want ? llama_moe_stream_sched_copy_hook : nullptr, ms_t);
@@ -2044,7 +2052,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         const int64_t tt_al = g_tt_ub.on ? ggml_time_us() : 0;
         bool alloc_ok = ggml_backend_sched_alloc_graph(sched.get(), gf);
         // Never a failed graph - one whose plan did not fit lends (more), then the real compute buffer
-        if (auto * ms_g = model.moe_stream(); !alloc_ok && ms_g && ms_g->lend_owner == this && ms_g->lend_on) {
+        if (auto * ms_g = ctx_moe_stream(); !alloc_ok && ms_g && ms_g->lend_owner == this && ms_g->lend_on) {
             alloc_ok = lend_alloc_retry();
         }
         if (alloc_ok) {
@@ -2058,7 +2066,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         // TEST ONLY (MOE_STREAM_TEST_GUESS_CHECK): where the combined guess step's norm runs, once per graph build
-        if (const auto * ms = model.moe_stream(); ms && ms->la_gchk != 0) {
+        if (const auto * ms = ctx_moe_stream(); ms && ms->la_gchk != 0) {
             std::string where;
             for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
                 ggml_tensor * t = ggml_graph_node(gf, i);
@@ -2081,7 +2089,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // CPU backend runs the nodes in this order: op A must be below the guess-only and shared-expert nodes, op B below its
         // readers
         static const bool ig_order = getenv("MOE_STREAM_TEST_IG_ORDER") && atoi(getenv("MOE_STREAM_TEST_IG_ORDER")) != 0;
-        if (ig_order && model.moe_stream()) {
+        if (ig_order && ctx_moe_stream()) {
             const int nn = ggml_graph_n_nodes(gf);
             std::unordered_map<const ggml_tensor *, int> idx;
             for (int i = 0; i < nn; i++) {
@@ -2206,11 +2214,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // With --moe-stream-async-h2d the previous compute's last async H2D copies may still be queued
         // on the GPU, reading the CPU compute buffer that set_inputs and this graph's CPU splits write (nothing else synchronizes
         // between two computes) - wait for them first. Between decode words the GPU is already idle here (the logits were read)
-        if (model.moe_stream() && model.moe_stream()->p1.async_h2d && ggml_backend_sched_get_async_host_input(sched.get())) {
-            const int64_t t_tt = model.moe_stream()->vf_test_tick_timers ? ggml_time_us() : 0;
+        if (ctx_moe_stream() && ctx_moe_stream()->p1.async_h2d && ggml_backend_sched_get_async_host_input(sched.get())) {
+            const int64_t t_tt = ctx_moe_stream()->vf_test_tick_timers ? ggml_time_us() : 0;
             ggml_backend_sched_synchronize(sched.get());   // (only when the scheduler really turned it on)
             if (t_tt) {
-                model.moe_stream()->vf_tt_sync_us += ggml_time_us() - t_tt;   // TEST ONLY (MOE_STREAM_TEST_VF_TICK_TIMERS)
+                ctx_moe_stream()->vf_tt_sync_us += ggml_time_us() - t_tt;   // TEST ONLY (MOE_STREAM_TEST_VF_TICK_TIMERS)
             }
         }
 
@@ -2225,7 +2233,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const int64_t t_ho_compute = g_llama_handoff ? ggml_time_us() : 0;
     const int64_t tt3 = g_tt_ub.on ? ggml_time_us() : 0;
-    if (auto * ms = model.moe_stream()) {   // this graph's op-offload decision (built now or reused), for experts_on_cpu
+    if (auto * ms = ctx_moe_stream()) {   // this graph's op-offload decision (built now or reused), for experts_on_cpu
         ms->graph_op_offload = res->ms_op_offload;
         ms->graph_chunk      = res->ms_chunk;
     }
@@ -2541,7 +2549,7 @@ static void llama_moe_stream_la_now(const llama_moe_stream_stats & ms, int64_t (
 // queued. When the engine asks for events (lm_events), one per layer is recorded on the VRAM pool GPU's stream right here: once it
 // has completed, nothing of this call reads the layer's RAM slots (null on a CPU-only run: the work has run when the graph returns)
 void llama_context::lm_signal_done(int il_from, int il_to) {
-    auto * ms = model.moe_stream();
+    auto * ms = ctx_moe_stream();
     if (ms == nullptr || !ms->lm_in_call) {
         return;
     }
@@ -2583,7 +2591,7 @@ int llama_context::sched_n_gpu() const {
 }
 
 ggml_backend_t llama_context::ms_pool_backend() const {
-    const auto * ms = model.moe_stream();
+    const auto * ms = ctx_moe_stream();
     for (const auto & backend : backends) {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
         if (ms != nullptr && ms->pool_dev != nullptr ? dev == ms->pool_dev : ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
@@ -2595,7 +2603,7 @@ ggml_backend_t llama_context::ms_pool_backend() const {
 
 bool llama_context::lm_layer_major_ok(uint32_t n_tokens_all) {
     static const int env_g = getenv("MOE_STREAM_TEST_LM_GROUP") ? atoi(getenv("MOE_STREAM_TEST_LM_GROUP")) : -1;
-    const auto * mstream = model.moe_stream();
+    const auto * mstream = ctx_moe_stream();
     const bool want = env_g > 0 || (env_g < 0 && mstream && mstream->p1.layer_major);
     if (!want || n_tokens_all <= cparams.n_ubatch || lm_force_off) {
         return false;   // off, or one ubatch: nothing to reorder (or this call's layer-major attempt failed)
@@ -2842,7 +2850,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
     } tm_call;
-    if (auto * mstream_tm = model.moe_stream(); mstream_tm && mstream_tm->p1.timing) {
+    if (auto * mstream_tm = ctx_moe_stream(); mstream_tm && mstream_tm->p1.timing) {
         tm_call.ms = mstream_tm;
         tm_call.t0 = ggml_time_us();
         for (int i = 0; i < GGML_PROF_N_SLOTS; i++) {
@@ -2923,10 +2931,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 ms->end_call(complete);
             }
         }
-    } moe_end = { model.moe_stream(), false };
-    if (model.moe_stream()) {
-        model.moe_stream()->idle_call_start();   // before anything of the call runs, the queued idle reads are taken back
-        model.moe_stream()->el_enter();   // before the graph is reserved, the pressure thread waits for the call's end
+    } moe_end = { ctx_moe_stream(), false };
+    if (ctx_moe_stream()) {
+        ctx_moe_stream()->idle_call_start();   // before anything of the call runs, the queued idle reads are taken back
+        ctx_moe_stream()->el_enter();   // before the graph is reserved, the pressure thread waits for the call's end
     }
     if (tt_call.on) { moe_tt("D idle_el"); }
 
@@ -3109,7 +3117,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // that its stall, reads and misses are per phase. A decode step is a single token that continues
     // a sequence (pos > 0); a batch of several tokens, or the first token of a sequence, is prompt
     // processing - even when the prompt is split into ubatches of one token each.
-    if (auto * mstream = model.moe_stream()) {
+    if (auto * mstream = ctx_moe_stream()) {
         const auto & b = balloc->get_batch();
 
         // A small batch that continues exactly where the last decode batch ended is decoding as
@@ -3195,7 +3203,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     struct lm_reset_t {   // back to whole graphs on every way out of decode(), and the call's tensors freed (up to about 60 KiB per token)
         llama_context & c;
         ~lm_reset_t() {
-            if (auto * ms = c.model.moe_stream(); ms && ms->lm_in_call) {
+            if (auto * ms = c.ctx_moe_stream(); ms && ms->lm_in_call) {
                 ms->lm_call_end(c.lm_complete);   // on every way out of a layer-major call
             }
             c.lm_complete = false;
@@ -3213,7 +3221,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // reaches do not fit the VRAM pool's held places is processed as layer-major pieces that do (each starts where the last ended, so a
     // sliding window stays whole). Only where the pieces before the last ask for no output (a prompt's), and no token carries an embedding
     // or a state; else the call runs as it is (the pool gives way, never a failure)
-    if (auto * ms = model.moe_stream(); lm_on && !lm_force_off && ms && ms->lend_owner == this && ms->lend_on && ms->lm_lend_on()) {
+    if (auto * ms = ctx_moe_stream(); lm_on && !lm_force_off && ms && ms->lend_owner == this && ms->lend_on && ms->lm_lend_on()) {
         const int64_t kv0 = (int64_t) balloc->get_batch().pos[0];
         const int64_t t_fit = ms->lm_lend_max_tokens(lm_call_bytes_per_tok(model.hparams), kv0)/cparams.n_ubatch*cparams.n_ubatch;
         if (t_fit >= (int64_t) cparams.n_ubatch && t_fit < (int64_t) n_tokens_all) {
@@ -3244,7 +3252,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     }
     const int lm_g = lm_on ? lm_group() : 0;
-    if (auto * ms_c = model.moe_stream(); ms_c && !ms_c->is_decode() && n_tokens_all > 1) {   // the prompt calls (the exit line)
+    if (auto * ms_c = ctx_moe_stream(); ms_c && !ms_c->is_decode() && n_tokens_all > 1) {   // the prompt calls (the exit line)
         n_prompt_calls += 1;
         if (prompt_calls.size() < 64) {   // (the first 64 only: a long-running server's list stays bounded; the count goes on)
             prompt_calls.push_back({ (int64_t) n_tokens_all, lm_on });
@@ -3280,7 +3288,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
         fprintf(stderr, "%s: layer-major: %s - this call runs ubatch by ubatch instead (no layer-major for it; slower)\n", __func__, what);
-        if (auto * ms = model.moe_stream(); ms && ms->lm_in_call) {
+        if (auto * ms = ctx_moe_stream(); ms && ms->lm_in_call) {
             ms->lm_call_end(false);
         }
         lm_complete = false; lm_il0 = 0; lm_il1 = -1; lm_reapply = false; lm_on = false; lm_row0 = 0; lm_phase = 0;
@@ -3302,7 +3310,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // whole call's expert input into the CPU compute buffer, uncounted) - otherwise whole layers
     bool lm_split = lm_on && !lm_group_test();
     if (lm_split) {
-        const auto * ms = model.moe_stream();
+        const auto * ms = ctx_moe_stream();
         const bool cpu_only = ggml_backend_dev_type(model.dev_layer(0)) == GGML_BACKEND_DEVICE_TYPE_CPU;
         const bool gpu_waves_chunk = ms && ms->gpu_waves > 0 && cparams.n_ubatch >= ms->gpu_waves && !ms->cpu_repack_on.load() &&
                                      cparams.op_offload;
@@ -3339,7 +3347,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // the FFN combine's inject weights lm_inj [hc, T]; with a GPU expert pool that has a tail they all live in the tail's
         // extension (vacated for this call's GPU-wave graphs first), else in a buffer of their own
         if (lm_last0 > 0) {
-            auto * ms = model.moe_stream();
+            auto * ms = ctx_moe_stream();
             const int64_t k  = hparams.n_expert_used();
             const int64_t hc = std::max<int64_t>(1, hparams.dsv4_hc_mult);
             ggml_init_params ip = { 6*ggml_tensor_overhead(), nullptr, true };
@@ -3435,16 +3443,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                         placed ? "in the VRAM pool (its tail / expert places lent for the call)" : (std::string("in a buffer of their own on ") + ggml_backend_dev_name(dev)).c_str());
             }
         }
-        if (auto * ms = model.moe_stream(); ms && ms->lend_owner == this && ms->lend_on && !ms->is_decode()) {
+        if (auto * ms = ctx_moe_stream(); ms && ms->lend_owner == this && ms->lend_on && !ms->is_decode()) {
             lend_call_start(false, (int64_t) n_tokens_all, lend_kv);   // a layer-major prompt call lends after the front places
         }
-        if (auto * ms = model.moe_stream(); ms && lm_last0 > 0) {   // the window's call start (the call-level prompt-end rule)
+        if (auto * ms = ctx_moe_stream(); ms && lm_last0 > 0) {   // the window's call start (the call-level prompt-end rule)
             static const bool pe_all = getenv("MOE_STREAM_PROMPT_END_ALL") && atoi(getenv("MOE_STREAM_PROMPT_END_ALL")) != 0;
             ms->lm_call_begin(n_tokens_all, !ms->is_decode() && n_tokens_all > 1 && n_outputs_all > 0 &&
                     (pe_all || n_tokens_all < cparams.n_batch));
         }
         for (int il0 = 0; il0 < lm_last0; il0 += lm_g) {
-            if (auto * ms = model.moe_stream()) {
+            if (auto * ms = ctx_moe_stream()) {
                 ms->lm_layer_begin(il0);
             }
             const bool psplit_now = psplit_here && il0 > 0;   // (test only, once)
@@ -3464,7 +3472,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             lm_il1     = il0 + lm_g;
             lm_reapply = il0 > 0;
             // A streamed layer runs lm_phase 1 per ubatch, then one expert graph for the whole call (below)
-            lm_phase   = lm_split && model.moe_stream() && model.moe_stream()->layer(il0) != nullptr ? 1 : 0;
+            lm_phase   = lm_split && ctx_moe_stream() && ctx_moe_stream()->layer(il0) != nullptr ? 1 : 0;
             llama_ubatch lm_ub_first;
             size_t u = 0;
             int64_t lm_tok_prev = 0;
@@ -3476,7 +3484,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     lm_ub_first = ub;
                 }
                 n_outputs = ub.n_tokens;   // (no output rows in these graphs; process_ubatch only sizes the graph by it)
-                if (auto * mstream = model.moe_stream()) {
+                if (auto * mstream = ctx_moe_stream()) {
                     // the same prompt-end rule as the loop below, for every layer group: the last ubatch of a short prompt
                     // batch with an output orders its waves so the reply's experts stay (otherwise the groups before the last see
                     // whatever the previous call left)
@@ -3519,15 +3527,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 ube.n_tokens     = n_tokens_all;
                 ube.n_seq_tokens = n_tokens_all;
                 n_outputs = n_tokens_all;
-                if (auto * mstream = model.moe_stream()) {   // the call's prompt-end rule (the usual one, for the whole call)
+                if (auto * mstream = ctx_moe_stream()) {   // the call's prompt-end rule (the usual one, for the whole call)
                     static const bool pe_all = getenv("MOE_STREAM_PROMPT_END_ALL") && atoi(getenv("MOE_STREAM_PROMPT_END_ALL")) != 0;
                     mstream->set_prompt_end(!mstream->is_decode() && n_tokens_all > 1 && n_outputs_all > 0 &&
                             (pe_all || n_tokens_all < cparams.n_batch));
                 }
                 ggml_status st = GGML_STATUS_SUCCESS;
-                model.moe_stream()->lm_expert_graph = true;    // the tail's copy hook: a wave's chunks share one pool copy
+                ctx_moe_stream()->lm_expert_graph = true;    // the tail's copy hook: a wave's chunks share one pool copy
                 const auto * res_e = process_ubatch(ube, ctx_type_to_graph_type(cparams.ctx_type), nullptr, st);
-                model.moe_stream()->lm_expert_graph = false;
+                ctx_moe_stream()->lm_expert_graph = false;
                 if (!res_e) {
                     LLAMA_LOG_ERROR("%s: layer-major: the expert graph of layer %d failed\n", __func__, il0);
                     const bool cut = lm_remove_call();
@@ -3576,7 +3584,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         lm_il0     = lm_last0;
         lm_il1     = -1;
         lm_reapply = lm_last0 > 0;
-        if (auto * ms = model.moe_stream(); ms && lm_last0 < (int) hparams.n_layer()) {
+        if (auto * ms = ctx_moe_stream(); ms && lm_last0 < (int) hparams.n_layer()) {
             ms->lm_layer_begin(lm_last0);   // the last group (per ubatch, as without layer-major)
         }
         static bool said = false;
@@ -3589,7 +3597,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     format("the last group from layer %d", lm_last0).c_str(), cparams.n_ubatch);
         }
     }
-    if (auto * ms = model.moe_stream(); !lm_on && ms && ms->lend_owner == this && ms->lend_on && !ms->is_decode()) {
+    if (auto * ms = ctx_moe_stream(); !lm_on && ms && ms->lend_owner == this && ms->lend_on && !ms->is_decode()) {
         lend_call_start(false, (int64_t) n_tokens_all, lend_kv);   // a prompt call that is not layer-major lends at its start too
     }
     do {
@@ -3623,7 +3631,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // (common_batch_get_one), so only the short last piece is the prompt's end; a prompt that is an exact multiple
         // of n_batch is missed. MOE_STREAM_PROMPT_END_ALL=1 drops the length test (llama-perplexity's pieces are all
         // full, and that is how the numerics of the order are measured).
-        if (auto * mstream = model.moe_stream()) {
+        if (auto * mstream = ctx_moe_stream()) {
             static const bool pe_all = getenv("MOE_STREAM_PROMPT_END_ALL") && atoi(getenv("MOE_STREAM_PROMPT_END_ALL")) != 0;
             mstream->set_prompt_end(!mstream->is_decode() && n_tokens_all > 1 && n_outputs > 0 &&
                     n_tokens_prev + (int64_t) ubatch.n_tokens == (int64_t) n_tokens_all &&
@@ -3699,7 +3707,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // A streamed model's output is checked for non-finite values (--moe-stream-out-check N: every prompt call and every Nth reply
         // call; 0 = never), on 256 logits of the last output row: a wrong expert byte becomes NaN in every later row, and the call fails
         // here with one line (its sequences' memory dropped, so nothing reuses it) instead of giving a wrong answer
-        if (auto * ms_o = model.moe_stream(); ms_o && t_logits && n_outputs > 0 && ms_o->out_check_due(ubatch.n_tokens > 1)) {
+        if (auto * ms_o = ctx_moe_stream(); ms_o && t_logits && n_outputs > 0 && ms_o->out_check_due(ubatch.n_tokens > 1)) {
             ggml_backend_t be_o = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             const int64_t  nv   = t_logits->ne[0];
             const int64_t  nr   = std::min<int64_t>(256, nv);
@@ -4244,7 +4252,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_HY_V4 ||
         // The MoE expert streaming adds nodes to every streamed layer's graph (the remap op, the pool views, the guess, the
         // waves) whatever the architecture: Flint's graph ran out of the 8-per-tensor budget below at its first prompt
-        model.moe_stream() != nullptr) {
+        ctx_moe_stream() != nullptr) {
         res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
         // DFlash2's convolutions and selector are shape work rather than matmuls,
@@ -4393,7 +4401,7 @@ ggml_cgraph * llama_context::graph_reserve(
     // (the engine's one rule, waves_on_gpu)
     bool gpu_waves = false;
     if (moe_waves) {
-        if (const auto * mstream = model.moe_stream()) {
+        if (const auto * mstream = ctx_moe_stream()) {
             gpu_waves = mstream->waves_on_gpu(n_tokens);
         }
     }
@@ -4405,7 +4413,7 @@ ggml_cgraph * llama_context::graph_reserve(
     ggml_backend_sched_set_op_offload(sched.get(), reserve_offload);
 
     // The reserved graph is scheduled with the same hook, so the compute buffer is sized without the pool copies
-    if (auto * ms_t = model.moe_stream(); ms_t && ms_t->tail_on) {
+    if (auto * ms_t = ctx_moe_stream(); ms_t && ms_t->tail_on) {
         ms_t->tail_real = false;
         ggml_backend_sched_set_copy_hook(sched.get(), moe_waves && gpu_waves && ms_t->tail_hook_ready() ? llama_moe_stream_sched_copy_hook : nullptr, ms_t);
     }
@@ -4424,7 +4432,7 @@ ggml_cgraph * llama_context::graph_reserve(
     }
 
     // what the reserve asked for, per backend, next to what the run uses (printed once, below)
-    if (!split_only && model.moe_stream() != nullptr && !getenv("MOE_STREAM_QUIET_RESERVE")) {   // not on stock runs
+    if (!split_only && ctx_moe_stream() != nullptr && !getenv("MOE_STREAM_QUIET_RESERVE")) {   // not on stock runs
         std::string per_backend;
 
         for (const auto & backend_ptr : backends) {
@@ -4453,7 +4461,7 @@ ggml_cgraph * llama_context::graph_reserve(
 // this model, -ub, context and pool, not a fixed count
 void llama_context::lm_measure_expert_graph() {
     lm_xg = {};
-    auto * ms = model.moe_stream();
+    auto * ms = ctx_moe_stream();
     const uint32_t ub = std::min(cparams.n_ctx, cparams.n_ubatch);
     if (!ms || !ms->p1.layer_major || !llama_arch_layer_major(model.arch) || cparams.n_batch < 2*ub || !gf_res_reserve) {
         return;
@@ -4553,7 +4561,7 @@ bool llama_context::lm_xg_fits(int64_t n_tok) const {
     if (!lm_xg.on) {
         return true;
     }
-    const int64_t cw = ((n_tok + lm_xg.ub - 1)/lm_xg.ub)*std::max<int64_t>(lm_xg.w, model.moe_stream()->n_waves(n_tok));
+    const int64_t cw = ((n_tok + lm_xg.ub - 1)/lm_xg.ub)*std::max<int64_t>(lm_xg.w, ctx_moe_stream()->n_waves(n_tok));
     return (lm_xg.per_n <= 0 || lm_xg.base_n + (cw + 1)*lm_xg.per_n <= lm_xg.room_n) &&
            (lm_xg.per_m <= 0 || lm_xg.base_m + (cw + 1)*lm_xg.per_m <= lm_xg.room_m);
 }
@@ -4564,7 +4572,7 @@ bool llama_context::lm_xg_fits(int64_t n_tok) const {
 // n_ubatch chunk: its peak does not grow with the call). The call's own tensors (hidden state, expert input, picks, weights) are
 // stand-ins in the pool's buffer - a reserve never writes them. false = a graph could not be built / each() said stop
 bool llama_context::lend_lm_graphs(const llama_memory_context_i * mctx, const std::function<bool(void)> & each) {
-    auto * ms = model.moe_stream();
+    auto * ms = ctx_moe_stream();
     const auto & hp = model.hparams;
     const bool gpu_waves_chunk = ms->gpu_waves > 0 && cparams.n_ubatch >= ms->gpu_waves && !ms->cpu_repack_on.load() && cparams.op_offload;
     const bool split = gpu_waves_chunk;   // (as decode's lm_split on a GPU run)
@@ -4622,7 +4630,7 @@ bool llama_context::lend_lm_graphs(const llama_memory_context_i * mctx, const st
 // what stays in the real buffer. stays (alloc): the GPU tensors of the reserved graphs that did not go into a piece
 bool llama_context::lend_measure(const llama_memory_context_i * mctx, const std::vector<int64_t> & t_pts, std::vector<int64_t> & by_t,
                                 int64_t & lm, bool alloc, std::map<std::string, std::pair<int64_t, int>> * stays) {
-    auto * ms = model.moe_stream();
+    auto * ms = ctx_moe_stream();
     std::vector<size_t> sz(backend_ptrs.size(), 0);
     by_t.assign(t_pts.size(), 0);
     lm = 0;
@@ -4683,7 +4691,7 @@ bool llama_context::lend_measure(const llama_memory_context_i * mctx, const std:
 // the lend gives (partial when the pool cannot give it all) - a tensor no piece can hold stays in the real buffer. Off - one line,
 // the plain compute buffer - only when the pool's pieces would hold none of the plan
 bool llama_context::lend_decide(const llama_memory_context_i * mctx) {
-    auto * ms = model.moe_stream();
+    auto * ms = ctx_moe_stream();
     lend_be = -1;
     for (size_t i = 0; i < backend_ptrs.size(); i++) {
         if (ggml_backend_get_device(backend_ptrs[i]) == ms->vx_dev) {
@@ -4852,7 +4860,7 @@ bool llama_context::lend_decide(const llama_memory_context_i * mctx) {
 // Set the pieces of a lend on the scheduler (the next graph re-plans into them; the real buffer may grow only when asked); the
 // last set's buffers are freed now
 void llama_context::lend_set(std::vector<ggml_backend_buffer_t> && bufs, const std::vector<int32_t> & U, bool may_grow) {
-    auto * ms = model.moe_stream();
+    auto * ms = ctx_moe_stream();
     ms->lend_free_pieces(lend_bufs_old);
     lend_bufs_old = std::move(lend_bufs);
     lend_bufs     = std::move(bufs);
@@ -4864,7 +4872,7 @@ void llama_context::lend_set(std::vector<ggml_backend_buffer_t> && bufs, const s
 
 // The real compute buffer again (the next graph re-plans into it)
 void llama_context::lend_clear() {
-    auto * ms = model.moe_stream();
+    auto * ms = ctx_moe_stream();
     if ((lend_bufs.empty() && !lend_no_grow) || ms == nullptr) {
         return;
     }
@@ -4886,7 +4894,7 @@ void llama_context::lend_clear() {
 // stay (no re-plan; the places vacated again, the end fill may have refilled them). A lend that cannot give the plan lends what it can
 // (the rest stays in the real buffer)
 void llama_context::lend_call_start(bool dec, int64_t T, int64_t kv) {
-    auto * ms = model.moe_stream();
+    auto * ms = ctx_moe_stream();
     lend_kv = kv;
     lend_T  = T;
     lend_start_failed = false;
@@ -4941,7 +4949,7 @@ void llama_context::lend_call_start(bool dec, int64_t T, int64_t kv) {
 // forced-low test): this call's real buffer may grow (the pieces set stay), and later calls lend 25 % more (the
 // slack learns, up to 4x); last, the real buffer alone. One line each (the first few)
 bool llama_context::lend_alloc_retry() {
-    auto * ms = model.moe_stream();
+    auto * ms = ctx_moe_stream();
     static const bool test_no_grow = getenv("MOE_STREAM_TEST_LEND_NO_GROW") && atoi(getenv("MOE_STREAM_TEST_LEND_NO_GROW")) != 0;   // TEST ONLY
     // the same split graph planned again (never split again: the failed allocation's split already pointed its nodes at the scheduler's
     // input copies - a second split of it reads those as its own tensors, and the graph that reaches the GPU is not the allocated one)
@@ -5017,8 +5025,8 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
-        /*.mstream     =*/ model.moe_stream(),
-        /*.mstream_gen =*/ model.moe_stream() ? model.moe_stream()->graph_gen ^ (model.moe_stream()->ne_gpu_graph() ? 0x80000000u : 0u) : 0u,   // a needed-early one-token graph is not reused in another kind of call
+        /*.mstream     =*/ ctx_moe_stream(),
+        /*.mstream_gen =*/ ctx_moe_stream() ? ctx_moe_stream()->graph_gen ^ (ctx_moe_stream()->ne_gpu_graph() ? 0x80000000u : 0u) : 0u,   // a needed-early one-token graph is not reused in another kind of call
         /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
@@ -5907,7 +5915,7 @@ llama_memory_recurrent * llama_context::cc_recr() const {
 // only where the call runs layer by layer (Ling-3.0 with --moe-stream-layer-major 1), with a recurrent part and no rollback planes;
 // elsewhere the server keeps cutting the prompt (the default)
 bool llama_context::call_checkpoints_ok() const {
-    const auto * ms   = model.moe_stream();
+    const auto * ms   = ctx_moe_stream();
     const auto * recr = cc_recr();
     return ms != nullptr && ms->p1.layer_major && model.arch == LLM_ARCH_BAILINGMOE3 && recr != nullptr && recr->n_rs_seq == 0 &&
            cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP && !cparams.embeddings;
@@ -7586,18 +7594,18 @@ static std::string moe_stream_router_json(const llama_model & model, const llama
 }
 
 void llama_moe_stream_print_stats(const llama_context * ctx) {
-    if (ctx && ctx->get_model().moe_stream()) {
-        ctx->get_model().moe_stream()->print_stats();
+    if (ctx && ctx->ctx_moe_stream()) {
+        ctx->ctx_moe_stream()->print_stats();
 
-        if (ctx->get_model().moe_stream()->rec_on()) {
-            ctx->get_model().moe_stream()->rec_write(moe_stream_router_json(ctx->get_model(), *ctx->get_model().moe_stream()));
+        if (ctx->ctx_moe_stream()->rec_on()) {
+            ctx->ctx_moe_stream()->rec_write(moe_stream_router_json(ctx->get_model(), *ctx->ctx_moe_stream()));
         }
     }
 }
 
 void llama_moe_stream_idle(const llama_context * ctx) {
-    if (ctx && ctx->get_model().moe_stream()) {
-        ctx->get_model().moe_stream()->el_reply_end();
+    if (ctx && ctx->ctx_moe_stream()) {
+        ctx->ctx_moe_stream()->el_reply_end();
     }
 }
 

@@ -13,8 +13,9 @@ import gguf
 from gguf.constants import GGUFValueType
 
 PLUGIN_ABI_VERSION = 1
+PLUGIN_SUPPORTED_ABI_VERSIONS = (1,)
 PLUGIN_EXT_BASE = 43
-PLUGIN_MAX_TYPES = 4
+PLUGIN_MAX_TYPES = 6
 ACTION_KEEP = 0
 ACTION_REHEADER = 1
 ACTION_TRANSCODE = 2
@@ -32,6 +33,7 @@ class _PluginTypeInfo(ctypes.Structure):
         ("to_float", ctypes.c_void_p),
         ("from_float_ref", ctypes.c_void_p),
         ("vec_dot", ctypes.c_void_p),
+        ("vec_dot_x4", ctypes.c_void_p),
     ]
 
 
@@ -72,6 +74,7 @@ class _PluginAPI(ctypes.Structure):
             ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t)),
         ("converter_finalize_aux", ctypes.CFUNCTYPE(
             ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t))),
+        ("repack_expert_slot", ctypes.c_void_p),
     ]
 
 
@@ -126,7 +129,7 @@ class QuantPluginBridge:
         if not api_ptr:
             raise refuse_cls(f"--quant-plugin {plugin_path}: ggml_quant_plugin_get_api returned NULL")
         self.api = api_ptr.contents
-        if self.api.abi_version != PLUGIN_ABI_VERSION:
+        if self.api.abi_version not in PLUGIN_SUPPORTED_ABI_VERSIONS:
             raise refuse_cls(f"--quant-plugin {plugin_path}: unsupported ABI version {self.api.abi_version}")
         if bool(self.api.init) and self.api.init() != 0:
             raise refuse_cls(f"--quant-plugin {plugin_path}: init failed: {self.last_error()}")

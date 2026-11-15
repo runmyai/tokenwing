@@ -573,7 +573,9 @@ extern "C" {
         const char * moe_stream_gpu_layers_device; // whole MoE layers per GPU, "DEV=LIST;DEV=LIST" (LIST: layers and ranges a-b): their
                                                 //      experts on DEV whatever device holds the layer; NULL = on the layer's own device.
                                                 //      The layers themselves come from moe_stream_gpu_layers_list (common fills it)
-        const char * quant_plugin;              // shared library (.so / .dll) registering GGML_TYPE_EXT0..EXT3, NULL = none
+        const char * quant_plugin;              // shared library (.so / .dll) registering GGML_TYPE_EXT0..EXT5, NULL = none
+        float        moe_router_min_w;          // minimum normalized routing weight beyond moe_router_k_min (0 = off)
+        int32_t      moe_router_k_min;          // minimum top-k experts always kept when moe_router_min_w > 0 (default 4)
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights

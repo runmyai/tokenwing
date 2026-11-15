@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moe-stream.h"
+#include "ggml-quant-plugin.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
@@ -2786,6 +2787,49 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
     }
+
+    const int32_t n_layer_tot  = std::max<int32_t>(1, (int32_t) n_layer);
+    const float   depth_frac   = (il >= 0 && il < n_layer_tot)
+            ? (float) il / (float) std::max<int32_t>(1, n_layer_tot - 1)
+            : 1.0f;
+    const float   eff_min_w    = cparams.moe_router_min_w * depth_frac * depth_frac;
+    const int32_t router_k_min = std::max<int32_t>(1, cparams.moe_router_k_min);
+    if (eff_min_w > 0.0f && n_expert_used > router_k_min && n_tokens > 0) {
+        ggml_tensor * w2d        = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+        ggml_tensor * w_sum_orig = ggml_clamp(ctx0, ggml_sum_rows(ctx0, w2d), 6.103515625e-5f, INFINITY);
+        ggml_tensor * w_rel      = ggml_div(ctx0, w2d, w_sum_orig);
+        ggml_tensor * prefix_exc = ggml_sub(ctx0, ggml_cumsum(ctx0, w_rel), w_rel);
+        ggml_tensor * tail_mass  = ggml_add(ctx0, ggml_scale(ctx0, prefix_exc, -1.0f), ggml_sum_rows(ctx0, w_rel));
+
+        ggml_tensor * rank       = ggml_arange(ctx0, 0.0f, (float) n_expert_used, 1.0f);
+        ggml_tensor * kmin_mask  = ggml_step(ctx0, ggml_scale_bias(ctx0, rank, -1.0f, (float) router_k_min - 0.5f));
+        ggml_tensor * bias_1d    = ggml_scale_bias(ctx0, kmin_mask, 1.0f + eff_min_w, -eff_min_w);
+        ggml_tensor * keep_mask  = ggml_step(ctx0, ggml_add(ctx0, tail_mass, bias_1d));
+
+        w2d = ggml_mul(ctx0, w2d, keep_mask);
+        if (norm_w || gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT || gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX) {
+            ggml_tensor * w_sum_kept = ggml_clamp(ctx0, ggml_sum_rows(ctx0, w2d), 6.103515625e-5f, INFINITY);
+            w2d = ggml_mul(ctx0, w2d, ggml_div(ctx0, w_sum_orig, w_sum_kept));
+        }
+        weights = ggml_reshape_3d(ctx0, w2d, 1, n_expert_used, n_tokens);
+        cb(weights, "ffn_moe_weights_pruned", il);
+
+        const ggml_tensor * up_src = up_exps && up_exps->view_src ? up_exps->view_src : up_exps;
+        const bool up_on_dev = up_src && up_src->buffer && !ggml_backend_buffer_is_host(up_src->buffer);
+        const bool can_sentinel_skip = (mstream != nullptr && mstream->layer(il) != nullptr) ||
+                (up_on_dev && !up_exps_s && !gate_exps_s && !down_exps_s &&
+                 !up_exps_b && !gate_exps_b && !down_exps_b &&
+                 ggml_quant_plugin_has_cuda(up_exps->type, /*is_id =*/ true));
+        if (can_sentinel_skip) {
+            ggml_tensor * f_sel      = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
+            ggml_tensor * prune_mask = ggml_scale_bias(ctx0, keep_mask, -1.0f, 1.0f);
+            ggml_tensor * f_pruned   = ggml_add(ctx0, ggml_mul(ctx0, f_sel, keep_mask),
+                                                ggml_scale(ctx0, prune_mask, (float) n_expert));
+            selected_experts = ggml_cast(ctx0, f_pruned, GGML_TYPE_I32);
+            cb(selected_experts, "ffn_moe_topk_pruned", il);
+        }
+    }
+
     if (w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
@@ -2811,7 +2855,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // it runs in the GPU window and is ready for the VRAM pass and the join. Same ops on the same inputs.
     // MOE_STREAM_TEST_WEIGHTS_EARLY=1 (test only) keeps the old order for the A/B.
     static const bool weights_early_test = getenv("MOE_STREAM_TEST_WEIGHTS_EARLY") && atoi(getenv("MOE_STREAM_TEST_WEIGHTS_EARLY")) != 0;
-    const bool weights_deferred = !weights_early_test && mstream && mstream->p1.fused_route && hparams.n_expert_groups > 1 &&
+    const bool weights_deferred = !(cparams.moe_router_min_w > 0.0f) &&
+            !weights_early_test && mstream && mstream->p1.fused_route && hparams.n_expert_groups > 1 &&
             n_tokens == 1 && mstream->ne_gpu_graph() && mstream->ne_rd_layer_on(il);
     bool weights_expanded = false;
 

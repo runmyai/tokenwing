@@ -434,7 +434,9 @@ extern "C" {
         GGML_TYPE_EXT1    = 44,
         GGML_TYPE_EXT2    = 45,
         GGML_TYPE_EXT3    = 46,
-        GGML_TYPE_COUNT   = 47,
+        GGML_TYPE_EXT4    = 47,
+        GGML_TYPE_EXT5    = 48,
+        GGML_TYPE_COUNT   = 49,
     };
 
     // [TAG_GGML_PREC]

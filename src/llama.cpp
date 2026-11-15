@@ -437,9 +437,12 @@ static struct llama_model * llama_model_load_from_file_impl(
         return nullptr;
     }
 
-    if (params.quant_plugin != nullptr && params.quant_plugin[0] != '\0') {
-        if (!ggml_quant_plugin_load(params.quant_plugin)) {
-            LLAMA_LOG_ERROR("%s: failed to load quant plugin '%s'\n", __func__, params.quant_plugin);
+    const char * plugin_path = (params.quant_plugin != nullptr && params.quant_plugin[0] != '\0')
+        ? params.quant_plugin
+        : getenv("GGML_QUANT_PLUGIN");
+    if (plugin_path != nullptr && plugin_path[0] != '\0') {
+        if (!ggml_quant_plugin_load(plugin_path)) {
+            LLAMA_LOG_ERROR("%s: failed to load quant plugin '%s'\n", __func__, plugin_path);
             return nullptr;
         }
     }

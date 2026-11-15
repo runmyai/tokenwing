@@ -283,7 +283,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 
 // Host function: returns the max batch size for the current arch+type at runtime.
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
-    if (type >= GGML_TYPE_EXT0 && type <= GGML_TYPE_EXT3) {
+    if (type >= GGML_TYPE_EXT0 && type <= GGML_TYPE_EXT5) {
         return 0;
     }
     // NVIDIA: P100, Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
@@ -319,7 +319,7 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
 }
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
-    if (!ggml_is_quantized(type) || (type >= GGML_TYPE_EXT0 && type <= GGML_TYPE_EXT3)) {
+    if (!ggml_is_quantized(type) || (type >= GGML_TYPE_EXT0 && type <= GGML_TYPE_EXT5)) {
         return false;
     }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.

@@ -3289,11 +3289,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("LLAMA_ARG_MODEL"));
     add_opt(common_arg(
         {"--quant-plugin"}, "PATH",
-        "shared library (.so / .dll) registering external GGML quantization types GGML_TYPE_EXT0..EXT3 (default: none)",
+        "shared library (.so / .dll) registering external GGML quantization types GGML_TYPE_EXT0..EXT5 (default: none)",
         [](common_params & params, const std::string & value) {
             params.quant_plugin = value;
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_TOKENIZE}).set_env("LLAMA_ARG_QUANT_PLUGIN"));
+    add_opt(common_arg(
+        {"--moe-router-min-w"}, "FLOAT",
+        "skip routed tail experts beyond --moe-router-k-min whose normalized weight <= FLOAT (default: 0.0 = disabled)",
+        [](common_params & params, const std::string & value) {
+            params.moe_router_min_w = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON}).set_env("LLAMA_ARG_MOE_ROUTER_MIN_W"));
+    add_opt(common_arg(
+        {"--moe-router-k-min"}, "N",
+        "minimum routed experts always retained per token when --moe-router-min-w > 0 (default: 4)",
+        [](common_params & params, int value) {
+            params.moe_router_k_min = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON}).set_env("LLAMA_ARG_MOE_ROUTER_K_MIN"));
     add_opt(common_arg(
         {"-mu", "--model-url"}, "MODEL_URL",
         "model download url (default: unused)",

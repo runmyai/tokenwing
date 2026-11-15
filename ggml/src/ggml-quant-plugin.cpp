@@ -30,7 +30,7 @@ namespace {
 std::mutex                                  g_plugin_mu;
 std::atomic<const ggml_quant_plugin_api *>  g_plugin_api{ nullptr };
 std::string                                 g_plugin_path;
-bool                                        g_ext_has_cuda[GGML_QUANT_PLUGIN_MAX_TYPES] = { false, false, false, false };
+bool                                        g_ext_has_cuda[GGML_QUANT_PLUGIN_MAX_TYPES] = {};
 std::vector<void (*)(const ggml_quant_plugin_api *)> g_cpu_hooks;
 
 #ifdef _WIN32
@@ -177,7 +177,7 @@ const struct ggml_quant_plugin_api * ggml_quant_plugin_get(void) {
 }
 
 bool ggml_quant_plugin_has_cuda(enum ggml_type type, bool is_id) {
-    if (type < GGML_TYPE_EXT0 || type > GGML_TYPE_EXT3) {
+    if (type < GGML_TYPE_EXT0 || type > GGML_TYPE_EXT5) {
         return false;
     }
     const ggml_quant_plugin_api * api = g_plugin_api.load(std::memory_order_acquire);

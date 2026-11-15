@@ -417,6 +417,8 @@ static struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     },
 };
 
+static ggml_quant_plugin_vec_dot_x4_t g_ext_vec_dot_x4[GGML_QUANT_PLUGIN_MAX_TYPES] = { NULL };
+
 static void ggml_cpu_apply_quant_plugin(const struct ggml_quant_plugin_api * api) {
     if (api == NULL || api->get_type_info == NULL) {
         return;
@@ -432,11 +434,12 @@ static void ggml_cpu_apply_quant_plugin(const struct ggml_quant_plugin_api * api
         type_traits_cpu[t].vec_dot      = (ggml_vec_dot_t) info.vec_dot;
         type_traits_cpu[t].vec_dot_type = (enum ggml_type) info.vec_dot_type;
         type_traits_cpu[t].nrows        = 1;
+        g_ext_vec_dot_x4[i]             = info.vec_dot_x4;
     }
 }
 
 const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type) {
-    if (type >= GGML_TYPE_EXT0 && type <= GGML_TYPE_EXT3 && type_traits_cpu[type].vec_dot == NULL) {
+    if (type >= GGML_TYPE_EXT0 && type <= GGML_TYPE_EXT5 && type_traits_cpu[type].vec_dot == NULL) {
         const struct ggml_quant_plugin_api * api = ggml_quant_plugin_get();
         if (api != NULL) {
             ggml_cpu_apply_quant_plugin(api);
@@ -1546,6 +1549,12 @@ typedef void (*ggml_vec_dot_x4_t)(int n, float * GGML_RESTRICT s, const void * G
 // without one. One switch (--moe-stream-cpu-x4 / ggml_cpu_set_mxfp4_kernel) turns them all on. Q5_K's 4-row kernel
 // (ggml_vec_dot_q5_K_q8_K_x4) is not used: ggml's 1-row one already reads at the speed of reading the bytes alone (kernel benchmark)
 static ggml_vec_dot_x4_t ggml_cpu_vec_dot_x4(enum ggml_type type) {
+    if (type >= GGML_TYPE_EXT0 && type <= GGML_TYPE_EXT5) {
+        if (type_traits_cpu[type].vec_dot == NULL) {
+            ggml_get_type_traits_cpu(type);
+        }
+        return (ggml_vec_dot_x4_t) g_ext_vec_dot_x4[type - GGML_TYPE_EXT0];
+    }
     switch (type) {
         case GGML_TYPE_MXFP4:  return ggml_vec_dot_mxfp4_q8_0_x4;
         case GGML_TYPE_IQ4_XS: return ggml_vec_dot_iq4_xs_q8_K_x4;

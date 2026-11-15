@@ -8,6 +8,7 @@
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "ggml-quant-plugin.h"
 #include "gguf.h"
 
 extern "C" bool ggml_op_can_inplace(enum ggml_op op);   // (ggml-alloc.c, GGML_API in ggml-impl.h: the ops its allocator computes in place)
@@ -1704,7 +1705,7 @@ llama_moe_stream::llama_moe_stream(
         off("--moe-stream-vram-follow 1", "--moe-stream-vram-experts N or --moe-stream-vram-free SIZE (the places per streamed layer)");
         p1.vram_follow = false;
     }
-    if (p1.vram_follow && cpu_repack) {
+    if (p1.vram_follow && cpu_repack && !(ggml_quant_plugin_get() && ggml_quant_plugin_get()->repack_expert_slot)) {
         off("--moe-stream-vram-follow 1", "--moe-stream-cpu-repack 0 (it copies RAM slots into the GPU pool, which needs the plain layout)");
         p1.vram_follow = false;
     }
@@ -3834,6 +3835,7 @@ void llama_moe_stream::print_repack_state() const {
     }
 
     int64_t n_pool = 0, n_rep = 0;
+    const bool plug_rep = plugin_repack_on.load();
 
     for (const auto & sl : layers) {
         if (!sl) {
@@ -3844,14 +3846,14 @@ void llama_moe_stream::print_repack_state() const {
                 continue;
             }
             n_pool += 1;
-            n_rep  += w.pool->extra ? 1 : 0;
+            n_rep  += (w.pool->extra || plug_rep) ? 1 : 0;
         }
     }
 
     fprintf(stderr, "%s: cpu-repack %s: %lld of %lld expert pool tensors hold the repacked layout, "
             "%lld do not (that type or shape has no repacked kernel on this CPU: IQ4_XS has none on x86); "
             "the sidecar stores '%s', so reads are %s\n", __func__,
-            cpu_repack_on ? "on" : (cpu_repack ? "OFF (no kernel)" : "off"),
+            (cpu_repack_on || plug_rep) ? "on" : (cpu_repack ? "OFF (no kernel)" : "off"),
             (long long) n_rep, (long long) n_pool, (long long) (n_pool - n_rep), sidecar_layout.c_str(),
             convert_on_read ? "converted after the read" : "copied into the slot as they are");
 }
@@ -4254,7 +4256,15 @@ ggml_tensor * llama_moe_stream::create_pool(int32_t il, const std::string & name
             } else {
                 ggml_backend_buffer_free(rbuf);   // no repacked kernel for this type/shape
 
-                if (n_repacked_blocks > 0) {
+                const ggml_quant_plugin_api * qapi = cpu_repack ? ggml_quant_plugin_get() : nullptr;
+                if (qapi && qapi->repack_expert_slot &&
+                        qapi->repack_expert_slot((int32_t) pool->type, nullptr, nullptr, pool->ne[0], pool->ne[1]) == 0) {
+                    plugin_repack_on = true;
+                    convert_on_read  = true;
+                    if (p1.cpu_x4 == 0) {
+                        ggml_cpu_set_mxfp4_kernel(2, p1.cpu_x4_pf);
+                    }
+                } else if (n_repacked_blocks > 0) {
                     throw std::runtime_error(format(
                                 "the sidecar is stored in the '%s' layout but this CPU has no repacked "
                                 "kernel for %s of this shape, so its weights cannot be read at all",
@@ -4665,6 +4675,22 @@ void llama_moe_stream::repack_slot(llama_moe_stream_layer & sl, int32_t pi, int3
                     sl.il, pi, w.size, ggml_nbytes(w.pool), (int) w.pool->ne[2]);
     }
 
+    if (plugin_repack_on.load(std::memory_order_relaxed)) {
+        const ggml_quant_plugin_api * qapi = ggml_quant_plugin_get();
+        if (!qapi || !qapi->repack_expert_slot) {
+            moe_stream_fail("layer %d projection %d: quant plugin repack_expert_slot missing", sl.il, pi);
+        }
+        uint8_t * dst_slot = (uint8_t *) w.mem + (size_t) slot * w.size;
+        const int32_t rc = qapi->repack_expert_slot(
+                (int32_t) w.pool->type, dst_slot, plain, w.pool->ne[0], w.pool->ne[1]);
+        if (rc != 0) {
+            moe_stream_fail("layer %d projection %d: quant plugin repack_expert_slot failed (%d)", sl.il, pi, (int) rc);
+        }
+        n_repack_us += ggml_time_us() - t0;
+        n_repack_n  += 1;
+        return;
+    }
+
     // One view per (I/O thread, layer, projection). The view's data pointer *is* the slot, and
     // ggml_backend_tensor_set reads it, so a view shared by the threads made them write over each other:
     // with 8 threads two of every eight slots kept the bytes of another slot, or none at all (the
@@ -4879,7 +4905,23 @@ std::string llama_moe_stream::compare_model(int32_t il, int p, int32_t expert, c
     // it the other way round (or unconditionally) compared plain bytes with repacked ones.
     const bool have_repacked = have_repacked_in;
 
-    if (have_repacked && cpu_repack_on && wp && wp->pool && wp->pool->extra && wp->mem) {
+    if (have_repacked && plugin_repack_on && wp && wp->pool && wp->mem) {
+        const auto & w = *wp;
+        const ggml_quant_plugin_api * qapi = ggml_quant_plugin_get();
+        if (qapi && qapi->repack_expert_slot) {
+            if (!verify_repack_mem) {
+                void * mem = nullptr;
+                if (posix_memalign(&mem, MOE_STREAM_ALIGN, w.size) != 0) {
+                    fprintf(stderr, "llama_moe_stream: the read-back check is skipped: cannot allocate %zu bytes for it\n", w.size);
+                    return "";
+                }
+                verify_repack_mem = mem;
+            }
+            if (qapi->repack_expert_slot((int32_t) w.pool->type, verify_repack_mem, m, w.pool->ne[0], w.pool->ne[1]) == 0) {
+                m = (const uint8_t *) verify_repack_mem;
+            }
+        }
+    } else if (have_repacked && cpu_repack_on && wp && wp->pool && wp->pool->extra && wp->mem) {
         const auto & w = *wp;
 
         // The repack always goes into this function's own scratch, never into the pool. It used to be written
@@ -4940,7 +4982,7 @@ std::string llama_moe_stream::compare_model(int32_t il, int p, int32_t expert, c
             "(in memory %02x%02x%02x, %s %02x%02x%02x)",
             what, il, expert, p, size - i, i,
             h[i], h[(i + 1) % size], h[(i + 2) % size],
-            cpu_repack_on ? "repacked model" : (vs_model ? "model" : (model_file ? "model file" : "sidecar")),
+            (cpu_repack_on || plugin_repack_on) ? "repacked model" : (vs_model ? "model" : (model_file ? "model file" : "sidecar")),
             m[i], m[(i + 1) % size], m[(i + 2) % size]);
 
     if (vctx) {
@@ -5011,7 +5053,7 @@ void llama_moe_stream::verify_slot(llama_moe_stream_layer & sl, int32_t slot, in
         }
 
         // a slot of a repacked pool holds the repacked bytes
-        const bool slot_repacked = cpu_repack_on && w.pool && w.pool->extra != nullptr;
+        const bool slot_repacked = (cpu_repack_on && w.pool && w.pool->extra != nullptr) || plugin_repack_on.load();
 
         err = compare_model(sl.il, p, expert, (const char *) w.mem + (size_t) slot*w.size, w.size,
                     format("pool slot %d of layer %d", slot, sl.il).c_str(), slot_repacked);
@@ -9911,8 +9953,12 @@ void llama_moe_stream::es_count(llama_moe_stream_layer & sl, const int32_t * ids
             w *= dec;
         }
         for (int64_t j = 0; j < n; j++) {
+            const int32_t e = ids[j];
+            if (e < 0 || (uint32_t) e >= sl.n_expert) {
+                continue;
+            }
             const int64_t t = k > 0 ? j/k : 0;
-            sl.es_w[ids[j]] += std::exp2(-(float) (n_tok - 1 - t)/p1.prompt_end_halflife);
+            sl.es_w[e] += std::exp2(-(float) (n_tok - 1 - t)/p1.prompt_end_halflife);
         }
         return;
     }
@@ -9932,6 +9978,9 @@ void llama_moe_stream::es_count(llama_moe_stream_layer & sl, const int32_t * ids
     }
     for (int64_t j = 0; j < n; j++) {
         const int32_t e = ids[j];
+        if (e < 0 || (uint32_t) e >= sl.n_expert) {
+            continue;
+        }
         const int32_t s = sl.expert_slot[e];
         const bool    vh = sl.vx_held(e);
         sl.es_p      += 1;
@@ -10513,6 +10562,9 @@ void llama_moe_stream::win_layer_start(llama_moe_stream_layer & sl, const int32_
     }
     for (int64_t j = 0; j < n; j++) {
         const int32_t e = ids[j];
+        if (e < 0 || (uint32_t) e >= sl.n_expert) {
+            continue;
+        }
         const int64_t t = k > 0 ? j/k : 0;
         if (sl.win_score[e] == 0.0f && !sl.vx_held(e)) {
             sl.win_union += 1;   // counted on first pick (the floor keeps a picked score above 0); not the VRAM-held ones
@@ -11198,7 +11250,7 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
         if (!sl.ws_named_word.empty()) {
             for (int64_t j = 0; j < n; j++) {
                 const int32_t e = ids[j];
-                if (sl.vx_held(e) || sl.ws_named_word[e] != w) {
+                if (e < 0 || (uint32_t) e >= sl.n_expert || sl.vx_held(e) || sl.ws_named_word[e] != w) {
                     continue;
                 }
                 const int32_t s = sl.expert_slot[e];
@@ -11207,8 +11259,8 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
         }
         for (int64_t j = 0; j < n && sl.b0_n < (int32_t) sl.b0_e.size(); j++) {
             const int32_t e = ids[j];
-            if (sl.vx_held(e)) {
-                continue;   // the VRAM expert pool computes it
+            if (e < 0 || (uint32_t) e >= sl.n_expert || sl.vx_held(e)) {
+                continue;   // pruned or VRAM expert pool computes it
             }
             const int32_t s = sl.expert_slot[e];
             if (s >= 0 && sl.slot_state[s] == MOE_STREAM_SLOT_READY) {
@@ -11354,6 +11406,9 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
 
         for (int64_t j = 0; j < k; j++) {
             const int32_t e = ids[t*k + j];
+            if (e == (int32_t) sl.n_expert) {
+                continue;   // pruned tail slot (--moe-router-min-w)
+            }
             GGML_ASSERT(e >= 0 && (uint32_t) e < sl.n_expert);
 
             if (sl.tok_stamp[e] == stamp) {
@@ -11369,19 +11424,28 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
     if (us_on && wave == 0 && (size_t) sl.il < us_cnt.size() && !us_cnt[sl.il].empty()) {   // the usage table, +1 per pick
         uint32_t * cnt = us_cnt[sl.il].data();
         for (int64_t i = 0; i < n; i++) {
-            cnt[ids[i]] += cnt[ids[i]] < UINT32_MAX ? 1 : 0;
+            const int32_t e = ids[i];
+            if (e >= 0 && (uint32_t) e < sl.n_expert) {
+                cnt[e] += cnt[e] < UINT32_MAX ? 1 : 0;
+            }
         }
         us_dirty = true;
     }
     if (!sl.vf_recent.empty() && wave == 0) {   // VRAM follow: AI-der's counts, +1 per pick (prompts and replies)
         for (int64_t i = 0; i < n; i++) {
             const int32_t e = ids[i];
+            if (e < 0 || (uint32_t) e >= sl.n_expert) {
+                continue;
+            }
             sl.vf_recent[e] += sl.vf_recent[e] < UINT32_MAX ? 1 : 0;
             sl.vf_long  [e] += sl.vf_long  [e] < UINT32_MAX ? 1 : 0;
         }
     }
     for (int64_t i = 0; i < n; i++) {
         const int32_t e = ids[i];
+        if (e == (int32_t) sl.n_expert) {
+            continue;
+        }
         GGML_ASSERT(e >= 0 && (uint32_t) e < sl.n_expert);
         // An expert the VRAM expert pool holds is computed by the GPU: it gets no RAM slot, no read and no place in a
         // wave, and its use is counted on its own (once per ubatch, at wave 0), not as a hit or a miss
@@ -11491,7 +11555,10 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
         for (int64_t t = 0; t < n_tok; t++) {
             const float wt = std::exp2(-(float) (n_tok - 1 - t)/p1.prompt_end_halflife);
             for (int64_t j = 0; j < k; j++) {
-                sl.p1_pe_w[ids[t*k + j]] += wt;
+                const int32_t e = ids[t*k + j];
+                if (e >= 0 && (uint32_t) e < sl.n_expert) {
+                    sl.p1_pe_w[e] += wt;
+                }
             }
         }
         n_p1_prompt_end_sorted += wave == 0 ? 1 : 0;
@@ -11589,7 +11656,10 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
         for (int64_t t = 0; t < n_tok; t++) {
             const float wt = p1_decay(n_tok - 1 - t);
             for (int64_t j = 0; j < k; j++) {
-                sl.p1_dval[ids[t*k + j]] += wt;
+                const int32_t e = ids[t*k + j];
+                if (e >= 0 && (uint32_t) e < sl.n_expert) {
+                    sl.p1_dval[e] += wt;
+                }
             }
         }
     }
@@ -12259,11 +12329,12 @@ void llama_moe_stream::remap_finish(llama_moe_stream_layer & sl, const int32_t *
         int32_t rank = 0;
 
         for (int64_t j = 0; j < k; j++) {
-            const int32_t e  = ids[t*k + j];
-            const int32_t s  = sl.expert_slot[e];
-            const bool vx = sl.vx_held(e);   // the device pass computes this pair
-            const bool pw = wplan && wp_tab.pair_wave[(size_t) (t*k + j)] == wave;
-            const bool ok = s >= 0 && !vx && (!multi || (wplan ? pw : sl.slot_wave[s] == wave));
+            const int32_t e      = ids[t*k + j];
+            const bool    pruned = (e < 0 || (uint32_t) e >= sl.n_expert);
+            const int32_t s      = pruned ? -1 : sl.expert_slot[e];
+            const bool    vx     = !pruned && sl.vx_held(e);   // the device pass computes this pair
+            const bool    pw     = !pruned && wplan && wp_tab.pair_wave[(size_t) (t*k + j)] == wave;
+            const bool    ok     = s >= 0 && !vx && (!multi || (wplan ? pw : sl.slot_wave[s] == wave));
             // A pair the plan puts in this wave must have the slot this wave's fill gave its expert
             if (wplan && p1.slot_check && pw && (s < 0 || vx || sl.slot_wave[s] != wave)) {
                 moe_stream_fail("slot check (wave plan): layer %d, token %lld of %lld: expert %d is in wave %d by the plan but %s",
@@ -12298,7 +12369,7 @@ void llama_moe_stream::remap_finish(llama_moe_stream_layer & sl, const int32_t *
             const bool t_drop1 = drop1 && t == 0 && j == 0;
             const bool t_drop3 = t*k + j == drop3_i;
             const bool vx_seen = vx && !t_drop3;
-            if (!multi && p1.slot_check && ((s < 0 && !vx_seen) || t_drop1)) {
+            if (!multi && p1.slot_check && ((!pruned && s < 0 && !vx_seen) || t_drop1)) {
                 moe_stream_fail("slot check: layer %d, token %lld of %lld (%s): expert %d has no RAM slot in a one-wave call%s; "
                         "it would add 0 instead of the expert%s", sl.il, (long long) t, (long long) n_tok,
                         decode_phase ? "decode" : "prompt", e, vx ? " and the VRAM expert pool does not serve it" : "",
@@ -12607,7 +12678,8 @@ void llama_moe_stream::rec_stage_state(llama_moe_stream_layer & sl, const int32_
     rec_s_tsnap[il] = ggml_time_us();   // under the lock: events made before it are in the state read below, later ones are not
 
     for (size_t j = 0; j < kk; j++) {
-        const int32_t s = sl.expert_slot[ids[j]];
+        const int32_t eid = ids[j];
+        const int32_t s = (eid < 0 || (uint32_t) eid >= sl.n_expert) ? -1 : sl.expert_slot[eid];
 
         // 3 = held by the VRAM expert pool (present, computed by the GPU; never a miss and never a RAM hit)
         // A read drop stale cancelled is not in flight (it settles EMPTY): 0, as the engine counts it (n_miss)
@@ -13182,7 +13254,8 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
             for (int64_t t = 0; t < n_tok; t++) {
                 int64_t n_miss_tok = 0;
                 for (int64_t j = 0; j < n/n_tok; j++) {
-                    if (!sl->was_res[ids[t*(n/n_tok) + j]] && !sl->vx_held(ids[t*(n/n_tok) + j])) {   // a VRAM-held pair is present
+                    const int32_t eid = ids[t*(n/n_tok) + j];
+                    if (eid >= 0 && (uint32_t) eid < sl->n_expert && !sl->was_res[eid] && !sl->vx_held(eid)) {   // a VRAM-held pair is present
                         n_miss_tok++;
                     }
                 }
@@ -13288,7 +13361,8 @@ static void llama_moe_stream_remap_after(llama_moe_stream * mgr, llama_moe_strea
         for (int64_t t = 0; t < n_tok; t++) {
             int64_t n_miss_tok = 0;
             for (int64_t j = 0; j < n/n_tok; j++) {
-                if (!sl->was_res[ids[t*(n/n_tok) + j]] && !sl->vx_held(ids[t*(n/n_tok) + j])) {   // a VRAM-held pair is present
+                const int32_t eid = ids[t*(n/n_tok) + j];
+                if (eid >= 0 && (uint32_t) eid < sl->n_expert && !sl->was_res[eid] && !sl->vx_held(eid)) {   // a VRAM-held pair is present
                     n_miss_tok++;
                 }
             }
@@ -13542,7 +13616,7 @@ void llama_moe_stream::print_stats() const {
     }
 
     // What the repack cost, once the run is over (the start-up print is before the first read)
-    if (cpu_repack_on && n_repack_n > 0) {
+    if ((cpu_repack_on || plugin_repack_on) && n_repack_n > 0) {
         fprintf(stderr, "%s: cpu-repack: %lld slices repacked in %.3f s (%.3f ms per slice), on the "
                 "I/O threads\n", __func__, (long long) n_repack_n, (double) n_repack_us/1e6,
                 (double) n_repack_us/1e3/n_repack_n);
@@ -14808,7 +14882,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
             ggml_set_name(G.vp_gate_up, "vram_experts.gate_up (held + zero)");
             ggml_set_name(G.vp_down,    "vram_experts.down (held + zero)");
             if (vp) {
-                G.vp_table = ggml_new_tensor_3d(G.ctx, GGML_TYPE_I32, n_expert_used, n_expert_total, (int64_t) G.layers.size());
+                G.vp_table = ggml_new_tensor_3d(G.ctx, GGML_TYPE_I32, n_expert_used, n_expert_total + 1, (int64_t) G.layers.size());
                 ggml_set_name(G.vp_table, "vram_experts.vp_table");
             }
             G.buf = ggml_backend_alloc_ctx_tensors_from_buft(G.ctx, buft);
@@ -15180,16 +15254,18 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
         }
     }
 
-    // The id tables from the filled vx_slot (with MOE_STREAM_VRAM_TEST_EMPTY every row names the zero slices)
+    // The id tables from the filled vx_slot (with MOE_STREAM_VRAM_TEST_EMPTY every row names the zero slices;
+    // row n_expert_total is the pruned sentinel mapped to zero slices for --moe-router-min-w)
     if (vp) {
+        const size_t n_vp_rows = (size_t) (n_expert_total + 1);
         for (auto & G : vx_groups) {
-            std::vector<int32_t> tab((size_t) n_expert_used*n_expert_total*G.layers.size());
+            std::vector<int32_t> tab((size_t) n_expert_used*n_vp_rows*G.layers.size());
             for (size_t li = 0; li < G.layers.size(); li++) {
                 const auto & sl = *layers[G.layers[li]];
-                for (uint32_t e = 0; e < n_expert_total; e++) {
-                    const int32_t place = sl.vx_slot.empty() ? -1 : sl.vx_slot[e];
+                for (uint32_t e = 0; e <= n_expert_total; e++) {
+                    const int32_t place = (e < n_expert_total && !sl.vx_slot.empty()) ? sl.vx_slot[e] : -1;
                     for (uint32_t j = 0; j < n_expert_used; j++) {
-                        tab[(li*n_expert_total + e)*n_expert_used + j] = place >= 0 ? place : G.z_end() + (int32_t) j;
+                        tab[(li*n_vp_rows + e)*n_expert_used + j] = place >= 0 ? place : G.z_end() + (int32_t) j;
                     }
                 }
             }
@@ -15572,16 +15648,17 @@ void llama_moe_stream::vp_check() {
     if (vp_backend != nullptr) {
         ggml_backend_synchronize(vp_backend);   // the rows written on the compute stream have landed
     }
+    const size_t n_vp_rows = (size_t) (n_expert_total + 1);
     for (const auto & G : vx_groups) {
-        std::vector<int32_t> tab((size_t) n_expert_used*n_expert_total*G.layers.size());
+        std::vector<int32_t> tab((size_t) n_expert_used*n_vp_rows*G.layers.size());
         ggml_backend_tensor_get(G.vp_table, tab.data(), 0, tab.size()*sizeof(int32_t));
         for (size_t li = 0; li < G.layers.size(); li++) {
             const auto & sl = *layers[G.layers[li]];
-            for (uint32_t e = 0; e < n_expert_total; e++) {
-                const int32_t place = sl.vx_slot.empty() ? -1 : sl.vx_slot[e];
+            for (uint32_t e = 0; e <= n_expert_total; e++) {
+                const int32_t place = (e < n_expert_total && !sl.vx_slot.empty()) ? sl.vx_slot[e] : -1;
                 for (uint32_t j = 0; j < n_expert_used; j++) {
                     const int32_t want = place >= 0 ? place : G.z_end() + (int32_t) j;
-                    const int32_t have = tab[(li*n_expert_total + e)*n_expert_used + j];
+                    const int32_t have = tab[(li*n_vp_rows + e)*n_expert_used + j];
                     if (have != want) {
                         moe_stream_fail("vram-parallel table check: layer %d expert %u pair %u: the table names %d, vx_slot says %d",
                                 sl.il, e, j, have, want);
@@ -18960,7 +19037,8 @@ void llama_moe_stream_remap_vram(ggml_tensor * dst, const ggml_tensor * a, int i
     const int32_t   b0  = mgr->vx_id_base(sl->il);
 
     for (int64_t i = 0; i < n; i++) {
-        const int32_t s = sl->vx_slot.empty() ? -1 : sl->vx_slot[ids[i]];
+        const int32_t eid = ids[i];
+        const int32_t s = (eid < 0 || (uint32_t) eid >= sl->n_expert || sl->vx_slot.empty()) ? -1 : sl->vx_slot[eid];
         if (s >= 0 && s < b0) {
             moe_stream_fail("layer %d expert %d is held in place %d, below the view (first place %d) of the graph that runs",
                     sl->il, ids[i], s, b0);

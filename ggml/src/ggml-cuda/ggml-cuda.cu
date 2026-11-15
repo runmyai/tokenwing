@@ -1895,7 +1895,7 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
 }
 
 static inline bool ggml_cuda_is_ext_type(ggml_type type) {
-    return type >= GGML_TYPE_EXT0 && type <= GGML_TYPE_EXT3;
+    return type >= GGML_TYPE_EXT0 && type <= GGML_TYPE_EXT5;
 }
 
 static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
@@ -6295,6 +6295,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_EXT1:
                     case GGML_TYPE_EXT2:
                     case GGML_TYPE_EXT3:
+                    case GGML_TYPE_EXT4:
+                    case GGML_TYPE_EXT5:
                         return b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                                ggml_quant_plugin_has_cuda(a->type, op->op == GGML_OP_MUL_MAT_ID);
                     default:

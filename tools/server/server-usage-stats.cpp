@@ -6,15 +6,19 @@
 #include "build-info.h"
 #include "ggml-backend.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <random>
-#include <sstream>
+#include <stdexcept>
+#include <string>
 #include <thread>
+#include <vector>
 
 #if defined(_WIN32)
 #    include <windows.h>
@@ -157,13 +161,14 @@ static std::string os_cpu_name() {
 #endif
 }
 
-static std::string os_local_day() {
+// Today's date in UTC, so every record of one day carries the same date wherever the PC is.
+static std::string os_utc_day() {
     std::time_t t = std::time(nullptr);
     std::tm tmv = {};
 #if defined(_WIN32)
-    localtime_s(&tmv, &t);
+    gmtime_s(&tmv, &t);
 #else
-    localtime_r(&t, &tmv);
+    gmtime_r(&t, &tmv);
 #endif
     char buf[16];
     std::strftime(buf, sizeof(buf), "%Y-%m-%d", &tmv);
@@ -255,7 +260,7 @@ static void send_record(const std::shared_ptr<usage_stats_state> & st, const std
         throw std::runtime_error("cannot create the state folder: " + ec.message());
     }
 
-    const std::string day = os_local_day();
+    const std::string day = os_utc_day();
     const fs::path day_file = dir / ("stats-day-" + launcher);
     if (read_first_line(day_file) == day) {
         return; // today's record went out already

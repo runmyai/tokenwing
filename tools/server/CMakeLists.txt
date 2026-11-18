@@ -51,6 +51,10 @@ set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(${TARGET} PRIVATE ../mtmd ${PROJECT_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC server-context llama-ui cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
+if (WIN32)
+    # the usage record reads the CPU name from the registry
+    target_link_libraries(${TARGET} PRIVATE advapi32)
+endif()
 
 add_dependencies(${TARGET} llama-ui-assets)
 

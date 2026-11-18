@@ -689,6 +689,8 @@ struct common_params {
     bool endpoint_props   = false; // only control POST requests, not GET
     bool endpoint_metrics = false;
 
+    bool usage_stats = true; // llama-server: one anonymous usage record a day
+
     // enable built-in tools
     std::vector<std::string> server_tools;
     std::string server_tools_runtime;

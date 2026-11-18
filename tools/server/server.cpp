@@ -4,6 +4,7 @@
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
+#include "server-usage-stats.h"
 
 #include "arg.h"
 #include "build-info.h"
@@ -475,6 +476,7 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         // setup clean up function, to be called before exit
         clean_up = [&ctx_http, &ctx_server, &mcp_mgr]() {
             SRV_INF("%s: cleaning up before exit...\n", __func__);
+            server_usage_stats_stop();
             // stop the session GC first, it finalizes live sessions and wakes pending readers
             server_stream_session_manager_stop();
             ctx_http.stop();
@@ -508,6 +510,10 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         ctx_http.is_ready.store(true);
 
         SRV_INF("%s", "model loaded\n");
+
+        if (!is_run_by_cli) {
+            server_usage_stats_start(params);
+        }
 
         shutdown_handler = [&](int) {
             mcp_mgr.shutdown();

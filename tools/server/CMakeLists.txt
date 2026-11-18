@@ -43,6 +43,8 @@ add_library(${TARGET}
     server-http.h
     server-models.cpp
     server-models.h
+    server-usage-stats.cpp
+    server-usage-stats.h
 )
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 

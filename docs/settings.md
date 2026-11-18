@@ -251,6 +251,14 @@ Off by default. Run My AI doesn't use it.
 
 Its test-only environment variables: `MOE_STREAM_TEST_DISCARD`, `MOE_STREAM_TEST_DISCARD_NOLOCK`, `MOE_STREAM_TEST_ELASTIC_CHECK`, `MOE_STREAM_TEST_FAKE_ALARM`, `MOE_STREAM_TEST_FAKE_SQUEEZE`, `MOE_STREAM_TEST_FAKE_SQUEEZE_A0`, `MOE_STREAM_TEST_FAKE_SWAP`, `MOE_STREAM_TEST_FREE_PINNED`, `MOE_STREAM_TEST_GIVE_IGNORE_LEVEL`, `MOE_STREAM_TEST_GIVE_NOREASON`, `MOE_STREAM_TEST_GIVE_ONE_LAYER`, `MOE_STREAM_TEST_GIVE_OVERSIZE`, `MOE_STREAM_TEST_IGNORE_ALARM`, `MOE_STREAM_TEST_KEEP_SKIP`, `MOE_STREAM_TEST_LOOK_LOG`, `MOE_STREAM_TEST_LOWNEED_SKIP`, `MOE_STREAM_TEST_LOWONLY_SKIP`, `MOE_STREAM_TEST_MADVISE_FAIL`, `MOE_STREAM_TEST_NO_SWAP`, `MOE_STREAM_TEST_PACE_OFF`, `MOE_STREAM_TEST_PENDING_IGNORE`, `MOE_STREAM_TEST_PSI_OFF`, `MOE_STREAM_TEST_SELF_DISCARD`, `MOE_STREAM_TEST_SHARE_FLOOR_BREAK`, `MOE_STREAM_TEST_SHARE_FORCE`, `MOE_STREAM_TEST_SHARE_LOG`, `MOE_STREAM_TEST_SHARE_LOWFIRST`, `MOE_STREAM_TEST_SHRINK_INUSE`, `MOE_STREAM_TEST_THP_ALWAYS`, `MOE_STREAM_TEST_THP_KEEP`, `MOE_STREAM_TEST_UNLOCK_EVERY`, `MOE_STREAM_TEST_WIDE_FAIL`, `MOE_STREAM_TEST_ZERO_ALWAYS`.
 
+## Usage statistics
+
+`llama-server` sends one anonymous record a day, after the model has loaded, so we can count how many people use the engine and how many start it directly or through an app. The record holds a random install id (made on first use and kept in the state folder), the date, the engine version, the OS name and version, the CPU name, the GPU names, and who started the engine (`direct`, or the value of `TOKENWING_LAUNCHER`). Never a prompt, a reply, a model name, a path or a user name. It is sent from its own thread with short timeouts: a failure (no network, a refusal) changes nothing and is not retried until the next start. The install id and the date of the last record live in the state folder: `$XDG_STATE_HOME/tokenwing` or `~/.local/state/tokenwing` on Linux, `%LOCALAPPDATA%\TokenWing` on Windows, `~/Library/Application Support/TokenWing` on macOS.
+
+| Flag | What it does |
+|---|---|
+| `--no-stats` | do not send the daily anonymous usage record. The environment variables `TOKENWING_NO_STATS=1` and `DO_NOT_TRACK=1` turn it off too (default: sent) |
+
 ## Environment variables
 
 These are read once at start-up. The ones under "Test only" exist for tests: most make a failure happen on purpose, to prove a check catches it. Never leave one set for a real run.
@@ -290,6 +298,9 @@ These are read once at start-up. The ones under "Test only" exist for tests: mos
 | `MOE_STREAM_PROMPT_END_ALL` | When set to a non-zero number, the prompt-end wave order applies to every layer-major prompt call that has an output, not only to calls shorter than the batch size (-b). |
 | `MOE_STREAM_READ_RETRIES` | Sets how many times a failed sidecar read is retried (default 3). |
 | `MOE_STREAM_READ_RETRY_US` | Sets the wait in microseconds before each retry of a failed sidecar read (default 20). |
+| `TOKENWING_INSTALL_ID` | 32 lowercase hex characters: the install id the usage record carries instead of the one in the state folder (an app that starts the engine passes its own); the state folder's id file is then not written. |
+| `TOKENWING_LAUNCHER` | Who started the engine, as the usage record names it (lowercase letters, digits and `-`, at most 32 characters; anything else counts as `direct`). Each value gets its own record a day. |
+| `TOKENWING_NO_STATS` | Any value other than empty or 0 turns the usage record off, like --no-stats. `DO_NOT_TRACK=1` does the same. |
 
 ### Measuring
 
@@ -468,3 +479,4 @@ These are read once at start-up. The ones under "Test only" exist for tests: mos
 | `MOE_STREAM_TEST_WS_INELIGIBLE` | Names a word-start source layer V that counts as not eligible, so all sources keep the word-start op, and the run aborts if it needs --moe-stream-needed-early 1, --moe-stream-wordstart above 0 and the GPU producer and they are not there. |
 | `MOE_STREAM_TEST_ZERO_WRITE` | When 1, each pool is allocated normally and its all-zero block is written at start and counted in the RAM plan, instead of being left unwritten. |
 | `MOE_STREAM_VRAM_TEST_EMPTY` | When 1, the VRAM expert pool and its device pass exist but hold no expert, so every device id names a zero slice and the output must equal the run without --moe-stream-vram-experts. |
+| `TOKENWING_STATS_URL` | Sends the usage record to this address instead of the real database (plain http allowed), so tests never write to it. |

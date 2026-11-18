@@ -5719,6 +5719,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_METRICS"));
     add_opt(common_arg(
+        {"--no-stats"},
+        "do not send the daily anonymous usage record (engine version, OS, CPU and GPU names, and whether the engine "
+        "was started directly or by an app; at most one a day). The environment variables TOKENWING_NO_STATS=1 and "
+        "DO_NOT_TRACK=1 turn it off too (default: sent)",
+        [](common_params & params) {
+            params.usage_stats = false;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--props"},
         string_format("enable changing global properties via POST /props (default: %s)", params.endpoint_props ? "enabled" : "disabled"),
         [](common_params & params) {

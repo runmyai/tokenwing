@@ -1,0 +1,319 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (e.g. v0.1.0)
+        required: true
+      prerelease:
+        description: Mark GitHub release as prerelease
+        required: false
+        type: boolean
+        default: false
+      publish:
+        description: Create or update the GitHub Release (set false for dry-run artifacts only)
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: ${{ matrix.variant }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: tokenwing-linux-x64-cpu
+            os: ubuntu-22.04
+            backend: cpu
+            image: ''
+            smoke: '--smoke'
+          - variant: tokenwing-linux-x64-cuda12
+            os: ubuntu-22.04
+            backend: cuda
+            image: nvidia/cuda:12.8.1-devel-ubuntu22.04
+            smoke: ''
+          - variant: tokenwing-linux-x64-cuda13
+            os: ubuntu-22.04
+            backend: cuda
+            image: nvidia/cuda:13.4.1-devel-ubuntu22.04
+            smoke: ''
+          - variant: tokenwing-linux-x64-rocm
+            os: ubuntu-22.04
+            backend: rocm
+            image: rocm/dev-ubuntu-22.04:7.2.1
+            smoke: '--smoke'
+          - variant: tokenwing-linux-x64-vulkan
+            os: ubuntu-22.04
+            backend: vulkan
+            image: ''
+            smoke: ''
+          - variant: tokenwing-linux-arm64-cpu
+            os: ubuntu-22.04-arm
+            backend: cpu
+            image: ''
+            smoke: '--smoke'
+          - variant: tokenwing-linux-arm64-cuda13
+            os: ubuntu-22.04-arm
+            backend: cuda
+            image: nvidia/cuda:13.4.1-devel-ubuntu22.04
+            smoke: ''
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Reclaim runner disk space for container build
+        if: matrix.image != ''
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+
+      - name: Install native host build dependencies
+        if: matrix.image == ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ca-certificates cmake curl file ninja-build pkg-config xz-utils
+
+      - name: Setup Vulkan SDK 1.4.363.1 (Linux)
+        if: matrix.backend == 'vulkan'
+        run: |
+          sudo apt-get install -y --no-install-recommends libvulkan1
+          curl -fsSL -o /tmp/vulkansdk.tar.xz \
+            https://sdk.lunarg.com/sdk/download/1.4.363.1/linux/vulkansdk-linux-x86_64-1.4.363.1.tar.xz
+          mkdir -p /tmp/vulkansdk
+          tar -xf /tmp/vulkansdk.tar.xz -C /tmp/vulkansdk
+          rm -f /tmp/vulkansdk.tar.xz
+          echo "VULKAN_SDK=/tmp/vulkansdk/1.4.363.1/x86_64" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=/tmp/vulkansdk/1.4.363.1/x86_64/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "/tmp/vulkansdk/1.4.363.1/x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Build native Linux release archive
+        if: matrix.image == ''
+        run: >-
+          ./tokenwing-tools/release/build_linux.sh
+          --variant "${{ matrix.variant }}"
+          --backend "${{ matrix.backend }}"
+          --out-dir dist
+          ${{ matrix.smoke }}
+
+      - name: Build containerized Linux release archive
+        if: matrix.image != ''
+        env:
+          EXTRA_APT: ${{ matrix.backend == 'rocm' && 'rocblas-dev hipblas-dev' || '' }}
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/src" \
+            -w /src \
+            "${{ matrix.image }}" \
+            bash -lc "
+              set -euo pipefail
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                ca-certificates cmake curl file ninja-build pkg-config xz-utils ${EXTRA_APT}
+              ./tokenwing-tools/release/build_linux.sh \
+                --variant '${{ matrix.variant }}' \
+                --backend '${{ matrix.backend }}' \
+                --out-dir dist \
+                ${{ matrix.smoke }}
+            "
+
+      - name: Upload Linux release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.variant }}
+          path: dist/${{ matrix.variant }}.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: ${{ matrix.variant }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: tokenwing-windows-x64-cpu
+            backend: cpu
+            cuda_version: ''
+            smoke: '--smoke'
+          - variant: tokenwing-windows-x64-cuda12
+            backend: cuda12
+            cuda_version: '12.8.1'
+            smoke: ''
+          - variant: tokenwing-windows-x64-cuda13
+            backend: cuda13
+            cuda_version: '13.4.1'
+            smoke: ''
+          - variant: tokenwing-windows-x64-vulkan
+            backend: vulkan
+            cuda_version: ''
+            smoke: ''
+          - variant: tokenwing-windows-x64-hip
+            backend: hip
+            cuda_version: ''
+            smoke: ''
+          - variant: tokenwing-windows-arm64-cpu
+            backend: arm64-cpu
+            cuda_version: ''
+            smoke: ''
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Ensure Ninja is installed
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja -y --no-progress
+          }
+
+      - name: Setup CUDA toolkit redistributables
+        if: startsWith(matrix.backend, 'cuda')
+        run: >-
+          python tokenwing-tools/release/cuda_redist.py
+          --version "${{ matrix.cuda_version }}"
+          --dest "${{ runner.temp }}\cuda-${{ matrix.cuda_version }}"
+
+      - name: Setup Vulkan SDK 1.4.363.1 (Windows)
+        if: matrix.backend == 'vulkan'
+        run: |
+          $exe = Join-Path $env:RUNNER_TEMP "vulkansdk-1.4.363.1.exe"
+          Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/1.4.363.1/windows/vulkansdk-windows-X64-1.4.363.1.exe" -OutFile $exe
+          $proc = Start-Process -FilePath $exe -Wait -PassThru -ArgumentList @(
+            "--root", "C:\VulkanSDK\1.4.363.1",
+            "--accept-licenses",
+            "--default-answer",
+            "--confirm-command",
+            "install"
+          )
+          Remove-Item -Force $exe -ErrorAction SilentlyContinue
+          if ($proc.ExitCode -ne 0) { exit $proc.ExitCode }
+
+      - name: Setup ROCm Windows SDK 10.0.0
+        if: matrix.backend == 'hip'
+        run: >-
+          python -m pip install --no-cache-dir
+          --index-url https://stable.repo.amd.com/rocm/whl-next/
+          "rocm[libraries,devel]==10.0.0"
+
+      - name: Setup llvm-mingw ARM64 cross-compiler
+        if: matrix.backend == 'arm64-cpu'
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "llvm-mingw.zip"
+          $dst = Join-Path $env:RUNNER_TEMP "llvm-mingw"
+          Invoke-WebRequest -Uri "https://github.com/mstorsjo/llvm-mingw/releases/download/20261020/llvm-mingw-20261020-ucrt-x86_64.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dst -Force
+          Remove-Item -Force $zip -ErrorAction SilentlyContinue
+
+      - name: Build and package Windows release archive
+        run: |
+          $extra = @()
+          if ("${{ matrix.backend }}" -like "cuda*") {
+            $extra += @("--cuda-root", "${{ runner.temp }}\cuda-${{ matrix.cuda_version }}")
+          } elseif ("${{ matrix.backend }}" -eq "vulkan") {
+            $extra += @("--vulkan-sdk", "C:\VulkanSDK\1.4.363.1")
+          } elseif ("${{ matrix.backend }}" -eq "arm64-cpu") {
+            $base = Join-Path $env:RUNNER_TEMP "llvm-mingw"
+            $root = Get-ChildItem $base -Directory | Select-Object -First 1 -ExpandProperty FullName
+            $extra += @("--mingw-root", $root)
+          }
+          if ("${{ matrix.smoke }}" -ne "") {
+            $extra += "${{ matrix.smoke }}"
+          }
+          python tokenwing-tools/release/build_windows.py `
+            --variant "${{ matrix.variant }}" `
+            --backend "${{ matrix.backend }}" `
+            --out-dir dist `
+            @extra
+
+      - name: Upload Windows release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.variant }}
+          path: dist/${{ matrix.variant }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Verify 13/13 assets and publish release
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download all 13 release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Verify all 13 packages and generate SHA256SUMS
+        run: |
+          cd release-assets
+          expected=(
+            tokenwing-linux-arm64-cpu.tar.gz
+            tokenwing-linux-arm64-cuda13.tar.gz
+            tokenwing-linux-x64-cpu.tar.gz
+            tokenwing-linux-x64-cuda12.tar.gz
+            tokenwing-linux-x64-cuda13.tar.gz
+            tokenwing-linux-x64-rocm.tar.gz
+            tokenwing-linux-x64-vulkan.tar.gz
+            tokenwing-windows-arm64-cpu.zip
+            tokenwing-windows-x64-cpu.zip
+            tokenwing-windows-x64-cuda12.zip
+            tokenwing-windows-x64-cuda13.zip
+            tokenwing-windows-x64-hip.zip
+            tokenwing-windows-x64-vulkan.zip
+          )
+          for f in "${expected[@]}"; do
+            test -s "$f"
+          done
+          sha256sum "${expected[@]}" > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload combined release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokenwing-release-assets
+          path: release-assets/*
+          if-no-files-found: error
+
+      - name: Create or update GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PRE: ${{ inputs.prerelease }}
+        run: |
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${INPUT_TAG}"
+          fi
+          PRE="${INPUT_PRE:-false}"
+          case "$TAG" in
+            *-*) PRE=true ;;
+          esac
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            flags=(--target "${{ github.sha }}" --title "$TAG" --generate-notes)
+            if [ "$PRE" = "true" ]; then
+              flags+=(--prerelease)
+            fi
+            gh release create "$TAG" "${flags[@]}"
+          fi
+          gh release upload "$TAG" --clobber release-assets/*

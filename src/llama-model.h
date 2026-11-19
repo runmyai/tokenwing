@@ -866,6 +866,15 @@ struct llama_model {
     // The load's retry passed a shortened --moe-stream-gpu-layers-list it owns - no pointer to it after the load
     void moe_stream_forget_gpu_layers_list() { params.moe_stream_gpu_layers_list = nullptr; }
 
+    const llama_model_params & model_params() const { return params; }
+
+    bool prefill_qsa_fused_on()          const { return params.moe_stream_prefill_fast == 1 || params.moe_stream_qsa_fused   == 1; }
+    bool prefill_ple_fast_on()           const { return params.moe_stream_prefill_fast == 1 || params.moe_stream_ple_fast    == 1; }
+    bool prefill_lm_bf16_on()            const { return params.moe_stream_prefill_fast == 1 || params.moe_stream_lm_bf16     == 1; }
+    bool prefill_lm_bf16_explicit()      const { return params.moe_stream_lm_bf16     == 1; }
+    bool prefill_lend_output_on()        const { return params.moe_stream_prefill_fast == 1 || params.moe_stream_lend_output == 1; }
+    bool prefill_lend_output_explicit()  const { return params.moe_stream_lend_output == 1; }
+
 protected:
     llama_model_params params;
 

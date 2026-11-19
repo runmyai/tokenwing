@@ -29,6 +29,7 @@ struct ggml_cuda_gdn_mma_args {
     int64_t sb2;
     int64_t sb3;
     float   scale;
+    bool    kda;
     bool    eligible;
 };
 

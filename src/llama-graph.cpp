@@ -2666,6 +2666,13 @@ static bool llama_moe_wsum_weights_on_host(const ggml_tensor * w) {
     return src && src->buffer && ggml_backend_buffer_is_host(src->buffer);
 }
 
+static void llama_moe_hybrid_tail_cpu(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    const auto * wctx = (const llama_moe_stream_wave *) userdata;
+    if (wctx && wctx->sl && wctx->sl->mgr) {
+        wctx->sl->mgr->compute_hybrid_tail_cpu(wctx, dst->src[0], dst->src[1], dst, ith, nth);
+    }
+}
+
 static LLAMA_WSUM_NO_FP_CONTRACT void llama_moe_weighted_sum_cpu(ggml_tensor * dst, int ith, int nth, void * userdata) {
 #if defined(__clang__)
 #pragma clang fp contract(off)
@@ -2932,6 +2939,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             down_w = mstream->tailw_tensor(2, il, wave, n_w);
             if (auto * wc = mstream->wave_ctx_of(il, wave)) {
                 wc->tail_gate = gate_w;   // (the copy-ahead check compares it with the gather's tensor)
+            }
+        }
+
+        ggml_tensor * cpu_tail = nullptr;
+        if (mstream && mstream->p1.hybrid_tail > 0 && lm_phase == 0 && x_c == nullptr &&
+                tailw_w && gpu_w && nt >= 8 && nt <= 2048 && mstream->htail_layer_ok(il) &&
+                cur_in->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(cur_in) && ggml_is_contiguous(weights) &&
+                !weight_before_ffn && gate_exps != nullptr && !gate_up_exps &&
+                !up_exps_s && !gate_exps_s && !down_exps_s && !up_exps_b && !gate_exps_b && !down_exps_b &&
+                type_op == LLM_FFN_SILU && (il < 0 || hparams.swiglu_clamp_exp[il] <= 1e-6f)) {
+            if (auto * wctx = mstream->wave_ctx_of(il, wave)) {
+                ids_gemm->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2] = 0x48544149;
+                ggml_build_forward_expand(gf, ids_gemm);
+                ggml_tensor * h_args[3] = { cur_in, weights, ids_gemm };
+                cpu_tail = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, nt, 1, 1, h_args, 3,
+                        llama_moe_hybrid_tail_cpu, GGML_N_TASKS_MAX, wctx);
+                ggml_format_name(cpu_tail, "ffn_moe_htail-%d-%d", il, wave);
+                ggml_build_forward_expand(gf, cpu_tail);
             }
         }
 
@@ -3206,6 +3232,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             if (n_expert_used_il == 1) {
                 // avoid returning a non-contiguous tensor
                 moe_out = ggml_cont(ctx0, moe_out);
+            }
+
+            if (cpu_tail) {
+                moe_out = ggml_add(ctx0, moe_out, cpu_tail);
+                ggml_build_forward_expand(gf, moe_out);
             }
 
             return moe_out;
@@ -3983,8 +4014,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 if (lm_moe && !lm_h_cur[(size_t) c]) {
                     lm_h_cur[(size_t) c] = ggml_cpy(ctx0, add, dst);
                 } else {
-                    ggml_tensor * prev = lm_h_cur[(size_t) c] ? lm_h_cur[(size_t) c] : dst;
-                    lm_h_cur[(size_t) c] = ggml_cpy(ctx0, ggml_add(ctx0, prev, add), dst);
+                    ggml_tensor * prev     = lm_h_cur[(size_t) c] ? lm_h_cur[(size_t) c] : dst;
+                    ggml_tensor * prev_f32 = prev->type == GGML_TYPE_F32 ? prev : ggml_cast(ctx0, prev, GGML_TYPE_F32);
+                    lm_h_cur[(size_t) c]   = ggml_cpy(ctx0, ggml_add(ctx0, prev_f32, add), dst);
                 }
                 ggml_build_forward_expand(gf, lm_h_cur[(size_t) c]);
             };
@@ -4486,11 +4518,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+        const bool qsa_compact = kq_mask != nullptr && kq_mask->type == GGML_TYPE_I32 && sinks == nullptr;
+        cur = ggml_flash_attn_ext(ctx0, q, k, v, qsa_compact ? nullptr : kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
+        if (qsa_compact) {
+            cur->src[4] = kq_mask;
+        }
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_prec_set_acc(cur, GGML_PREC_F32);

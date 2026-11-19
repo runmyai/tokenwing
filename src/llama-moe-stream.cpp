@@ -4032,6 +4032,10 @@ llama_moe_stream::~llama_moe_stream() {
                     (long long) tailw_pads, tailw_pad_bytes/1024.0, p1.vram_end_fill,
                     (long long) n_end_fill, (long long) n_end_fill_jobs, (long long) n_end_tick_jobs, (long long) n_end_fill_skip);
         }
+        if (p1.hybrid_tail > 0) {
+            fprintf(stderr, "llama_moe_stream: hybrid-tail: threshold %d, %lld pairs computed on CPU, %.1f MiB H2D gather skipped\n",
+                    p1.hybrid_tail, (long long) htail_computed_pairs, htail_saved_bytes / 1048576.0);
+        }
         if (p1.copy_ahead) {
             fprintf(stderr, "llama_moe_stream: copy-ahead: %s; %lld jobs, %lld experts copied ahead + %lld follow-ups (%.1f MiB, %.1f ms of uploader time), "
                     "%lld found in place by their layer, %lld above the set's places, %lld of the next waves' experts not READY in time, %lld "
@@ -4254,6 +4258,20 @@ llama_moe_stream::~llama_moe_stream() {
         if (G.ctx) { ggml_free(G.ctx); }
     }
     vx_groups.clear();
+    for (int s = 0; s < PRING_SLICES; ++s) {
+        if (pring_ev[s]) {
+            ggml_backend_event_free(pring_ev[s]);
+            pring_ev[s]     = nullptr;
+            pring_ev_rec[s] = false;
+        }
+    }
+    if (pring_buf) {
+        ggml_backend_buffer_free(pring_buf);
+        pring_buf  = nullptr;
+        pring_ptr  = nullptr;
+        pring_cap  = 0;
+        pring_head = 0;
+    }
     if (tailw_ctx) {   // the tail waves' tensor headers (their memory is the pool's, freed above)
         ggml_free(tailw_ctx);
         tailw_ctx = nullptr;
@@ -4264,6 +4282,9 @@ llama_moe_stream::~llama_moe_stream() {
     // Unregister host pool addresses before destroying backend buffers (host_buft UMA pools own their memory inside bufs)
     for (size_t i = 0; i < pool_mem.size(); i++) {
         unregister_pool(pool_mem[i]);
+        if (unpin_pool_fn && i < pool_pinned.size() && pool_pinned[i]) {
+            unpin_pool_fn(pool_mem[i]);
+        }
     }
     bufs.clear();
     for (ggml_context * ctx : ctxs) {
@@ -4462,6 +4483,8 @@ ggml_tensor * llama_moe_stream::create_pool(int32_t il, const std::string & name
         sl->slot_expert .assign(nsa, -1);
         sl->slot_state  .assign(nsa, MOE_STREAM_SLOT_EMPTY);
         sl->slot_last_use.assign(nsa, 0);
+        sl->slot_tailw_gen.assign(nsa, 0);
+        sl->slot_ca_gen   .assign(nsa, 0);
         sl->slot_freq    .assign(nsa, 0);
         sl->slot_seg     .assign(nsa, 0);   // every slot starts in probation
         sl->slot_prefetch.assign(nsa, 0);
@@ -6213,6 +6236,7 @@ void llama_moe_stream::io_loop_t(int ith) {
             // the other threads and of the next layer.
             // A sidecar already in the repacked layout is copied into the slot as it is; only a
             // plain sidecar is converted, and then only into a repacked pool.
+            wait_slot_h2d_done(sl, job.slot);
             if (convert_on_read && !sl.repacked) {
                 // this thread's own scratch, so the reads stay parallel (one shared scratch behind a
                 // mutex serialized all of them and tripled the stall: 13.5 -> 42.8 ms/token)
@@ -7079,6 +7103,40 @@ void llama_moe_stream::note_lead(llama_moe_stream_layer & sl, int32_t slot) {
     }
 }
 
+void llama_moe_stream::wait_slot_h2d_done(const llama_moe_stream_layer & sl, int32_t slot) {
+    if (!pools_registered || slot < 0) {
+        return;
+    }
+    static_assert(sizeof(std::atomic<uint64_t>) == sizeof(uint64_t), "atomic<uint64_t> layout");
+    const uint64_t tg = (size_t) slot < sl.slot_tailw_gen.size()
+        ? reinterpret_cast<const std::atomic<uint64_t> *>(&sl.slot_tailw_gen[(size_t) slot])->load(std::memory_order_acquire)
+        : 0;
+    const uint64_t cg = (size_t) slot < sl.slot_ca_gen.size()
+        ? reinterpret_cast<const std::atomic<uint64_t> *>(&sl.slot_ca_gen[(size_t) slot])->load(std::memory_order_acquire)
+        : 0;
+    if (tg <= tailw_h2d_acked.load(std::memory_order_acquire) &&
+        cg <= ca_h2d_acked.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(h2d_ev_mtx);
+    uint64_t ta = tailw_h2d_acked.load(std::memory_order_relaxed);
+    if (tg > ta && tg <= tailw_h2d_seq.load(std::memory_order_relaxed)) {
+        ggml_backend_event_t ev = tailw_ev_ring[tg % H2D_EV_RING];
+        if (ev != nullptr) {
+            ggml_backend_event_synchronize(ev);
+        }
+        tailw_h2d_acked.store(tg, std::memory_order_release);
+    }
+    uint64_t ca = ca_h2d_acked.load(std::memory_order_relaxed);
+    if (cg > ca && cg <= ca_h2d_seq.load(std::memory_order_relaxed)) {
+        ggml_backend_event_t ev = ca_ev_ring[cg % H2D_EV_RING];
+        if (ev != nullptr) {
+            ggml_backend_event_synchronize(ev);
+        }
+        ca_h2d_acked.store(cg, std::memory_order_release);
+    }
+}
+
 // mtx must be held: a slot loses whatever expert it held
 void llama_moe_stream::drop_slot(llama_moe_stream_layer & sl, int32_t slot, int32_t taker, bool taker_guess, bool to_vram,
                                  bool by_copyback) {
@@ -7357,9 +7415,16 @@ bool llama_moe_stream::pin_pools(ggml_backend_reg_t reg) {
     }
 
     typedef bool (*register_fn)(void *, size_t);
+    typedef void (*unregister_fn)(void *);
     register_fn reg_fn = reg
-        ? (register_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer")
+        ? (register_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_pin_rw_host_buffer")
         : nullptr;
+    if (reg_fn && reg) {
+        unpin_pool_fn = (unregister_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_unpin_rw_host_buffer");
+    } else if (reg) {
+        reg_fn        = (register_fn)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer");
+        unpin_pool_fn = (unregister_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
+    }
 
     if (!reg_fn) {
         fprintf(stderr, "%s: this backend cannot register host memory (no "
@@ -7374,11 +7439,13 @@ bool llama_moe_stream::pin_pools(ggml_backend_reg_t reg) {
 
     size_t n_ok = 0;
     size_t ok_bytes = 0;
+    pool_pinned.assign(pool_mem.size(), 0);
 
     for (size_t i = 0; i < pool_mem.size(); i++) {
         if (reg_fn(pool_mem[i], pool_size[i])) {
-            n_ok     += 1;
-            ok_bytes += pool_size[i];
+            pool_pinned[i] = 1;
+            n_ok          += 1;
+            ok_bytes      += pool_size[i];
         } else {
             // no CUDA here, so no cudaGetErrorString(): the driver's own message needs the runtime
             fprintf(stderr, "%s: pool %zu (%.2f MiB) could not be registered with the driver\n", __func__,
@@ -14042,6 +14109,8 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
     mgr->remap(*sl, ids, nullptr, n, n_tok, w->w, out, t0_op);
     mgr->psplit_after_remap(*sl, n_tok, w->w);
     if (dst->flags & LLAMA_MOE_STREAM_TENSOR_TAIL) {
+        mgr->htail_armed = (dst->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2] == 0x48544149);
+        mgr->htail_k     = (int32_t) a->ne[0];
         mgr->tailw_gather(*sl, out, n, w->w);   // the slot ids become tail places, the copies are queued
     }
 
@@ -14289,6 +14358,8 @@ void llama_moe_stream_remap2(ggml_tensor * dst, const ggml_tensor * a, const ggm
     mgr->remap(*sl, (const int32_t *) a->data, (const int32_t *) b->data, n, n_tok, w->w, (int32_t *) dst->data, t0_op);
     mgr->psplit_after_remap(*sl, n_tok, w->w);
     if (dst->flags & LLAMA_MOE_STREAM_TENSOR_TAIL) {
+        mgr->htail_armed = (dst->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2] == 0x48544149);
+        mgr->htail_k     = (int32_t) a->ne[0];
         mgr->tailw_gather(*sl, (int32_t *) dst->data, n, w->w);
     }
 
@@ -14340,6 +14411,8 @@ static void llama_moe_stream_remap_b_impl(ggml_tensor * dst, const ggml_tensor *
             t0_op);
     mgr->psplit_after_remap(*sl, n_tok, w->w);
     if (dst->flags & LLAMA_MOE_STREAM_TENSOR_TAIL) {
+        mgr->htail_armed = (dst->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2] == 0x48544149);
+        mgr->htail_k     = (int32_t) a->ne[0];
         mgr->tailw_gather(*sl, (int32_t *) dst->data, n, w->w);
     }
     llama_moe_stream_remap_after(mgr, sl, w, ids, n, n_tok, t0_op, t_layer0);
@@ -15656,8 +15729,11 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                             ggml_row_size(Pk->type, Pk->ne[0])*Pk->ne[1] == (k < 2 ? nbg : nbd) && Pk->nb[2] == (k < 2 ? nbg : nbd);
                 }
             }
-            tailw_why = pools_registered ? "the pools are page-locked (--moe-stream-pin)"
-                   : reg == nullptr || (strcmp(ggml_backend_reg_name(reg), "CUDA") != 0 && strcmp(ggml_backend_reg_name(reg), "ROCm") != 0)
+            const bool cuda_or_rocm = reg != nullptr &&
+                (strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 || strcmp(ggml_backend_reg_name(reg), "ROCm") == 0);
+            const bool pin_tailw_ok = p1.prefill_fast && cuda_or_rocm;
+            tailw_why = (pools_registered && !pin_tailw_ok) ? "the pools are page-locked (--moe-stream-pin)"
+                   : !cuda_or_rocm
                    ? "not a CUDA / ROCm GPU (to do: a copy-done event)"
                    : !shape ? "a pool slice is not one VRAM place (merged gate|up or another type)" : "";
             tailw_ready = tailw_why.empty();
@@ -16290,6 +16366,16 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
     // Tail waves: three tensors at the tail's copy places (where tail_copy_hook puts the scheduler's pool copies: gate, then up in the
     // merged gate|up tensor's tail, down in the down tensor's tail), the shape of a pool view of tail_copy_n slices
     if (tail_on && tailw_ready && !il_of_moe.empty()) {
+        if (pools_registered && dev != nullptr) {
+            for (size_t ei = 0; ei < H2D_EV_RING; ++ei) {
+                if (tailw_ev_ring[ei] == nullptr) {
+                    tailw_ev_ring[ei] = ggml_backend_event_new(dev);
+                }
+                if (ca_ev_ring[ei] == nullptr) {
+                    ca_ev_ring[ei] = ggml_backend_event_new(dev);
+                }
+            }
+        }
         // One set per pool group (format), at that group's copy places in the tail group's tensors (the sets share the bytes)
         const auto & G  = vx_groups[(size_t) tail_group];
         const size_t nb_g = ggml_row_size(G.t_gate, G.ne_gate[0])*G.ne_gate[1];
@@ -16324,6 +16410,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                 if (ok) {
                     t->buffer = G.buf;
                     t->data   = addr;
+                    t->flags |= GGML_TENSOR_FLAG_PREZERO_PAD;
                     tailw_tg[si][(size_t) k] = t;
                 }
             }
@@ -17211,6 +17298,7 @@ void llama_moe_stream::vf_cb_copy(vf_job_t & j, bool async) {
                          (uint8_t *) B.weights[1].pool->data + (size_t) s*B.weights[1].size,
                          (uint8_t *) B.weights[2].pool->data + (size_t) s*B.weights[2].size };
     const bool stale = vf_test_cb_stale > 0 && vf_cb_seen.fetch_add(1) + 1 == vf_test_cb_stale;   // TEST ONLY: the failure test
+    wait_slot_h2d_done(B, s);
     if (async && vf_bounce) {
         ggml_backend_tensor_get_async(vf_be, G.gate_up, vf_bounce,          o_g, nb_g);
         ggml_backend_tensor_get_async(vf_be, G.gate_up, vf_bounce + nb_g,   o_u, nb_g);
@@ -18154,6 +18242,189 @@ void llama_moe_stream::lm_call_end(bool complete) {
 // stream as runs of consecutive places from consecutive slots, three projections each. From pageable pool memory a host-to-device copy
 // returns once its bytes are staged, so the slots may be refilled when the op returns (the CLOBBER gate's claim); the zero places are
 // copied once after every vacate (they hold experts at word time)
+void llama_moe_stream::pring_ensure() {
+    if (pring_buf != nullptr || p1.pinned_ring <= 0 || tailw_be == nullptr) {
+        return;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(tailw_be);
+    ggml_backend_buffer_type_t hbuft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    if (hbuft == nullptr) {
+        return;
+    }
+    for (int64_t sz = p1.pinned_ring; sz >= ((int64_t) 32 << 20); sz >>= 1) {
+        ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(hbuft, (size_t) sz);
+        if (b != nullptr) {
+            pring_buf   = b;
+            pring_ptr   = (char *) ggml_backend_buffer_get_base(b);
+            pring_cap   = (size_t) sz;
+            pring_head  = 0;
+            pring_slice = 0;
+            for (int s = 0; s < PRING_SLICES; ++s) {
+                pring_ev[s]     = ggml_backend_event_new(dev);
+                pring_ev_rec[s] = false;
+            }
+            fprintf(stderr, "llama_moe_stream: pinned H2D staging ring allocated: %.1f MiB\n", (double) sz / 1048576.0);
+            break;
+        }
+    }
+}
+
+void llama_moe_stream::tailw_set_async_staged(ggml_tensor * D, const char * src, size_t dst_off, size_t nbytes) {
+    if (p1.pinned_ring <= 0 || nbytes == 0) {
+        ggml_backend_tensor_set_async(tailw_be, D, src, dst_off, nbytes);
+        return;
+    }
+    if (pring_ptr == nullptr) {
+        pring_ensure();
+    }
+    const size_t slice_cap = pring_cap / PRING_SLICES;
+    if (pring_ptr == nullptr || slice_cap == 0 || nbytes > slice_cap) {
+        ggml_backend_tensor_set_async(tailw_be, D, src, dst_off, nbytes);
+        return;
+    }
+    if (pring_head + nbytes > slice_cap) {
+        if (pring_ev[pring_slice]) {
+            ggml_backend_event_record(pring_ev[pring_slice], tailw_be);
+            pring_ev_rec[pring_slice] = true;
+        }
+        pring_slice = (pring_slice + 1) % PRING_SLICES;
+        pring_head  = 0;
+        if (pring_ev_rec[pring_slice] && pring_ev[pring_slice]) {
+            ggml_backend_event_synchronize(pring_ev[pring_slice]);
+            pring_ev_rec[pring_slice] = false;
+        }
+        pring_wraps += 1;
+    }
+    char * stage = pring_ptr + (size_t) pring_slice * slice_cap + pring_head;
+    std::memcpy(stage, src, nbytes);
+    ggml_backend_tensor_set_async(tailw_be, D, stage, dst_off, nbytes);
+    pring_head   = GGML_PAD(pring_head + nbytes, 64);
+    pring_bytes += (int64_t) nbytes;
+}
+
+void llama_moe_stream::set_lm_routed_ids(int32_t il, const int32_t * ids_host, int64_t n) {
+    if (il < 0 || (size_t) il >= layers.size() || !layers[il] || ids_host == nullptr || n <= 0) {
+        return;
+    }
+    if (lm_routed_mask.size() < layers.size()) {
+        lm_routed_mask.resize(layers.size());
+    }
+    const uint32_t ne = layers[il]->n_expert;
+    auto & mask = lm_routed_mask[(size_t) il];
+    mask.assign(ne, 0);
+    for (int64_t i = 0; i < n; ++i) {
+        const int32_t e = ids_host[i];
+        if (e >= 0 && (uint32_t) e < ne) {
+            mask[(size_t) e] = 1;
+        }
+    }
+}
+
+bool llama_moe_stream::htail_layer_ok(int32_t il) const {
+    if (il < 0 || (size_t) il >= layers.size() || !layers[il] || cpu_repack_on.load()) {
+        return false;
+    }
+    const llama_moe_stream_layer & sl = *layers[il];
+    for (int k = 0; k < 3; ++k) {
+        const ggml_tensor * P = sl.weights[k].pool;
+        if (!P || !P->buffer || !ggml_backend_buffer_is_host(P->buffer)) {
+            return false;
+        }
+        const auto * tr = ggml_get_type_traits_cpu(P->type);
+        if (!tr || !tr->vec_dot) {
+            return false;
+        }
+        const auto * tr_q = ggml_get_type_traits_cpu(tr->vec_dot_type);
+        const int64_t bs  = ggml_blck_size(tr->vec_dot_type);
+        if (!tr_q || !tr_q->from_float || bs <= 0 || (P->ne[0] % bs) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void llama_moe_stream::compute_hybrid_tail_cpu(
+        const llama_moe_stream_wave * wctx, const ggml_tensor * x_in, const ggml_tensor * w_in, ggml_tensor * dst, int ith, int nth) {
+    const int64_t n_embd = dst->ne[0];
+    const int64_t nt     = dst->ne[1];
+    const int64_t tok0   = (nt * ith) / nth;
+    const int64_t tok1   = (nt * (ith + 1)) / nth;
+    for (int64_t t = tok0; t < tok1; ++t) {
+        std::memset((char *) dst->data + (size_t) t * dst->nb[1], 0, (size_t) n_embd * sizeof(float));
+    }
+    if (!wctx || !wctx->sl || wctx->htail_pairs.empty() || tok0 >= tok1) {
+        return;
+    }
+    const llama_moe_stream_layer & sl = *wctx->sl;
+    const ggml_tensor * P_gate = sl.weights[0].pool;
+    const ggml_tensor * P_up   = sl.weights[1].pool;
+    const ggml_tensor * P_down = sl.weights[2].pool;
+    const int64_t n_ff         = P_up->ne[1];
+    const int64_t k_used       = w_in->ne[1];
+    const size_t  x_tok_stride = x_in->ne[1] == nt && x_in->ne[2] == 1 ? x_in->nb[1] : x_in->nb[2];
+
+    const auto * tr_g  = ggml_get_type_traits_cpu(P_gate->type);
+    const auto * tr_u  = ggml_get_type_traits_cpu(P_up->type);
+    const auto * tr_d  = ggml_get_type_traits_cpu(P_down->type);
+    const auto * tr_gq = tr_g ? ggml_get_type_traits_cpu(tr_g->vec_dot_type) : nullptr;
+    const auto * tr_uq = tr_u ? ggml_get_type_traits_cpu(tr_u->vec_dot_type) : nullptr;
+    const auto * tr_dq = tr_d ? ggml_get_type_traits_cpu(tr_d->vec_dot_type) : nullptr;
+    if (!tr_g || !tr_u || !tr_d || !tr_g->vec_dot || !tr_u->vec_dot || !tr_d->vec_dot ||
+            !tr_gq || !tr_uq || !tr_dq || !tr_gq->from_float || !tr_uq->from_float || !tr_dq->from_float) {
+        return;
+    }
+    const bool same_gu_q = (tr_g->vec_dot_type == tr_u->vec_dot_type);
+    std::vector<char>  xq_g(ggml_row_size(tr_g->vec_dot_type, n_embd));
+    std::vector<char>  xq_u(same_gu_q ? 0 : ggml_row_size(tr_u->vec_dot_type, n_embd));
+    std::vector<char>  hq(ggml_row_size(tr_d->vec_dot_type, n_ff));
+    std::vector<float> h_f32((size_t) n_ff);
+
+    const auto & pairs = wctx->htail_pairs;
+    const int32_t pair0 = (int32_t) std::min<int64_t>(tok0 * k_used, INT32_MAX);
+    auto it = std::lower_bound(pairs.begin(), pairs.end(), pair0,
+            [](const auto & a, int32_t v) { return a.pair_idx < v; });
+
+    int64_t last_tok = -1;
+    for (; it != pairs.end(); ++it) {
+        const auto &  hp  = *it;
+        const int64_t tok = hp.pair_idx / k_used;
+        if (tok >= tok1) {
+            break;
+        }
+        const int64_t kj = hp.pair_idx % k_used;
+        const float   wt = *(const float *)((const char *) w_in->data + (size_t) kj * w_in->nb[1] + (size_t) tok * w_in->nb[2]);
+        if (wt == 0.0f) {
+            continue;
+        }
+        if (tok != last_tok) {
+            const float * x_row = (const float *)((const char *) x_in->data + (size_t) tok * x_tok_stride);
+            tr_gq->from_float(x_row, xq_g.data(), n_embd);
+            if (!same_gu_q) {
+                tr_uq->from_float(x_row, xq_u.data(), n_embd);
+            }
+            last_tok = tok;
+        }
+        const char * xq_u_ptr = same_gu_q ? xq_g.data() : xq_u.data();
+        const char * g_exp    = (const char *) P_gate->data + (size_t) hp.slot * P_gate->nb[2];
+        const char * u_exp    = (const char *) P_up->data   + (size_t) hp.slot * P_up->nb[2];
+        for (int64_t f = 0; f < n_ff; ++f) {
+            float gv = 0.0f, uv = 0.0f;
+            tr_g->vec_dot((int) n_embd, &gv, 0, g_exp + (size_t) f * P_gate->nb[1], 0, xq_g.data(), 0, 1);
+            tr_u->vec_dot((int) n_embd, &uv, 0, u_exp + (size_t) f * P_up->nb[1],   0, xq_u_ptr,    0, 1);
+            h_f32[(size_t) f] = (gv / (1.0f + expf(-gv))) * uv;
+        }
+        tr_dq->from_float(h_f32.data(), hq.data(), n_ff);
+
+        const char * d_exp   = (const char *) P_down->data + (size_t) hp.slot * P_down->nb[2];
+        float *      dst_row = (float *)((char *) dst->data + (size_t) tok * dst->nb[1]);
+        for (int64_t i = 0; i < n_embd; ++i) {
+            float dv = 0.0f;
+            tr_d->vec_dot((int) n_ff, &dv, 0, d_exp + (size_t) i * P_down->nb[1], 0, hq.data(), 0, 1);
+            dst_row[i] += wt * dv;
+        }
+    }
+}
+
 void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, int64_t n, int32_t wave) {
     if (!tail_vacated) {
         moe_stream_fail("tail waves: layer %d's GPU wave reads the tail's places while experts are held there (the tail was not vacated)", sl.il);
@@ -18320,6 +18591,54 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
         ca_list_e.clear();
         ca_job_il = -1;
     }
+    llama_moe_stream_wave * htail_wctx = wave_ctx_of(sl.il, wave);
+    if (htail_wctx) {
+        htail_wctx->htail_pairs.clear();
+    }
+    const int64_t k_htail = htail_k > 0 ? (int64_t) htail_k : (int64_t) n_expert_used;
+    if (htail_armed && htail_wctx != nullptr && p1.hybrid_tail > 0 &&
+            k_htail > 0 && n_zero > 0 && (n % k_htail) == 0 &&
+            (n / k_htail) <= 2048 && !ca_test_check) {
+        const int64_t n_tok_ht = n / k_htail;
+        std::vector<int32_t> slot_uses((size_t) n_pool, 0);
+        std::vector<int32_t> slot_redir((size_t) n_pool, 0);
+        for (int64_t i = 0; i < n; i++) {
+            const int32_t s = out[i];
+            if (s >= 0 && s < n_pool && !(s >= zb && s < zb + (int32_t) n_zero)) {
+                slot_uses[(size_t) s] += 1;
+            }
+        }
+        const size_t exp_bytes = sl.weights[0].pool->nb[2] + sl.weights[1].pool->nb[2] + sl.weights[2].pool->nb[2];
+        for (int64_t t = 0; t < n_tok_ht; t++) {
+            int32_t next_z = 0;
+            for (int64_t j = 0; j < k_htail; j++) {
+                const int32_t s = out[t * k_htail + j];
+                if (s >= zb && s < zb + (int32_t) n_zero) {
+                    next_z = std::max<int32_t>(next_z, (s - zb) + 1);
+                }
+            }
+            for (int64_t j = 0; j < k_htail; j++) {
+                const int64_t idx = t * k_htail + j;
+                const int32_t s   = out[idx];
+                if (s >= 0 && s < n_pool && !(s >= zb && s < zb + (int32_t) n_zero) &&
+                        slot_uses[(size_t) s] >= 1 && slot_uses[(size_t) s] <= p1.hybrid_tail &&
+                        tailw_place_of[(size_t) s] < 0 && next_z < (int32_t) n_zero) {
+                    htail_wctx->htail_pairs.push_back({ (int32_t) idx, s });
+                    htail_computed_pairs += 1;
+                    slot_redir[(size_t) s] += 1;
+                    out[idx] = zb + next_z++;   // distinct per-token zero slice so mm_ids_helper never sees duplicate IDs
+                }
+            }
+        }
+        for (int32_t s = 0; s < n_pool; s++) {
+            if (slot_redir[(size_t) s] > 0 && slot_redir[(size_t) s] == slot_uses[(size_t) s]) {
+                htail_saved_bytes += (int64_t) exp_bytes;
+            }
+        }
+    }
+    htail_armed = false;
+    htail_k     = 0;
+
     int64_t moved = 0;
     for (int pass = 0; pass < 2; pass++) {
         int32_t free_p = 0;
@@ -18401,7 +18720,7 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
             ggml_tensor *       D = g1s[(size_t) k];
             const size_t nb = P->nb[2];
             GGML_ASSERT(nb == D->nb[2] && P->type == D->type);
-            ggml_backend_tensor_set_async(tailw_be, D, (const char *) P->data + (size_t) s0*nb, (size_t) p0*nb, (size_t) len*nb);
+            tailw_set_async_staged(D, (const char *) P->data + (size_t) s0*nb, (size_t) p0*nb, (size_t) len*nb);
             calls += 1;
             bytes += (int64_t) len*(int64_t) nb;
         }
@@ -18414,7 +18733,7 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
         const ggml_tensor * P = sl.weights[2].pool;
         ggml_tensor *       D = g1s[2];
         const size_t nb = P->nb[2];
-        ggml_backend_tensor_set_async(tailw_be, D, (const char *) P->data + (size_t) pd.second*nb, (size_t) pd.first*nb, nb);
+        tailw_set_async_staged(D, (const char *) P->data + (size_t) pd.second*nb, (size_t) pd.first*nb, nb);
         calls += 1;
         bytes += (int64_t) nb;
     }
@@ -18452,6 +18771,37 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
                     tailw_pad_bytes += pd[(size_t) k];
                     calls += 1;
                 }
+            }
+        }
+    }
+    if (pools_registered && calls > 0) {
+        uint64_t gen = 0;
+        {
+            std::lock_guard<std::mutex> lk(h2d_ev_mtx);
+            gen = tailw_h2d_seq.load(std::memory_order_relaxed) + 1;
+            const uint64_t ta = tailw_h2d_acked.load(std::memory_order_relaxed);
+            if (gen - ta >= H2D_EV_RING) {
+                const uint64_t old = gen - (H2D_EV_RING - 1);
+                if (tailw_ev_ring[old % H2D_EV_RING] != nullptr) {
+                    ggml_backend_event_synchronize(tailw_ev_ring[old % H2D_EV_RING]);
+                }
+                tailw_h2d_acked.store(old, std::memory_order_release);
+            }
+            if (tailw_ev_ring[gen % H2D_EV_RING] != nullptr) {
+                ggml_backend_event_record(tailw_ev_ring[gen % H2D_EV_RING], tailw_be);
+            }
+            tailw_h2d_seq.store(gen, std::memory_order_release);
+        }
+        for (const auto & ps : tailw_list) {
+            const int32_t s = ps.second;
+            if (s >= 0 && (size_t) s < sl.slot_tailw_gen.size()) {
+                reinterpret_cast<std::atomic<uint64_t> *>(&sl.slot_tailw_gen[(size_t) s])->store(gen, std::memory_order_release);
+            }
+        }
+        for (const auto & pd : ca_dn) {
+            const int32_t s = pd.second;
+            if (s >= 0 && (size_t) s < sl.slot_tailw_gen.size()) {
+                reinterpret_cast<std::atomic<uint64_t> *>(&sl.slot_tailw_gen[(size_t) s])->store(gen, std::memory_order_release);
             }
         }
     }
@@ -18541,8 +18891,10 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
                 }
             }
         } else {
+            const bool has_rmask = (p1.prefill_fast || p1.pinned_ring > 0) && (size_t) il2 < lm_routed_mask.size() &&
+                                   lm_routed_mask[(size_t) il2].size() == sl2.n_expert;
             for (uint32_t e = 0; e < sl2.n_expert; e++) {
-                if (!sl2.vx_held((int32_t) e)) {
+                if (!sl2.vx_held((int32_t) e) && (!has_rmask || lm_routed_mask[(size_t) il2][e])) {
                     ca_es.push_back((int32_t) e);   // (a held expert may have a RAM copy now; the VRAM pass computes it)
                 }
             }
@@ -18878,6 +19230,10 @@ void llama_moe_stream::ca_end_call() {
     ca_cancel.store(false);
     if (issued) {
         ggml_backend_event_synchronize(ca_ev_a);
+        if (pools_registered) {
+            std::lock_guard<std::mutex> lk(h2d_ev_mtx);
+            ca_h2d_acked.store(ca_h2d_seq.load(std::memory_order_relaxed), std::memory_order_release);
+        }
     }
     for (const int32_t e : ca_list_e) {
         ca_place[(size_t) e] = -1;
@@ -19010,6 +19366,37 @@ void llama_moe_stream::ca_run_job(ca_job_t & j) {
         }
     }
     ggml_backend_event_record(ca_ev_a, vf_be);
+    if (pools_registered && bytes > 0) {
+        uint64_t cgen = 0;
+        {
+            std::lock_guard<std::mutex> lk(h2d_ev_mtx);
+            cgen = ca_h2d_seq.load(std::memory_order_relaxed) + 1;
+            const uint64_t ca = ca_h2d_acked.load(std::memory_order_relaxed);
+            if (cgen - ca >= H2D_EV_RING) {
+                const uint64_t old = cgen - (H2D_EV_RING - 1);
+                if (ca_ev_ring[old % H2D_EV_RING] != nullptr) {
+                    ggml_backend_event_synchronize(ca_ev_ring[old % H2D_EV_RING]);
+                }
+                ca_h2d_acked.store(old, std::memory_order_release);
+            }
+            if (ca_ev_ring[cgen % H2D_EV_RING] != nullptr) {
+                ggml_backend_event_record(ca_ev_ring[cgen % H2D_EV_RING], vf_be);
+            }
+            ca_h2d_seq.store(cgen, std::memory_order_release);
+        }
+        for (const auto & ps : j.list) {
+            const int32_t s = ps.second;
+            if (s >= 0 && (size_t) s < sl.slot_ca_gen.size()) {
+                reinterpret_cast<std::atomic<uint64_t> *>(&sl.slot_ca_gen[(size_t) s])->store(cgen, std::memory_order_release);
+            }
+        }
+        for (const auto & ad : j.added) {
+            const int32_t s = ad[2];
+            if (s >= 0 && (size_t) s < sl.slot_ca_gen.size()) {
+                reinterpret_cast<std::atomic<uint64_t> *>(&sl.slot_ca_gen[(size_t) s])->store(cgen, std::memory_order_release);
+            }
+        }
+    }
     j.bytes = bytes;
     j.us    = ggml_time_us() - t0;
 }
@@ -20066,6 +20453,16 @@ void llama_moe_stream::vf_stop_uploader() {
         if (*ev) {
             ggml_backend_event_free(*ev);
             *ev = nullptr;
+        }
+    }
+    for (size_t ei = 0; ei < H2D_EV_RING; ++ei) {
+        if (tailw_ev_ring[ei]) {
+            ggml_backend_event_free(tailw_ev_ring[ei]);
+            tailw_ev_ring[ei] = nullptr;
+        }
+        if (ca_ev_ring[ei]) {
+            ggml_backend_event_free(ca_ev_ring[ei]);
+            ca_ev_ring[ei] = nullptr;
         }
     }
     if (psplit_ev) {   // prompt split: after the uploader stopped

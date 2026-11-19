@@ -203,6 +203,16 @@ struct llama_moe_stream_p1 {
     int32_t     prompt_split_places = 128;   // --moe-stream-prompt-split-places N
     bool        gpu_wave_skip_zero = false;   // --moe-stream-gpu-wave-skip-zero 1
     bool        gpu_skip_zero  = false;   // the GPU one-token mmvq writes 0 for the VRAM pool's zero slices
+    bool        prefill_fast   = false;   // --moe-stream-prefill-fast 1
+    bool        mmq_moe_opt    = false;   // --moe-stream-mmq-moe-opt 1
+    bool        gpu_moe_fused  = false;   // --moe-stream-gpu-moe-fused 1
+    int64_t     pinned_ring    = 0;       // --moe-stream-pinned-ring SIZE
+    bool        lm_bf16        = false;   // --moe-stream-lm-bf16 1
+    bool        lend_output    = false;   // --moe-stream-lend-output 1
+    bool        qsa_fused      = false;   // --moe-stream-qsa-fused 1
+    bool        hc_fused       = false;   // --moe-stream-hc-fused 1
+    bool        ple_fast       = false;   // --moe-stream-ple-fast 1
+    int32_t     hybrid_tail    = 0;       // --moe-stream-hybrid-tail K
     bool        plan           = false;   // --moe-stream-plan 1, the waiting list with late binding (decode words)
     bool        plan_bind_early = false;  // test only - every list entry is bound the moment it is added
     bool        drop_stale     = false;   // at its target's start, entries it did not pick go, and their started reads'
@@ -328,6 +338,8 @@ struct llama_moe_stream_layer {
     std::vector<int32_t>  slot_expert;    // [n_slots]  expert id, or -1 when empty
     std::vector<uint8_t>  slot_state;     // [n_slots]  llama_moe_stream_slot_state
     std::vector<uint64_t> slot_last_use;  // [n_slots]  LRU stamp
+    std::vector<uint64_t> slot_tailw_gen; // [n_slots]  atomic H2D sequence stamp for page-locked tail-wave copies
+    std::vector<uint64_t> slot_ca_gen;    // [n_slots]  atomic H2D sequence stamp for page-locked copy-ahead copies
     // The readiness table ggml's mul_mat_id polls, one flag per slice of the pool tensor
     // (n_slots real slots, then the n_expert_used all-zero slices which are ready from the start).
     // Plain uint32 because it is written with atomic stores from another thread; the accesses are the
@@ -950,6 +962,11 @@ struct llama_moe_stream_job {
     bool     refill      = false;   // a take-back's refill read (q_refill: after every needed and guessed read, a few at a time)
 };
 
+struct llama_moe_stream_htail_pair {
+    int32_t pair_idx;
+    int32_t slot;
+};
+
 // the userdata of one wave's remapping op: the layer and which wave of the ubatch it loads
 struct llama_moe_stream_wave {
     llama_moe_stream_layer * sl = nullptr;
@@ -965,6 +982,7 @@ struct llama_moe_stream_wave {
     // 3 = pred_il3 (three ahead). The chain's later steps come from remap() as they always did.
     int32_t tlead = 2;
     const ggml_tensor * tail_gate = nullptr;   // the tail tensor this wave's gate matmul reads in the graph built last (copy-ahead check)
+    std::vector<llama_moe_stream_htail_pair> htail_pairs;
 };
 
 struct llama_moe_stream {
@@ -1534,6 +1552,17 @@ struct llama_moe_stream {
     };
     ca_job_t ca_job;                   // vf_mtx: the one job out
     ggml_backend_event_t ca_ev_c = nullptr, ca_ev_a = nullptr;   // the compute stream -> the uploader, the uploader -> the compute stream
+    static constexpr size_t H2D_EV_RING = 64;
+    ggml_backend_event_t  tailw_ev_ring[H2D_EV_RING] = {};
+    ggml_backend_event_t  ca_ev_ring[H2D_EV_RING]    = {};
+    std::mutex            h2d_ev_mtx;
+    std::atomic<uint64_t> tailw_h2d_seq{0};
+    std::atomic<uint64_t> tailw_h2d_acked{0};
+    std::atomic<uint64_t> ca_h2d_seq{0};
+    std::atomic<uint64_t> ca_h2d_acked{0};
+    void                  wait_slot_h2d_done(const llama_moe_stream_layer & sl, int32_t slot);
+    void                (*unpin_pool_fn)(void *) = nullptr;
+    std::vector<uint8_t>  pool_pinned;
     int32_t  ca_job_il = -1;           // graph thread: the layer the job's places are for
     int32_t  ca_job_w  = 0;            // graph thread: and the wave (one-set mode: the next wave of the same layer, or wave 0)
     int32_t  ca_job_set = 0;           // graph thread: and the set its places are in (the gather's "mine" check)
@@ -1626,6 +1655,29 @@ struct llama_moe_stream {
         return g >= 0 && i < tailw_tg.size() ? tailw_tg[i][(size_t) k] : tailw_t[k];
     }
     void tailw_gather(llama_moe_stream_layer & sl, int32_t * out, int64_t n, int32_t wave);   // the remap op, after its slot ids are final
+
+    // Pinned H2D staging ring + routed-only mask + CPU hybrid tail co-execution
+    static constexpr int  PRING_SLICES = 4;
+    ggml_backend_buffer_t pring_buf    = nullptr;
+    char *                pring_ptr    = nullptr;
+    size_t                pring_cap    = 0;
+    size_t                pring_head   = 0;
+    int                   pring_slice  = 0;
+    ggml_backend_event_t  pring_ev[PRING_SLICES] = {};
+    bool                  pring_ev_rec[PRING_SLICES] = {};
+    int64_t               pring_wraps = 0, pring_bytes = 0;
+    void                  pring_ensure();
+    void                  tailw_set_async_staged(ggml_tensor * D, const char * src, size_t dst_off, size_t nbytes);
+
+    std::vector<std::vector<uint8_t>> lm_routed_mask;   // [il][expert]: 1 if routed in lm_phase 1
+    void set_lm_routed_ids(int32_t il, const int32_t * ids_host, int64_t n);
+    void clear_lm_routed_masks() { lm_routed_mask.clear(); }
+
+    bool                      htail_armed = false;
+    int32_t                   htail_k     = 0;
+    int64_t                   htail_computed_pairs = 0, htail_saved_bytes = 0;
+    bool htail_layer_ok(int32_t il) const;
+    void compute_hybrid_tail_cpu(const llama_moe_stream_wave * wctx, const struct ggml_tensor * x_in, const struct ggml_tensor * w_in, struct ggml_tensor * dst, int ith, int nth);
     // Three pieces for --moe-stream-g1-ahead; nothing calls them
     // unless that setting or the test switches below are on
     uint32_t tailw_wave_w = 0;   // (c) the wave width of a tail-wave graph (graph and remap op alike), 0 = the plain width; option A sets the half places

@@ -1850,6 +1850,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
+    {
+        const bool fast = params.moe_stream_prefill_fast == 1;
+        uint32_t cuda_pf_flags = 0;
+        if (fast || params.moe_stream_mmq_moe_opt   == 1) { cuda_pf_flags |= (1u << 0); }
+        if (fast || params.moe_stream_gpu_moe_fused == 1) { cuda_pf_flags |= (1u << 1); }
+        if (fast || params.moe_stream_qsa_fused     == 1) { cuda_pf_flags |= (1u << 2); }
+        if (fast || params.moe_stream_hc_fused      == 1) { cuda_pf_flags |= (1u << 3); }
+        if (fast || params.moe_stream_ple_fast      == 1) { cuda_pf_flags |= (1u << 4); }
+        ggml_backend_reg_t creg = ggml_backend_reg_by_name("CUDA");
+        if (!creg) { creg = ggml_backend_reg_by_name("ROCm"); }
+        if (creg) {
+            auto * set_pf = (void (*)(uint32_t)) ggml_backend_reg_get_proc_address(creg, "ggml_backend_cuda_set_prefill_opts");
+            if (set_pf) {
+                set_pf(cuda_pf_flags);
+            }
+        }
+    }
+
     if (params.moe_stream) {
         // (a model these do not hold for has --moe-stream cleared above, with its line)
 
@@ -2543,8 +2561,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.prompt_split        = params.moe_stream_prompt_split == 1;
         p1.prompt_split_places = params.moe_stream_prompt_split_places >= 2 ? params.moe_stream_prompt_split_places : 128;
         p1.tail_wave_w         = params.moe_stream_tail_wave_w > 0 ? params.moe_stream_tail_wave_w : 0;
-        p1.gpu_wave_skip_zero  = params.moe_stream_gpu_wave_skip_zero == 1;
-        p1.gpu_skip_zero       = params.moe_stream_gpu_skip_zero == 1;
+        const bool pf_fast     = params.moe_stream_prefill_fast == 1;
+        p1.gpu_wave_skip_zero  = pf_fast || params.moe_stream_gpu_wave_skip_zero == 1;
+        p1.gpu_skip_zero       = pf_fast || params.moe_stream_gpu_skip_zero == 1;
+        p1.prefill_fast        = pf_fast;
+        p1.mmq_moe_opt         = pf_fast || params.moe_stream_mmq_moe_opt   == 1;
+        p1.gpu_moe_fused       = pf_fast || params.moe_stream_gpu_moe_fused == 1;
+        p1.pinned_ring         = params.moe_stream_pinned_ring > 0 ? params.moe_stream_pinned_ring : 0;
+        p1.lm_bf16             = pf_fast || params.moe_stream_lm_bf16      == 1;
+        p1.lend_output         = pf_fast || params.moe_stream_lend_output  == 1;
+        p1.qsa_fused           = pf_fast || params.moe_stream_qsa_fused    == 1;
+        p1.hc_fused            = pf_fast || params.moe_stream_hc_fused     == 1;
+        p1.ple_fast            = pf_fast || params.moe_stream_ple_fast     == 1;
+        p1.hybrid_tail         = std::max(0, params.moe_stream_hybrid_tail);
         p1.plan                = params.moe_stream_plan == 1;
         p1.plan_bind_early     = params.moe_stream_plan_bind_early == 1; // test only
         p1.drop_stale          = params.moe_stream_drop_stale == 1;
@@ -4765,6 +4794,16 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_uma              =*/ 0,      // off (discrete RAM / VRAM pools)
         /*.moe_stream_hip_mmvq         =*/ 0,      // off
         /*.moe_stream_hip_sync         =*/ 0,      // off
+        /*.moe_stream_prefill_fast     =*/ 0,      // off
+        /*.moe_stream_mmq_moe_opt      =*/ 0,      // off
+        /*.moe_stream_gpu_moe_fused    =*/ 0,      // off
+        /*.moe_stream_pinned_ring      =*/ 0,      // off
+        /*.moe_stream_lm_bf16          =*/ 0,      // off
+        /*.moe_stream_lend_output      =*/ 0,      // off
+        /*.moe_stream_qsa_fused        =*/ 0,      // off
+        /*.moe_stream_hc_fused         =*/ 0,      // off
+        /*.moe_stream_ple_fast         =*/ 0,      // off
+        /*.moe_stream_hybrid_tail      =*/ 0,      // off
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,

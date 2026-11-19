@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import struct
 import subprocess
@@ -126,7 +127,56 @@ def verify_pe_machine(path: Path, arch: str) -> None:
         raise ValueError(f"PE machine mismatch for {path}: 0x{machine:04x} != 0x{expected:04x}")
 
 
-def stage_dlls(backend: str, stage: Path, build_bin: Path, vs_dir: Path | None, cuda_root: Path | None, mingw_root: Path | None, rocm_dirs: list[Path]) -> None:
+def stage_rocm_blas_libraries(stage: Path, rocm_dirs: list[Path], targets: str) -> None:
+    target_list = [t.strip().split(":")[0] for t in targets.split(";") if t.strip()]
+    gfx_re = re.compile(r"gfx[0-9a-z]+")
+    for rel_sub in (("rocblas", "library"), ("hipblaslt", "library")):
+        dst_root = stage.joinpath(*rel_sub)
+        seen_src: set[Path] = set()
+        for d in rocm_dirs:
+            src_root = d.joinpath(*rel_sub)
+            if not src_root.is_dir():
+                continue
+            for src in sorted(src_root.rglob("*")):
+                if not src.is_file():
+                    continue
+                real = src.resolve()
+                if real in seen_src:
+                    continue
+                rel = src.relative_to(src_root)
+                found_archs = gfx_re.findall(rel.as_posix())
+                if found_archs and not any(a in target_list for a in found_archs):
+                    continue
+                seen_src.add(real)
+                dst = dst_root / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(real, dst)
+
+    rb_dir = stage / "rocblas" / "library"
+    lt_dir = stage / "hipblaslt" / "library"
+    for arch_name in target_list:
+        if not rb_dir.is_dir() or not any(rb_dir.glob(f"*{arch_name}*")):
+            raise FileNotFoundError(
+                f"Missing rocblas/library Tensile resources for {arch_name} (install rocm[device-{arch_name}])"
+            )
+        if arch_name.startswith(("gfx11", "gfx12")):
+            arch_lt = lt_dir / arch_name
+            if not arch_lt.is_dir() or not any(arch_lt.iterdir()):
+                raise FileNotFoundError(
+                    f"Missing hipblaslt/library/{arch_name} Tensile resources (install rocm[device-{arch_name}])"
+                )
+
+
+def stage_dlls(
+    backend: str,
+    stage: Path,
+    build_bin: Path,
+    vs_dir: Path | None,
+    cuda_root: Path | None,
+    mingw_root: Path | None,
+    rocm_dirs: list[Path],
+    rocm_targets: str = ROCM_ARCH_DEFAULT,
+) -> None:
     for built_dll in sorted(build_bin.glob("*.dll")):
         shutil.copy2(built_dll, stage / built_dll.name)
 
@@ -156,6 +206,7 @@ def stage_dlls(backend: str, stage: Path, build_bin: Path, vs_dir: Path | None, 
             if not hit:
                 raise FileNotFoundError(f"Missing ROCm runtime DLL {name} in {rocm_dirs}")
             shutil.copy2(hit, stage / name)
+        stage_rocm_blas_libraries(stage, rocm_dirs, rocm_targets)
 
 
 def build_zip(stage_parent: Path, zip_path: Path) -> None:
@@ -209,6 +260,7 @@ def main() -> int:
         ]
         extra_env: dict[str, str] = {}
         rocm_dirs: list[Path] = []
+        rocm_targets = os.environ.get("AMDGPU_TARGETS", ROCM_ARCH_DEFAULT)
         vcvarsall = None if vs_dir is None else vs_dir / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"
 
         if args.backend == "cpu":
@@ -276,7 +328,8 @@ def main() -> int:
         build_bin = bld / "bin"
         shutil.copy2(build_bin / "llama-server.exe", stage / "llama-server.exe")
         shutil.copy2(build_bin / "autotuner.exe", stage / "autotuner.exe")
-        stage_dlls(args.backend, stage, build_bin, vs_dir, args.cuda_root, args.mingw_root, rocm_dirs)
+        stage_dlls(args.backend, stage, build_bin, vs_dir, args.cuda_root, args.mingw_root, rocm_dirs, rocm_targets)
+        shutil.rmtree(bld, ignore_errors=True)
 
         for pe in [*stage.glob("*.exe"), *stage.glob("*.dll")]:
             verify_pe_machine(pe, arch)

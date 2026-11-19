@@ -207,10 +207,13 @@ jobs:
 
       - name: Setup ROCm Windows SDK 10.0.0
         if: matrix.backend == 'hip'
-        run: >-
-          python -m pip install --no-cache-dir
-          --index-url https://stable.repo.amd.com/rocm/whl-next/
-          "rocm[libraries,devel]==10.0.0"
+        run: |
+          foreach ($unused in @("C:\ghcup", "C:\Android")) {
+            if (Test-Path $unused) { Remove-Item -Recurse -Force $unused -ErrorAction SilentlyContinue }
+          }
+          python -m pip install --no-cache-dir `
+            --index-url https://stable.repo.amd.com/rocm/whl-next/ `
+            "rocm[libraries,devel,device-gfx1030,device-gfx1100,device-gfx1101,device-gfx1102,device-gfx1150,device-gfx1151,device-gfx1200,device-gfx1201]==10.0.0"
 
       - name: Setup llvm-mingw ARM64 cross-compiler
         if: matrix.backend == 'arm64-cpu'
@@ -282,6 +285,13 @@ jobs:
           for f in "${expected[@]}"; do
             test -s "$f"
           done
+          python3 -c '
+          import zipfile
+          with zipfile.ZipFile("tokenwing-windows-x64-hip.zip") as zf:
+              names = zf.namelist()
+          assert any(n.startswith("tokenwing/rocblas/library/") for n in names), "Missing rocblas/library in Windows HIP zip"
+          assert any(n.startswith("tokenwing/hipblaslt/library/gfx1201/") for n in names), "Missing hipblaslt/library/gfx1201 in Windows HIP zip"
+          '
           sha256sum "${expected[@]}" > SHA256SUMS
           sha256sum -c SHA256SUMS
           cat SHA256SUMS

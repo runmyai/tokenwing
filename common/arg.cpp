@@ -765,7 +765,7 @@ static void common_params_apply_system_config(common_params & params, llama_exam
     }
 }
 
-static std::vector<int32_t> moe_stream_dev_spec_layers(const std::string & spec);
+static std::vector<int32_t> moe_stream_dev_spec_layers(const std::string & spec, bool * has_auto = nullptr);
 
 static bool common_params_parse_ex(int argc, char ** argv, common_params_context & ctx_arg) {
     common_params & params = ctx_arg.params;
@@ -997,14 +997,19 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.moe_stream_correction.clear();
     }
     // --moe-stream-gpu-layers-device: its layers are the whole-layer list (in the order named), its devices the places of their experts
+    // (with an "auto" the engine picks the layers at load: the list stays empty, the named layers are read from the device list there)
     if (!params.moe_stream_gpu_layers_device.empty()) {
+        bool has_auto = false;
         std::string list;
-        for (const int32_t il : moe_stream_dev_spec_layers(params.moe_stream_gpu_layers_device)) {
+        for (const int32_t il : moe_stream_dev_spec_layers(params.moe_stream_gpu_layers_device, &has_auto)) {
             list += string_format("%s%d", list.empty() ? "" : ",", il);
+        }
+        if (has_auto) {
+            list.clear();
         }
         if (!params.moe_stream_gpu_layers_list.empty() && params.moe_stream_gpu_layers_list != list) {
             LOG_WRN("--moe-stream-gpu-layers-list %s is not used: --moe-stream-gpu-layers-device names the whole layers (%s)\n",
-                    params.moe_stream_gpu_layers_list.c_str(), list.c_str());
+                    params.moe_stream_gpu_layers_list.c_str(), has_auto ? "picked at load" : list.c_str());
         }
         params.moe_stream_gpu_layers_list = list;
     }
@@ -1532,17 +1537,23 @@ static std::vector<std::string> parse_csv_row(const std::string& input) {
     return fields;
 }
 
-// --moe-stream-gpu-layers-device: "DEV=LIST;DEV=LIST", LIST = layer numbers and ranges a-b separated by commas. Returns the layers in
-// the order given (each once); throws std::invalid_argument naming what is wrong
-static std::vector<int32_t> moe_stream_dev_spec_layers(const std::string & spec) {
+// --moe-stream-gpu-layers-device: "DEV=LIST;DEV=LIST", LIST = layer numbers and ranges a-b separated by commas, or "auto" (the engine
+// picks that device's layers at load). Returns the layers in the order given (each once; none for "auto"), *has_auto says whether an
+// "auto" was given; throws std::invalid_argument naming what is wrong
+static std::vector<int32_t> moe_stream_dev_spec_layers(const std::string & spec, bool * has_auto) {
     std::vector<int32_t> ids;
+    bool any_auto = false;
     for (const std::string & part : string_split<std::string>(spec, ';')) {
         if (part.empty()) {
             continue;
         }
         const size_t eq = part.find('=');
         if (eq == std::string::npos || eq == 0 || eq + 1 >= part.size()) {
-            throw std::invalid_argument("expected DEV=LIST (e.g. CUDA1=25-48 or CUDA0=2,3), got '" + part + "'");
+            throw std::invalid_argument("expected DEV=LIST (e.g. CUDA1=25-48, CUDA0=2,3 or CUDA1=auto), got '" + part + "'");
+        }
+        if (part.substr(eq + 1) == "auto") {
+            any_auto = true;
+            continue;
         }
         for (const std::string & item : string_split<std::string>(part.substr(eq + 1), ',')) {
             const size_t dash = item.find('-', 1);
@@ -1562,10 +1573,43 @@ static std::vector<int32_t> moe_stream_dev_spec_layers(const std::string & spec)
             }
         }
     }
-    if (ids.empty()) {
+    if (ids.empty() && !any_auto) {
         throw std::invalid_argument("expected DEV=LIST (e.g. CUDA1=25-48), got '" + spec + "'");
     }
+    if (has_auto) {
+        *has_auto = any_auto;
+    }
     return ids;
+}
+
+// --moe-stream-vram-free: one SIZE (the pool's GPU, *dev_list left empty) or a list "DEV=SIZE,DEV=SIZE[,SIZE]" (a bare SIZE = the value
+// of the GPUs not named). Returns the single value / the default; with a list and no default, the largest value named (what a GPU that
+// is not named keeps). *dev_list gets the named values in bytes, "DEV=bytes,DEV=bytes"
+static int64_t moe_stream_parse_size(const std::string & str);
+
+static int64_t moe_stream_parse_vram_free(const std::string & value, std::string * dev_list) {
+    dev_list->clear();
+    if (value.find('=') == std::string::npos && value.find(',') == std::string::npos) {
+        return moe_stream_parse_size(value);
+    }
+    int64_t def = -1, largest = 0;
+    for (const std::string & item : string_split<std::string>(value, ',')) {
+        const size_t eq = item.find('=');
+        if (eq == std::string::npos) {
+            if (def >= 0) {
+                throw std::invalid_argument("more than one value without a device name in '" + value + "'");
+            }
+            def = moe_stream_parse_size(item);
+            continue;
+        }
+        if (eq == 0 || eq + 1 >= item.size()) {
+            throw std::invalid_argument("expected DEV=SIZE (e.g. CUDA0=1GiB,CUDA1=512MiB), got '" + item + "'");
+        }
+        const int64_t b = moe_stream_parse_size(item.substr(eq + 1));
+        largest = std::max(largest, b);
+        *dev_list += string_format("%s%s=%lld", dev_list->empty() ? "" : ",", item.substr(0, eq).c_str(), (long long) b);
+    }
+    return def >= 0 ? def : largest;
 }
 
 // a byte count with an optional suffix: 20GiB, 20g, 512MiB, 1048576
@@ -3485,8 +3529,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "CUDA0=2,3. Repeat it for more devices (or join them with ';'). The whole layers are every layer named, in the order given; "
         "when it is given, --moe-stream-gpu-layers-list and --moe-stream-gpu-layers are not used. Checked against each device's free "
         "VRAM before the load: the layers that do not fit are streamed instead, the last named on the device that is short first, with "
-        "one line; a DEV that is not a GPU of the model streams its layers, with one line (default: unset = whole layers sit on their "
-        "layer's own device)",
+        "one line; a DEV that is not a GPU of the model streams its layers, with one line. LIST 'auto' (e.g. CUDA1=auto;CUDA2=auto): "
+        "the first DEV named auto gets as many of the last streamed layers as fit in its free VRAM (keeping its "
+        "--moe-stream-vram-free value free), the next the layers before those; the engine then places the layers itself: each "
+        "whole layer runs completely on its DEV, every other GPU layer on the VRAM pool's GPU (--moe-stream-vram-device), and "
+        "-ts does not decide (default: unset = whole layers sit on their layer's own device)",
         [](common_params & params, const std::string & value) {
             (void) moe_stream_dev_spec_layers(value);   // the syntax, here; the device names at load
             params.moe_stream_gpu_layers_device += (params.moe_stream_gpu_layers_device.empty() ? "" : ";") + value;
@@ -4142,15 +4189,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
-        {"--moe-stream-vram-free"}, "SIZE",
+        {"--moe-stream-vram-free"}, "SIZE|DEV=SIZE,...",
         "size the VRAM experts pool from the free VRAM instead of a pinned N: N per streamed layer = the largest count that still "
         "leaves this much VRAM free at the END state (after a full prompt), e.g. 200MiB. The fit takes the free VRAM after the KV "
         "cache and the compute buffers, minus the pool, minus --moe-stream-vram-growth (what the CUDA runtime still adds lazily "
         "after that check). With --moe-stream-vram-experts N as well, N is a cap. The experts come from the list "
-        "(--moe-stream-vram-experts-file, 64 per layer). The run prints the fit and, once, the real end state (default: unset = "
+        "(--moe-stream-vram-experts-file, 64 per layer). The run prints the fit and, once, the real end state. A list per GPU, e.g. "
+        "CUDA0=1GiB,CUDA1=512MiB (names as --list-devices prints them; a SIZE without a name = the value of the GPUs not named, "
+        "without one they keep the largest value named), keeps each GPU's value free: the pool's GPU sizes the pool from its own "
+        "value, and on every GPU the whole MoE layers placed there (--moe-stream-gpu-layers, -list, -device) leave it free - the "
+        "layers that would eat into it are streamed instead; a list turns the pool on, 0 keeps nothing free (default: unset = "
         "off, the pinned N and --moe-stream-vram-experts-margin decide)",
         [](common_params & params, const std::string & value) {
-            params.moe_stream_vram_free = (int64_t) moe_stream_parse_size(value);
+            params.moe_stream_vram_free = moe_stream_parse_vram_free(value, &params.moe_stream_vram_free_dev);
+            if (!params.moe_stream_vram_free_dev.empty()) {
+                params.moe_stream_vram_free = std::max<int64_t>(1, params.moe_stream_vram_free);   // a list turns the pool on (0 = off)
+            }
         }
     ));
     add_opt(common_arg(

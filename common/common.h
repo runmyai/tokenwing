@@ -930,7 +930,8 @@ struct common_params {
     int32_t     moe_stream_timing            = 0; // 1 = measure where a call's time goes (host, device, copies, syncs), report it per word
     int32_t     moe_stream_out_check         = 16; // the output's NaN / Inf check: every prompt call + every Nth reply call, 0 = off
     std::string moe_stream_vram_device;           // the GPU that holds the VRAM expert pool, "" = the first GPU
-    std::string moe_stream_gpu_layers_device;     // whole MoE layers per GPU, "DEV=LIST;DEV=LIST" (repeated flags joined with ';')
+    std::string moe_stream_gpu_layers_device;     // whole MoE layers per GPU, "DEV=LIST;DEV=LIST" (repeated flags joined with ';'); LIST may be "auto"
+    std::string moe_stream_vram_free_dev;         // --moe-stream-vram-free per GPU, "DEV=bytes,DEV=bytes"; "" = one value for the pool's GPU
     int64_t     moe_stream_vram_chunk        = 0; // max bytes per VRAM expert pool buffer group (1 = auto <= 2 GiB, 0 = off)
     int32_t     moe_stream_uma               = 0; // unified-memory zero-copy streaming mode (0 = off, 1)
     int32_t     moe_stream_hip_mmvq          = 0; // RDNA2/3/3.5/4 short-row & RDNA3.5 multi-warp MMVQ under ROCm/HIP (0 = off, 1)

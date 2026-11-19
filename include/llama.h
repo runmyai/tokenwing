@@ -586,7 +586,14 @@ extern "C" {
                                                 //      prompt matmuls of the RAM pools; NULL = the first GPU of the model
         const char * moe_stream_gpu_layers_device; // whole MoE layers per GPU, "DEV=LIST;DEV=LIST" (LIST: layers and ranges a-b): their
                                                 //      experts on DEV whatever device holds the layer; NULL = on the layer's own device.
-                                                //      The layers themselves come from moe_stream_gpu_layers_list (common fills it)
+                                                //      The layers themselves come from moe_stream_gpu_layers_list (common fills it).
+                                                //      LIST "auto": as many of the last streamed layers as fit on DEV (keeping its
+                                                //      moe_stream_vram_free_dev value free), the next "auto" DEV the layers before those;
+                                                //      the engine then places the layers itself (each whole layer on its DEV, the rest
+                                                //      of the GPU layers on the pool's GPU) and the list is left empty
+        const char * moe_stream_vram_free_dev;  // VRAM kept free per GPU, "DEV=bytes,DEV=bytes"; with it every GPU keeps its value free
+                                                //      in the whole-layer fit and the pool's GPU sizes the pool from its own value (a GPU
+                                                //      not named keeps moe_stream_vram_free); NULL = moe_stream_vram_free is the pool's only
         const char * quant_plugin;              // shared library (.so / .dll) registering GGML_TYPE_EXT0..EXT5, NULL = none
         int64_t      moe_stream_vram_chunk;     // max byte size per VRAM expert pool buffer group (1 = auto <= 2 GiB, > 1 = cap in bytes,
                                                 //      0 = off / one group per format)

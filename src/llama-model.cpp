@@ -1908,9 +1908,68 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             out.push_back(str.substr(p));
             return out;
         };
+        // --moe-stream-vram-free as a list per GPU: each GPU keeps its value free (a GPU not named keeps moe_stream_vram_free: the
+        // list's value without a name, or its largest). Without a list: 0 here, the single value sizes the pool alone as before
+        const bool keep_list = params.moe_stream_vram_free_dev && params.moe_stream_vram_free_dev[0];
+        std::map<std::string, int64_t> keep_named;
+        if (keep_list) {
+            std::string bad_keep;
+            for (const std::string & item : split_by(params.moe_stream_vram_free_dev, ',')) {
+                const size_t eq = item.find('=');
+                if (eq == std::string::npos) {
+                    continue;
+                }
+                keep_named[item.substr(0, eq)] = std::max<int64_t>(0, atoll(item.c_str() + eq + 1));
+                if (gpu_by_name(item.substr(0, eq), /* igpu_ok = */ true) == nullptr) {
+                    bad_keep += format("%s%s", bad_keep.empty() ? "" : ", ", item.substr(0, eq).c_str());
+                }
+            }
+            if (!bad_keep.empty()) {
+                fprintf(stderr, "%s: --moe-stream-vram-free: %s - not a GPU of this model (its GPUs: %s), not used\n", __func__,
+                        bad_keep.c_str(), gpu_names.empty() ? "none" : gpu_names.c_str());
+            }
+        }
+        const auto vram_keep = [&](ggml_backend_dev_t d) -> int64_t {
+            if (!keep_list || d == nullptr) {
+                return 0;
+            }
+            const auto it = keep_named.find(ggml_backend_dev_name(d));
+            return it != keep_named.end() ? it->second : std::max<int64_t>(0, params.moe_stream_vram_free);
+        };
+        // the compute buffers' margin per token of the physical batch (the auto-fit's, and the whole-layer check's estimate)
+        static const double fit_mib_per_token = getenv("MOE_STREAM_FIT_MIB_PER_TOKEN")
+            ? atof(getenv("MOE_STREAM_FIT_MIB_PER_TOKEN")) : 0.5;
+        // What each GPU device that runs layers holds besides the weights and the context: the compute buffers' estimate (the per-token
+        // margin x -ub + the attention masks, F16 [KV cells x -ub]), the backend's cuBLAS handle + workspace (98 MiB measured on CUDA) and
+        // its op scratch pool (the engine's own size, ubatch x hidden size x 8 bytes) - the whole-layer check's terms, also used by "auto"
+        const int64_t wl_ub = params.moe_stream_ubatch > 0 ? params.moe_stream_ubatch : 512;
+        const bool offload_kv = (params.moe_stream_ctx_flags & 4) != 0;
+        int64_t wl_compute = 0, wl_prewarm = 0;
+        {
+            const int64_t ub = wl_ub;
+            const uint32_t n_seq_c   = std::max(1u, params.moe_stream_ctx_seq);
+            const uint32_t n_ctx_c   = GGML_PAD(params.moe_stream_ctx > 0 ? params.moe_stream_ctx : hparams.n_ctx_train, 256);
+            const uint32_t n_ctx_seq = (params.moe_stream_ctx_flags & 1) ? n_ctx_c : GGML_PAD(n_ctx_c/n_seq_c, 256);
+            const int64_t kv_full = (int64_t) n_ctx_seq;
+            const int64_t kv_swa  = hparams.swa_type != LLAMA_SWA_TYPE_NONE ? std::min<int64_t>(kv_full,
+                    GGML_PAD((int64_t) hparams.n_swa*((params.moe_stream_ctx_flags & 1) ? n_seq_c : 1) + ub, 256)) : 0;
+            bool any_full = false, any_swa = false;
+            for (uint32_t il = 0; il < hparams.n_layer(); il++) {
+                if (!hparams.is_recr(il) && hparams.has_kv(il)) {
+                    (hparams.swa_type != LLAMA_SWA_TYPE_NONE && hparams.is_swa(il) && !(params.moe_stream_ctx_flags & 2) ? any_swa : any_full) = true;
+                }
+            }
+            wl_compute = (int64_t) (fit_mib_per_token*1048576.0)*ub +
+                         (any_full ? kv_full*ub*2 : 0) + (any_swa ? kv_swa*ub*2 : 0);
+            wl_prewarm = ((int64_t) 98 << 20) +
+                         (params.moe_stream_vram_scratch >= 0 ? params.moe_stream_vram_scratch
+                                                              : std::min<int64_t>(n_ctx_c, ub)*(int64_t) hparams.n_embd*8);
+        }
         const bool wl_spec = params.moe_stream_gpu_layers_device && params.moe_stream_gpu_layers_device[0];
         std::vector<ggml_backend_dev_t> whole_dev_flag(n_layer_all, nullptr);
         std::string gl_list_eff = params.moe_stream_gpu_layers_list ? params.moe_stream_gpu_layers_list : "";
+        std::vector<ggml_backend_dev_t> auto_devs;   // the devices named "auto", in the order given
+        std::vector<int32_t>            spec_order;  // the layers named with a device, in the order given
         if (wl_spec) {
             std::set<int32_t> bad;
             std::string bad_say;
@@ -1921,6 +1980,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 }
                 const std::string dname = part.substr(0, eq);
                 ggml_backend_dev_t d = gpu_by_name(dname, /* igpu_ok = */ true);
+                if (part.substr(eq + 1) == "auto") {
+                    if (d != nullptr) {
+                        auto_devs.push_back(d);
+                    } else {
+                        bad_say += format("%s%s (auto)", bad_say.empty() ? "" : "; ", dname.c_str());
+                    }
+                    continue;
+                }
                 std::string bl;
                 for (const std::string & item : split_by(part.substr(eq + 1), ',')) {
                     int a = -1, b = -1;
@@ -1929,6 +1996,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     }
                     for (int il = std::max(a, 0); il <= b && il < 4096; il++) {
                         if (d != nullptr && il < n_layer_all) {
+                            if (std::find(spec_order.begin(), spec_order.end(), il) == spec_order.end()) {
+                                spec_order.push_back(il);
+                            }
                             whole_dev_flag[il] = d;
                         } else if (d == nullptr) {
                             bad.insert(il);
@@ -1940,7 +2010,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     bad_say += format("%s%s (layers %s)", bad_say.empty() ? "" : "; ", dname.c_str(), bl.c_str());
                 }
             }
-            if (!bad.empty()) {
+            if (!bad.empty() || bad_say.find("(auto)") != std::string::npos) {
                 std::string kept;
                 for (const std::string & item : split_by(gl_list_eff, ',')) {
                     if (!item.empty() && bad.count(atoi(item.c_str())) == 0) {
@@ -1951,6 +2021,89 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 fprintf(stderr, "%s: --moe-stream-gpu-layers-device: %s - not a GPU of this model (its GPUs: %s): those layers are streamed "
                         "instead\n", __func__, bad_say.c_str(), gpu_names.empty() ? "none" : gpu_names.c_str());
             }
+        }
+        // --moe-stream-gpu-layers-device DEV=auto: the first device named auto takes as many of the last streamed layers as fit in its free
+        // VRAM, keeping its --moe-stream-vram-free value free (a run without gaps, from the end), the next the layers before those. Each
+        // layer costs its experts + its other weights (+ its KV cache / recurrent state when the context is in VRAM), each device the
+        // check's fixed terms (compute buffers, cuBLAS + scratch) and the first one the output weights; the bytes come from the model
+        // file, the engine's check below then runs with the exact sizes and streams what still does not fit. The engine then places the
+        // layers: each whole layer runs completely on its device, every other GPU layer on the pool's GPU, the output with the last layer.
+        // A list given back by a reload (one layer fewer) is kept as it is; a reload that gave up every layer (whole-layer count 0) picks none
+        if (!auto_devs.empty() && ms_pool_dev != nullptr) {
+            const int il_end = n_layer_all - (int) hparams.n_layer_nextn;   // the trunk's end (the MTP block follows the last layer)
+            std::vector<int64_t> exp_b(n_layer_all, 0), oth_b(n_layer_all, 0);
+            int64_t out_b = 0;
+            for (const auto & it : ml.weights_map) {
+                int il = -1;
+                sscanf(it.first.c_str(), "blk.%d.", &il);
+                const int64_t b = (int64_t) ggml_nbytes(it.second.tensor);
+                if (il >= 0 && il < n_layer_all) {
+                    (llama_moe_stream_is_exps(it.first.c_str()) ? exp_b : oth_b)[il] += b;
+                } else if (strncmp(it.first.c_str(), "output", 6) == 0) {
+                    out_b += b;
+                }
+            }
+            const bool pick = gl_list_eff.empty() && params.moe_stream_gpu_layers != 0;
+            std::string say;
+            int il = il_end - 1;
+            for (size_t k = 0; k < auto_devs.size(); k++) {
+                ggml_backend_dev_t d = auto_devs[k];
+                size_t f = 0, tot = 0;
+                ggml_backend_dev_memory(d, &f, &tot);
+                int64_t room = (int64_t) f - vram_keep(d) - wl_compute - wl_prewarm - (k == 0 ? out_b : 0);
+                int n = 0, lo = -1, hi = -1;
+                int64_t used = 0;
+                for (; il >= (int) hparams.n_layer_dense_lead; il--) {
+                    if (pimpl->dev_layer[il].dev == cpu_dev) {
+                        break;   // (the layers below -ngl stay on the CPU)
+                    }
+                    if (exp_b[il] == 0 || whole_dev_flag[il] != nullptr) {
+                        continue;   // (a layer without experts, or one named for a device, is passed over)
+                    }
+                    const int64_t cost = exp_b[il] + oth_b[il] + (offload_kv ? llama_moe_stream_layer_ctx_bytes(hparams, arch, (uint32_t) il, params) : 0);
+                    if (cost > room) {
+                        break;
+                    }
+                    room -= cost;
+                    used += exp_b[il];
+                    whole_dev_flag[il] = d;
+                    hi = hi < 0 ? il : hi;
+                    lo = il;
+                    if (pick) {
+                        gl_list_eff += format("%s%d", gl_list_eff.empty() ? "" : ",", il);   // (descending: a short device gives up its first layer)
+                    }
+                    n++;
+                }
+                say += format("%s%s %s (%.2f GiB of experts, %.0f MiB of %.0f free kept free)", say.empty() ? "" : "; ", ggml_backend_dev_name(d),
+                        n > 0 ? format("takes layers %d-%d", lo, hi).c_str() : "takes no layer", used/1073741824.0,
+                        vram_keep(d)/1048576.0, f/1048576.0);
+            }
+            if (pick) {
+                for (const int32_t x : spec_order) {   // the layers named with a device come first, in the order given
+                    gl_list_eff = format("%d", x) + (gl_list_eff.empty() ? "" : ",") + gl_list_eff;
+                }
+            }
+            // the placement: a layer of the list on its device, the other GPU layers on the pool's GPU
+            std::set<int32_t> in_list;
+            for (const std::string & item : split_by(gl_list_eff, ',')) {
+                if (!item.empty()) {
+                    in_list.insert(atoi(item.c_str()));
+                }
+            }
+            for (int x = 0; x < n_layer_all; x++) {
+                if (pimpl->dev_layer[x].dev == cpu_dev) {
+                    continue;
+                }
+                ggml_backend_dev_t t = x >= il_end && il_end > 0 ? pimpl->dev_layer[il_end - 1].dev
+                                     : in_list.count(x) && whole_dev_flag[x] != nullptr ? whole_dev_flag[x] : ms_pool_dev;
+                pimpl->dev_layer[x] = { t, &pimpl->gpu_buft_list.at(t) };
+            }
+            if (pimpl->dev_output.dev != cpu_dev && il_end > 0) {
+                pimpl->dev_output = pimpl->dev_layer[il_end - 1];
+            }
+            fprintf(stderr, "%s: --moe-stream-gpu-layers-device auto: %s; the other GPU layers run on %s (the pool's GPU)%s\n", __func__,
+                    say.c_str(), ggml_backend_dev_name(ms_pool_dev), pick ? "" : format(", whole layers as given: %s",
+                    gl_list_eff.empty() ? "none" : gl_list_eff.c_str()).c_str());
         }
         // the whole-layer count the engine is given: none when the device list was given and nothing of it is left (not the auto-fit)
         const int32_t gpu_layers_n = wl_spec && gl_list_eff.empty() ? 0 : params.moe_stream_gpu_layers;
@@ -2189,9 +2342,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // Only when the auto-fit decides - a --moe-stream-gpu-layers-list places the layers itself, and
         // this line then printed a plan nobody followed (the placement is printed after the context is built)
         const bool gpu_list = !gl_list_eff.empty();
-        // the compute buffers' margin per token of the physical batch (the auto-fit's, and the whole-layer check's estimate)
-        static const double fit_mib_per_token = getenv("MOE_STREAM_FIT_MIB_PER_TOKEN")
-            ? atof(getenv("MOE_STREAM_FIT_MIB_PER_TOKEN")) : 0.5;
         if (gpu_layers_n < 0 && !gpu_list && !devices.empty()) {
             size_t vram_free = 0;
             size_t vram_total = 0;
@@ -2207,17 +2357,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 (int64_t) (params.moe_stream_ubatch > 0 ? params.moe_stream_ubatch : 512);
             const int64_t vram_reserve_total = params.moe_stream_vram_reserve + ubatch_margin;
 
-            vram_reserve = (int64_t) vram_free - gpu_weight_bytes - vram_reserve_total;
+            // a --moe-stream-vram-free list: the device's own value stays free too (0 without a list)
+            const int64_t keep0 = vram_keep(devices[0].dev);
+            vram_reserve = (int64_t) vram_free - gpu_weight_bytes - vram_reserve_total - keep0;
 
             fprintf(stderr, "%s: VRAM for whole MoE layers: %.2f GiB free on %s, %.2f GiB of weights go there, "
                     "%.2f GiB reserved for the KV cache, the compute buffers and the driver "
-                    "(%.2f GiB of it %.2f MiB x -ub %d), %.2f GiB left\n",
+                    "(%.2f GiB of it %.2f MiB x -ub %d), %s%.2f GiB left\n",
                     __func__, (double) vram_free/1024.0/1024.0/1024.0,
                     ggml_backend_dev_name(devices[0].dev),
                     (double) gpu_weight_bytes/1024.0/1024.0/1024.0,
                     (double) vram_reserve_total/1024.0/1024.0/1024.0,
                     (double) ubatch_margin/1024.0/1024.0/1024.0, fit_mib_per_token,   // this argument was missing
                     (int) (params.moe_stream_ubatch > 0 ? params.moe_stream_ubatch : 512),
+                    keep0 > 0 ? format("%.2f GiB kept free (--moe-stream-vram-free), ", keep0/1024.0/1024.0/1024.0).c_str() : "",
                     (double) vram_reserve/1024.0/1024.0/1024.0);
         }
 
@@ -2231,25 +2384,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         std::vector<int32_t>                     wl_dev_of;
         // (with more than one GPU the auto-fit's picks are checked per device too: it counts the first GPU only)
         if ((gpu_list || gpu_layers_n > 0 || (gpu_layers_n < 0 && n_gpu_devs > 1)) && !devices.empty()) {
-            const int64_t ub = params.moe_stream_ubatch > 0 ? params.moe_stream_ubatch : 512;
-            const uint32_t n_seq_c   = std::max(1u, params.moe_stream_ctx_seq);
-            const uint32_t n_ctx_c   = GGML_PAD(params.moe_stream_ctx > 0 ? params.moe_stream_ctx : hparams.n_ctx_train, 256);
-            const uint32_t n_ctx_seq = (params.moe_stream_ctx_flags & 1) ? n_ctx_c : GGML_PAD(n_ctx_c/n_seq_c, 256);
-            const bool offload_kv = (params.moe_stream_ctx_flags & 4) != 0;
-            const int64_t kv_full = (int64_t) n_ctx_seq;
-            const int64_t kv_swa  = hparams.swa_type != LLAMA_SWA_TYPE_NONE ? std::min<int64_t>(kv_full,
-                    GGML_PAD((int64_t) hparams.n_swa*((params.moe_stream_ctx_flags & 1) ? n_seq_c : 1) + ub, 256)) : 0;
-            bool any_full = false, any_swa = false;
-            for (uint32_t il = 0; il < hparams.n_layer(); il++) {
-                if (!hparams.is_recr(il) && hparams.has_kv(il)) {
-                    (hparams.swa_type != LLAMA_SWA_TYPE_NONE && hparams.is_swa(il) && !(params.moe_stream_ctx_flags & 2) ? any_swa : any_full) = true;
-                }
-            }
-            const int64_t compute = (int64_t) (fit_mib_per_token*1048576.0)*ub +
-                                    (any_full ? kv_full*ub*2 : 0) + (any_swa ? kv_swa*ub*2 : 0);
-            const int64_t prewarm = ((int64_t) 98 << 20) +
-                                    (params.moe_stream_vram_scratch >= 0 ? params.moe_stream_vram_scratch
-                                                                         : std::min<int64_t>(n_ctx_c, ub)*(int64_t) hparams.n_embd*8);
             wl_dev_of.assign(n_layer_all, -1);
             const bool pool_on = params.moe_stream_vram_experts > 0 || params.moe_stream_vram_free > 0;
             for (const auto & dv : devices) {
@@ -2284,9 +2418,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     }
                 }
                 if (has_layer) {
-                    w.compute = compute;
-                    w.prewarm = prewarm;
+                    w.compute = wl_compute;
+                    w.prewarm = wl_prewarm;
                 }
+                w.keep = vram_keep(dv.dev);
                 wl_devs.push_back(w);
             }
         }
@@ -2377,6 +2512,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.vram_experts_margin = params.moe_stream_vram_experts_margin > 0 ? params.moe_stream_vram_experts_margin
                                                                            : (int64_t) 512*1024*1024;
         p1.vram_free           = params.moe_stream_vram_free > 0 ? params.moe_stream_vram_free : 0;
+        if (keep_list && ms_pool_dev != nullptr) {
+            p1.vram_free = std::max<int64_t>(1, vram_keep(ms_pool_dev));   // the pool's GPU's own value (a list turns the pool on: 0 = off)
+            fprintf(stderr, "%s: --moe-stream-vram-free per GPU: the VRAM pool on %s keeps %.0f MiB free\n", __func__,
+                    ggml_backend_dev_name(ms_pool_dev), vram_keep(ms_pool_dev)/1048576.0);
+        }
         p1.vram_scratch        = params.moe_stream_vram_scratch;   // -1 = derived
         p1.vram_growth         = params.moe_stream_vram_growth > 0 ? params.moe_stream_vram_growth : 0;  // 0 = derived
         {
@@ -4613,6 +4753,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_out_check        =*/ 16,     // every prompt call and every 16th reply call
         /*.moe_stream_vram_device      =*/ nullptr, // the first GPU holds the VRAM pool
         /*.moe_stream_gpu_layers_device =*/ nullptr, // whole layers' experts on their layer's own device
+        /*.moe_stream_vram_free_dev    =*/ nullptr, // moe_stream_vram_free is the pool's GPU's only
         /*.quant_plugin                =*/ nullptr,
         /*.moe_stream_vram_chunk       =*/ 0,      // off (one buffer group per format)
         /*.moe_stream_uma              =*/ 0,      // off (discrete RAM / VRAM pools)

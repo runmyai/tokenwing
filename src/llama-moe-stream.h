@@ -277,6 +277,7 @@ struct llama_moe_stream_p1 {
         int64_t ctx     = 0;   // the KV cache and the recurrent state of the layers there
         int64_t compute = 0;   // the compute buffers' estimate at the physical batch (with the attention mask)
         int64_t prewarm = 0;   // the backend's cuBLAS handle + workspace and its op scratch pool
+        int64_t keep    = 0;   // VRAM kept free on it (a --moe-stream-vram-free list; 0 without one)
         bool    pool    = false;   // the VRAM pool's device
     };
     std::vector<wl_dev>  wl_devs;

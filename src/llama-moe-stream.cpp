@@ -2823,7 +2823,7 @@ llama_moe_stream::llama_moe_stream(
                 std::vector<uint8_t> short_dev(D.size(), 0);
                 bool any_short = false;
                 for (size_t d = 0; d < D.size(); d++) {
-                    other[d] = D[d].weights + D[d].ctx + D[d].compute + D[d].prewarm + (D[d].pool ? pool_min + growth : 0);
+                    other[d] = D[d].weights + D[d].ctx + D[d].compute + D[d].prewarm + D[d].keep + (D[d].pool ? pool_min + growth : 0);
                     short_dev[d] = wl[d] > 0 && other[d] + wl[d] > D[d].free ? 1 : 0;
                     any_short = any_short || short_dev[d];
                 }
@@ -2850,8 +2850,9 @@ llama_moe_stream::llama_moe_stream(
                 }
                 for (size_t d = 0; d < D.size(); d++) {
                     per += format("%s%s: free %.0f MiB - weights %.0f - context %.0f (KV cache + recurrent state) - compute ~%.0f - cuBLAS + "
-                            "scratch %.0f%s = %.0f MiB for whole layers, %.0f used",
+                            "scratch %.0f%s%s = %.0f MiB for whole layers, %.0f used",
                             per.empty() ? "" : "; ", D[d].name.c_str(), D[d].free/M, D[d].weights/M, D[d].ctx/M, D[d].compute/M, D[d].prewarm/M,
+                            D[d].keep > 0 ? format(" - kept free %.0f", D[d].keep/M).c_str() : "",
                             D[d].pool ? format(" - VRAM pool minimum %.0f%s - growth %.0f", pool_min/M,
                                     tail_n > 0 ? format(" (with its tail of %lld places, %.0f)", (long long) tail_n, tail_b/M).c_str() : "",
                                     growth/M).c_str() : "",

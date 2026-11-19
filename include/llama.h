@@ -2296,10 +2296,9 @@ extern "C" {
     // allocation failed (the last picked of all when that device is not known); -1 = none on that device (fewer whole layers cannot help)
     LLAMA_API int32_t llama_moe_stream_gpu_layer_to_drop(const struct llama_model * model);
 
-    // With --moe-stream-elastic 1, no --moe-stream-slots and no --moe-stream-ram-free, the
-    // pools start with all free RAM minus keep-free (opts keep=, else ram_margin, else 500 MiB) minus the freeable part (opts part=,
-    // default 1 GiB; taken back at the first call as slots above the start size) - the RAM to pass as ram_free;
-    // otherwise ram_free unchanged
+    // The RAM to pass as ram_free: ram_free when it is not 0; else the RAM headroom (ram_margin, else opts keep=, else 1280 MiB on
+    // Linux, 1536 MiB on Windows / macOS, 2 GiB with no swap), with --moe-stream-elastic 1 and no --moe-stream-slots plus half the
+    // gap (opts gap=, at most 256 MiB)
     LLAMA_API int64_t llama_moe_stream_start_ram_free(int32_t elastic, int32_t slots, int64_t ram_free, int64_t ram_margin,
                                                       const char * elastic_opts);
 

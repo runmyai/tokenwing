@@ -785,9 +785,6 @@ constexpr uint64_t MOE_STREAM_LFU_DECAY = 64;
 
 // what the machine must still have free after the pools are allocated
 constexpr int64_t MOE_STREAM_MIN_AVAIL = 4LL*1024*1024*1024;   // the old fixed margin
-// What --moe-stream-ram-free keeps free by default. The user wants 2-3 GB for the desktop;
-// 2.5 GiB is the middle of that, and it is what the pools are sized to leave.
-constexpr int64_t MOE_STREAM_DEFAULT_MIN_AVAIL = (int64_t) (2.5*1024*1024*1024);   // 2.5 GiB
 // What the pools have to leave for everything else in the process that the model file does not
 // describe: the KV cache, the compute buffers, the ggml context, and the CUDA driver/runtime host
 // allocations - which are made *after* this number is needed, which is why it cannot be measured here.

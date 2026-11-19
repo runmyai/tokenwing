@@ -792,7 +792,7 @@ struct common_params {
     // Both orders are inside it, so the faster one is the default.
     std::string moe_stream_gpu_layers_mode; // "hot" (default) or "last" layer order for the auto-fit
     std::string moe_stream_gpu_layers_list; // explicit layer list, takes precedence over the count
-    int64_t     moe_stream_ram_free = 0;  // bytes of RAM to keep free, 0 = 2.5 GiB, negative = no margin
+    int64_t     moe_stream_ram_free = 0;  // bytes of RAM to keep free, 0 = the OS default (llama_moe_stream_start_ram_free), negative = no margin
     // Compare one filled pool slot per layer (and one GPU whole-layer expert) against the
     // model file at the first token, so wrong weights are named there and not in the output
     int32_t     moe_stream_verify = 1;   // 0 = no read-back check, N>1 = check N layers

@@ -1821,7 +1821,7 @@ llama_moe_stream::llama_moe_stream(
     pred_input_every(pred_input_every_in > 0 ? pred_input_every_in : 8),
     vram_reserve  (vram_reserve_in),
     gpu_layers_mode(gpu_layers_mode_in.empty() ? "hot" : gpu_layers_mode_in),
-    ram_free      (ram_free_in == 0 ? (int64_t) MOE_STREAM_DEFAULT_MIN_AVAIL : ram_free_in),
+    ram_free      (ram_free_in == 0 ? llama_moe_stream_start_ram_free(0, 0, 0, 0, "") : ram_free_in),
     other_bytes   (other_bytes_in),
     sidecar   (json_path_in == MOE_STREAM_MODEL_WORD ? model_path : sidecar_data_path(json_path_in)),
     sidecar_json(json_path_in == MOE_STREAM_MODEL_WORD ? model_path : json_path_in),
@@ -20921,8 +20921,10 @@ bool llama_moe_stream_cap_now(int64_t * use, int64_t * file_cache) {
     return true;
 }
 
+// One RAM headroom in both modes: --moe-stream-ram-free when given; else --moe-stream-ram-margin / keep=, else the OS default (2 GiB
+// with no swap). Elastic RAM with no pinned slots starts a little under it (half the gap, at most 256 MiB) and fills up to it
 int64_t llama_moe_stream_start_ram_free(int32_t elastic, int32_t slots, int64_t ram_free, int64_t ram_margin, const char * elastic_opts) {
-    if (elastic != 1 || slots > 0 || ram_free != 0) {
+    if (ram_free != 0) {
         return ram_free;
     }
     int64_t keep = ram_margin > 0 ? ram_margin : el_os_default_keep_bytes();
@@ -20940,8 +20942,11 @@ int64_t llama_moe_stream_start_ram_free(int32_t elastic, int32_t slots, int64_t 
     if (!keep_set && el_read_swap_kind(sdesc) == 0) {
         keep = std::max<int64_t>(keep, (int64_t) 2 << 30);   // no swap / pagefile: 2 GiB
     }
+    if (elastic != 1 || slots > 0) {
+        return keep > 0 ? keep : el_os_default_keep_bytes();
+    }
     const int64_t start_free = keep + std::min<int64_t>(gap / 2, (int64_t) 256 << 20);
-    return start_free > 0 ? start_free : ram_free;
+    return start_free > 0 ? start_free : el_os_default_keep_bytes();
 }
 
 void llama_moe_stream::el_parse_opts() {
@@ -21004,15 +21009,13 @@ void llama_moe_stream::el_parse_opts() {
     if (el_drop == 0) {
         el_drop = el_step/2;   // by default free RAM may fall at most half a give-back step between two looks
     }
-    if (!p1.ram_margin_set) {
+    if (!p1.ram_margin_set) {   // the same default as llama_moe_stream_start_ram_free, with or without elastic RAM
         p1.ram_margin = el_os_default_keep_bytes();
-        if (el_on) {
-            std::string sdesc;
-            if (el_read_swap_kind(sdesc) == 0) {
-                p1.ram_margin = std::max<int64_t>(p1.ram_margin, (int64_t) 2 << 30);   // 2 GiB
-                fprintf(stderr, "%s: elastic RAM: no swap on this machine (%s): keep-free %.1f GiB by default (keep= or --moe-stream-ram-margin sets it)\n",
-                        __func__, sdesc.c_str(), p1.ram_margin / 1073741824.0);
-            }
+        std::string sdesc;
+        if (el_read_swap_kind(sdesc) == 0) {
+            p1.ram_margin = std::max<int64_t>(p1.ram_margin, (int64_t) 2 << 30);   // 2 GiB
+            fprintf(stderr, "%s: no swap on this machine (%s): RAM kept free %.1f GiB by default (--moe-stream-ram-free sets it)\n",
+                    __func__, sdesc.c_str(), p1.ram_margin / 1073741824.0);
         }
     }
     // A tunable out of its range goes back to its default - one line names them

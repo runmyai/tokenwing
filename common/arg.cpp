@@ -5034,9 +5034,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--moe-stream-ram-free"}, "SIZE",
-        "RAM to keep free for everything else, so the expert pools are sized from what the machine can "
-        "spare: MemAvailable - this - the weights that stay in RAM. A negative value keeps no margin "
-        "(default: 2.5GiB)",
+        "RAM to keep free for everything else (the RAM headroom), so the expert pools are sized from what the machine can "
+        "spare: MemAvailable - this - the weights that stay in RAM. The same number in both modes: without --moe-stream-elastic "
+        "the pools are sized once to leave it free; with --moe-stream-elastic 1 RAM is filled up to it and given back below it. "
+        "A negative value keeps no margin (default: --moe-stream-ram-margin when given, else 1280MiB Linux, 1536MiB Windows/macOS, "
+        "2GiB with no swap/pagefile)",
         [](common_params & params, const std::string & value) {
             params.moe_stream_ram_free = (int64_t) moe_stream_parse_size(value);
         }

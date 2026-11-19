@@ -22677,6 +22677,21 @@ void llama_moe_stream::el_at_call_end(bool complete) {
                     "above its floor", (long long) el_events_unanswered);
         }
     }
+    // A long reply: a take-back step at a word's end too (between two calls, the slots it switches on are EMPTY and their fill reads wait
+    // behind every other read), from the elastic thread's last look (at most a second old) - el_take keeps its pace, the settle wait and
+    // the step still filling. At most one try every half second, so a word pays nothing in between
+    if (el_on && complete && decode_phase) {
+        const int64_t now_us = ggml_time_us(), look_us = el_last_look_us.load(std::memory_order_relaxed);
+        if (now_us - el_word_take_try_us >= 500000 && look_us > 0 && now_us - look_us < 1000000) {
+            el_word_take_try_us = now_us;
+            el_mem m;
+            m.room  = el_last_room_raw.load(std::memory_order_relaxed);
+            m.avail = el_last_avail.load(std::memory_order_relaxed);
+            const int64_t nt0 = el_n_take;
+            el_take(1, m);
+            el_n_word_take += el_n_take != nt0 ? 1 : 0;
+        }
+    }
     if (sh_on && complete && decode_phase) {
         sh_tick();
     }
@@ -23712,6 +23727,9 @@ void llama_moe_stream::el_loop() {
             const int64_t committed = el_x_committed();
             const int64_t x         = room_t >= 0 ? room_t - committed : -1;
             el_last_room_bytes.store(x, std::memory_order_relaxed);
+            el_last_room_raw.store(room_t, std::memory_order_relaxed);   // (a word's end takes back from these - no OS read under the lock)
+            el_last_avail.store(avail, std::memory_order_relaxed);
+            el_last_look_us.store(now, std::memory_order_relaxed);
             // The settle rule: the OTHER programs' memory growing by settlefall or more since the last look (an app opening)
             // holds take-backs back as a give-back does (el_last_obj_us) - el_os_others: lag-free, our own changes cancel out. (Two earlier
             // versions: x - a take-back's empty slots looked like a fall; the room minus our resident growth - the band's lag, +-600 MiB)
@@ -23949,9 +23967,9 @@ void llama_moe_stream::el_print_stats() const {
     fprintf(stderr, "llama_moe_stream: zeroing for GPU-capable prompt calls: %lld slots zeroed, %lld already zero (skipped)\n",
             (long long) el_n_zero_done, (long long) el_n_zero_skip);
     fprintf(stderr, "llama_moe_stream: elastic RAM swap-out signal %s (answered: as much handed back); keep-free trigger give-backs %lld; frees during "
-            "a call by elastic RAM's thread %lld (%lld slots); take-backs while idle %lld; the thread: %lld looks, %.3f s of CPU over %.1f s\n",
+            "a call by elastic RAM's thread %lld (%lld slots); take-backs while idle %lld, at a reply word's end %lld; the thread: %lld looks, %.3f s of CPU over %.1f s\n",
             el_swap_on ? "on" : "off", (long long) el_n_trigger, (long long) el_n_now_give, (long long) el_n_now_slots,
-            (long long) el_n_idle_take, (long long) el_looks.load(), el_thread_cpu_s, el_thread_wall_s);
+            (long long) el_n_idle_take, (long long) el_n_word_take, (long long) el_looks.load(), el_thread_cpu_s, el_thread_wall_s);
     fprintf(stderr, "llama_moe_stream: elastic RAM: the rule: give-backs under keep-free %lld, foreseen under it %lld, on a "
             "memory-pressure event %lld; swap-outs of idle memory logged %lld; looks %lld (%lld with no request running); the settle rule: "
             "falls of free RAM %lld, idle looks that waited %lld\n",

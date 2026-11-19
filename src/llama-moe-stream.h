@@ -1670,6 +1670,11 @@ struct llama_moe_stream {
     bool     el_squeezed_warn_said = false;        // mtx: logged once per squeeze excursion below el_soft_min_layer
     bool     el_win_holes = false;                 // Windows: a layer has decommitted slots below wave_view_slots()
     std::atomic<int64_t>  el_last_room_bytes{-1};  // lock-free snapshot of free headroom for layout telemetry
+    std::atomic<int64_t>  el_last_room_raw{-1};    // the elastic thread's last room reading (el_room), for a word's take-back
+    std::atomic<int64_t>  el_last_avail{-1};       // its MemAvailable at that look
+    std::atomic<int64_t>  el_last_look_us{0};      // when it looked
+    int64_t  el_word_take_try_us = 0;              // mtx: the last take-back try at a word's end
+    int64_t  el_n_word_take = 0;                   // mtx: take-back steps made at a word's end
     std::atomic<uint32_t> el_min_share_pub{0};     // lock-free snapshot of smallest active share per streamed layer
     std::atomic<int64_t>  el_net_given_bytes{0};   // lock-free snapshot of net bytes lent below initial pool size
     double   sh_step_pct = 1.0, sh_gap = 1.5, sh_half = 256.0, sh_floor_pct = 25.0, sh_ceil_pct = 300.0;

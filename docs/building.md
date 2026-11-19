@@ -1,6 +1,8 @@
 # Building
 
-TokenWing builds with CMake, the same way as llama.cpp. You need CMake, a C++ compiler and Git.
+TokenWing builds with CMake, the same way as llama.cpp. You need CMake, a C++ compiler and Git. For the web chat page that
+`llama-server` shows in the browser you also need Node.js with npm: the build makes the page from `tools/ui` and puts it inside
+the server. Without npm the server is built without a page (`-DLLAMA_BUILD_UI=OFF` skips it on purpose).
 
 ```bash
 git clone https://github.com/runmyai/tokenwing

@@ -1562,6 +1562,52 @@ struct ggml_cuda_q8_1_share {
     }
 };
 
+struct ggml_cuda_mmid_share {
+    bool                active        = false;
+    const ggml_tensor * ids           = nullptr;
+    const char *        lo            = nullptr;
+    const char *        hi            = nullptr;
+    const ggml_tensor * src1          = nullptr;
+    const char *        s1_lo         = nullptr;
+    const char *        s1_hi         = nullptr;
+    int64_t             ne02          = 0;
+    int64_t             ne12          = 0;
+    int64_t             n_expert_used = 0;
+    int64_t             ne10          = 0;
+    int64_t             ne10_padded   = 0;
+    int64_t             s12           = 0;
+    int                 si1           = 0;
+    int                 moe_nz        = 0;
+    int                 pad_j         = 0;
+    int                 q8_fmt        = -1;
+    size_t              q8_pad        = 0;
+    int32_t *           ids_dst       = nullptr;
+    size_t              ids_dst_cap   = 0;
+    int32_t *           expert_bounds = nullptr;
+    size_t              bounds_cap    = 0;
+    char *              q8_buf        = nullptr;
+    size_t              q8_cap        = 0;
+    float *             scale_buf     = nullptr;
+    size_t              scale_cap     = 0;
+    std::vector<void *> retired;
+
+    void reset(bool on) {
+        active = on;
+        ids    = nullptr;
+        src1   = nullptr;
+    }
+
+    void note_write(const char * wlo, const char * whi) {
+        if (ids != nullptr && wlo < hi && lo < whi) {
+            ids  = nullptr;
+            src1 = nullptr;
+        }
+        if (src1 != nullptr && wlo < s1_hi && s1_lo < whi) {
+            src1 = nullptr;
+        }
+    }
+};
+
 // GGML_CUDA_MEM_LOG=1 (diagnostic, read once; unset = nothing, one predictable branch at the few lazy
 // allocation points) prints the free VRAM before / after every lazy allocation of this backend: the cuBLAS handle + workspace, a growth of the
 // VMM pool (what the ops' temporary buffers add), a CUDA graph instantiation. That is where the memory that appears after the loader's
@@ -1677,6 +1723,7 @@ struct ggml_backend_cuda_context {
     ggml_cuda_stream_context concurrent_stream_context;
 
     ggml_cuda_q8_1_share q8_1_share;
+    ggml_cuda_mmid_share mmid_share;
 
     ~ggml_backend_cuda_context();
 
@@ -1746,6 +1793,7 @@ struct ggml_cuda_mm_fusion_args_host {
     ggml_tensor * shared_dst = nullptr;
     // The matmul node that carries the --moe-stream-gpu-wave-skip-zero tail when dst is the fused GLU
     const ggml_tensor * zero_tail_node = nullptr;
+    bool skip_zero_tail_rows = false;
     // A GPU byte; when it is 1 the matvec writes 0 and computes nothing (a guess row of a full target layer)
     const uint8_t * skip = nullptr;
 };

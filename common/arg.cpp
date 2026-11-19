@@ -3598,7 +3598,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "full speed and the pool cannot be swapped (default: 0 = off; needs a CUDA context, and the "
         "registration of a 20 GiB pool takes seconds)",
         [](common_params & params, int value) {
-            params.moe_stream_pin = value;
+            params.moe_stream_pin     = value;
+            params.moe_stream_pin_set = true;
         }
     ));
     add_opt(common_arg(
@@ -5016,6 +5017,95 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 LOG_WRN("--moe-stream-hc-silu must be 0 or 1: %d -> %d\n", v0, value);
             }
             params.moe_stream_hc_silu = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-prefill-fast"}, "0|1",
+        "1 = turn on the CUDA prefill fast paths together (--moe-stream-mmq-moe-opt, --moe-stream-gpu-moe-fused, "
+        "--moe-stream-pinned-ring, --moe-stream-lm-bf16, --moe-stream-lend-output, --moe-stream-qsa-fused, "
+        "--moe-stream-hc-fused, --moe-stream-ple-fast); 0 = off (default: 0)",
+        [](common_params & params, int value) {
+            params.moe_stream_prefill_fast = std::min(std::max(value, 0), 1);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-mmq-moe-opt"}, "0|1",
+        "CUDA MMQ: size batched expert tiles against average tokens per expert instead of total batch tokens and skip "
+        "redundant padding clears on pre-zeroed tail buffers (default: 0)",
+        [](common_params & params, int value) {
+            params.moe_stream_mmq_moe_opt = std::min(std::max(value, 0), 1);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-gpu-moe-fused"}, "0|1",
+        "CUDA MoE prefill: fuse gate, up, GLU, INT8 re-quantization and down projection across dual dense/sparse tile "
+        "buckets plus single-pass weighted expert reduction (default: 0)",
+        [](common_params & params, int value) {
+            params.moe_stream_gpu_moe_fused = std::min(std::max(value, 0), 1);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-pinned-ring"}, "SIZE",
+        "stage GPU tail-wave expert copies through a reusable pinned host ring of SIZE bytes (auto or 1 = 256MiB) "
+        "with routed-only copy-ahead filtering (default: 0 = off)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto" || value == "1") {
+                params.moe_stream_pinned_ring = (int64_t) 256 << 20;
+            } else {
+                const int64_t v = moe_stream_parse_size(value);
+                if (v < 0) {
+                    throw std::invalid_argument("--moe-stream-pinned-ring must be >= 0");
+                }
+                params.moe_stream_pinned_ring = v;
+            }
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-lm-bf16"}, "0|1",
+        "with --moe-stream-layer-major 1: keep the call's inter-group hidden state (lm_hid / lm_moe) in BF16 instead of "
+        "F32, halving its device footprint (default: 0)",
+        [](common_params & params, int value) {
+            params.moe_stream_lm_bf16 = std::min(std::max(value, 0), 1);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-lend-output"}, "0|1",
+        "with --moe-stream-layer-major 1: lend an untied VRAM output.weight buffer to the call's layer-major tensors "
+        "before the final layer group and restore it before logits are computed (default: 0)",
+        [](common_params & params, int value) {
+            params.moe_stream_lend_output = std::min(std::max(value, 0), 1);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-qsa-fused"}, "0|1",
+        "qwen4exp sparse attention: gather sorted selected KV pools directly in a GQA-transposed CUDA kernel without "
+        "allocating a dense [n_kv, n_tokens] mask (default: 0)",
+        [](common_params & params, int value) {
+            params.moe_stream_qsa_fused = std::min(std::max(value, 0), 1);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-hc-fused"}, "0|1",
+        "qwen4exp hyper-connections: fuse the low-rank up projection and gated stream mix in registers on CUDA without "
+        "materializing the full [hc*n_embd, n_tokens] gate tensor (default: 0)",
+        [](common_params & params, int value) {
+            params.moe_stream_hc_fused = std::min(std::max(value, 0), 1);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-ple-fast"}, "0|1",
+        "qwen4exp per-layer embeddings: deduplicate and LBA-sort n-gram row gathers through a host cache, upload unique "
+        "raw quantized rows to CUDA, and fuse the dilated PLE conv + SiLU (default: 0)",
+        [](common_params & params, int value) {
+            params.moe_stream_ple_fast = std::min(std::max(value, 0), 1);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-hybrid-tail"}, "K",
+        "in GPU tail-wave prompts of <= 2048 tokens, compute RAM-resident experts routed by at most K tokens on CPU "
+        "threads instead of copying whole expert slices over PCIe (default: 0 = off)",
+        [](common_params & params, int value) {
+            params.moe_stream_hybrid_tail = std::max(0, value);
         }
     ));
     add_opt(common_arg(

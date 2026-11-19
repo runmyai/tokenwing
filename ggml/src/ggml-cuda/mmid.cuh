@@ -9,4 +9,6 @@ void ggml_cuda_launch_mm_ids_helper(
 // maps (ids_src1 / ids_dst) stay complete, so the input quantization reads only valid entries
 int  ggml_cuda_moe_zero_tail_of(const ggml_tensor * dst);   // n_zero from the node's op_params, 0 = none
 void ggml_cuda_moe_zero_tail_apply(int32_t * expert_bounds, const int32_t * ids_dst, float * dst, int n_experts, int n_zero, int ne0,
-        int64_t stride_col_dst, int n_cols_max, cudaStream_t stream);
+        int64_t stride_col_dst, int n_cols_max, cudaStream_t stream, bool skip_zero_rows = false, bool save_orig_end = false);
+void ggml_cuda_moe_zero_tail_rows_cached(const int32_t * expert_bounds, const int32_t * ids_dst, float * dst, int n_experts, int n_zero,
+        int ne0, int64_t stride_col_dst, int n_cols_max, cudaStream_t stream);

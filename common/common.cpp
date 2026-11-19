@@ -1239,7 +1239,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 params.moe_stream_guess_pace,
                 params.moe_stream_needed_early,
                 params.moe_stream_hugepages != 0,
+#if defined(__linux__)
+                (!params.moe_stream_pin_set && params.moe_stream_prefill_fast != 0 &&
+                 params.moe_stream_elastic == 0 && params.moe_stream_window == 0) || params.moe_stream_pin != 0,
+#else
                 params.moe_stream_pin != 0,
+#endif
                 (int32_t) params.lazy_mode,
                 params.moe_stream_correction.empty() ? NULL : params.moe_stream_correction.c_str(),
                 params.moe_stream_pred_shared,
@@ -1825,7 +1830,13 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_stream_prefetch_m       = params.moe_stream_prefetch_m;
     mparams.moe_stream_max_waves        = params.moe_stream_max_waves;
     mparams.moe_stream_hugepages        = params.moe_stream_hugepages;
-    mparams.moe_stream_pin              = params.moe_stream_pin;
+#if defined(__linux__)
+    const int32_t auto_pin = (!params.moe_stream_pin_set && params.moe_stream_prefill_fast != 0 &&
+                              params.moe_stream_elastic == 0 && params.moe_stream_window == 0) ? 1 : params.moe_stream_pin;
+#else
+    const int32_t auto_pin = params.moe_stream_pin;
+#endif
+    mparams.moe_stream_pin              = auto_pin;
     mparams.moe_stream_policy           = params.moe_stream_policy.empty() ? NULL : params.moe_stream_policy.c_str();
     mparams.moe_stream_pred_shared      = params.moe_stream_pred_shared;
     mparams.moe_stream_pred_recall      = params.moe_stream_pred_recall;
@@ -1901,6 +1912,16 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_stream_prompt_split_places = params.moe_stream_prompt_split_places;
     mparams.moe_stream_gpu_wave_skip_zero = params.moe_stream_gpu_wave_skip_zero;
     mparams.moe_stream_gpu_skip_zero    = params.moe_stream_gpu_skip_zero;
+    mparams.moe_stream_prefill_fast     = params.moe_stream_prefill_fast;
+    mparams.moe_stream_mmq_moe_opt      = params.moe_stream_mmq_moe_opt;
+    mparams.moe_stream_gpu_moe_fused    = params.moe_stream_gpu_moe_fused;
+    mparams.moe_stream_pinned_ring      = params.moe_stream_pinned_ring;
+    mparams.moe_stream_lm_bf16          = params.moe_stream_lm_bf16;
+    mparams.moe_stream_lend_output      = params.moe_stream_lend_output;
+    mparams.moe_stream_qsa_fused        = params.moe_stream_qsa_fused;
+    mparams.moe_stream_hc_fused         = params.moe_stream_hc_fused;
+    mparams.moe_stream_ple_fast         = params.moe_stream_ple_fast;
+    mparams.moe_stream_hybrid_tail      = params.moe_stream_hybrid_tail;
     mparams.moe_stream_plan             = params.moe_stream_plan;
     mparams.moe_stream_plan_bind_early  = params.moe_stream_plan_bind_early;  // test only
     mparams.moe_stream_drop_stale       = params.moe_stream_drop_stale;

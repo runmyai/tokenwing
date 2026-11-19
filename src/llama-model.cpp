@@ -2442,8 +2442,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.hip_mmvq             = params.moe_stream_hip_mmvq == 1;
         p1.hip_sync             = std::max(0, params.moe_stream_hip_sync);
         p1.elastic              = params.moe_stream_elastic == 1;
-        p1.ram_margin           = params.moe_stream_ram_margin > 0 ? params.moe_stream_ram_margin : 0;   // 0 = OS zero-paging default in el_parse_opts
-        p1.ram_margin_set       = params.moe_stream_ram_margin > 0;
+        // one leave-free number: --moe-stream-ram-margin, else --moe-stream-ram-free, else the OS default (el_parse_opts) - the start's
+        // fill, elastic RAM's floor and the prompt guard all keep the same amount free
+        const int64_t keep_free = params.moe_stream_ram_margin > 0 ? params.moe_stream_ram_margin
+                                : params.moe_stream_ram_free > 0   ? params.moe_stream_ram_free : 0;
+        p1.ram_margin           = keep_free;
+        p1.ram_margin_set       = keep_free > 0;
         p1.elastic_opts         = params.moe_stream_elastic_opts ? params.moe_stream_elastic_opts : "";
         p1.shares               = params.moe_stream_shares == 1;
         p1.share_file           = params.moe_stream_share_file ? params.moe_stream_share_file : "";

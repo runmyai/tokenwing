@@ -3092,6 +3092,11 @@ llama_moe_stream::llama_moe_stream(
                 zero_block_free(hugepages || pin) ? ", the zero slices hold no RAM" : format(" + %u zero slices", n_expert_use).c_str(),
                 pool_bytes, pool_bytes/1024.0/1024.0/1024.0);
     }
+    if ((el_on || sh_on) && n_streamed == 0) {   // every MoE layer's experts are on the GPU: no pool to grow or shrink
+        fprintf(stderr, "llama_moe_stream: --moe-stream-elastic / --moe-stream-shares are off: nothing is streamed (every MoE "
+                "layer's experts are on the GPU)\n");
+        el_on = sh_on = false;
+    }
     // With elastic RAM or moving shares a pool is allocated for el_cap slots (address space only - a page costs
     // RAM only once a read writes it); without them el_cap = n_slots, the plain pools
     el_cap = (el_on || sh_on) && n_streamed > 0 ? std::max<uint32_t>(n_slots, el_cap_slots(n_slots, block_total, n_streamed, n_expert))
@@ -20762,6 +20767,19 @@ int64_t llama_moe_stream::el_os_memfree() {
     return el_meminfo_bytes("MemFree");
 }
 
+// Linux: file cache nobody has used for a while, which the kernel drops by itself, without writing anything, when a program needs
+// the page: the inactive file pages (Cached - Shmem - Active(file); not Inactive(file), which also holds lazily freed anonymous
+// pages such as our discardable band) minus pages waiting to be written (Dirty, Writeback) and minus all mapped file pages (programs'
+// code and mapped files, left alone). 0 when a field cannot be read
+int64_t llama_moe_stream::el_old_file_cache() {
+    const int64_t cached = el_meminfo_bytes("Cached"), shmem = el_meminfo_bytes("Shmem"), active = el_meminfo_bytes("Active(file)");
+    const int64_t dirty = el_meminfo_bytes("Dirty"), wb = el_meminfo_bytes("Writeback"), mapped = el_meminfo_bytes("Mapped");
+    if (cached < 0 || shmem < 0 || active < 0 || dirty < 0 || wb < 0 || mapped < 0) {
+        return 0;
+    }
+    return std::max<int64_t>(0, cached - shmem - active - dirty - wb - mapped);
+}
+
 // The OS layer: the memory the OTHER programs use - MemTotal - MemFree - our own, our own = this process's cgroup's charge
 // (memory.current) when the cgroup holds only this process (e.g. a systemd-run scope), else our resident size. Our
 // pools filling, our give-backs and our band change both sides alike (a page is charged to us until it is really freed); an app
@@ -20832,7 +20850,7 @@ int64_t llama_moe_stream::el_room() {
         if (mf < 0) {
             return -1;
         }
-        room = mf;
+        room = mf + (EL_OS_LINUX && el_cache_opt ? el_old_file_cache() : 0);
 #endif
     }
     if (el_test_fake_squeeze > 0) {
@@ -20895,6 +20913,7 @@ void llama_moe_stream::el_parse_opts() {
         else if (k == "keep")    { p1.ram_margin = el_parse_size(v); p1.ram_margin_set = true; }
         else if (k == "fill")    { }
         else if (k == "discard") { el_dz_opt = atoi(v.c_str()) != 0; }
+        else if (k == "cache")   { el_cache_opt = atoi(v.c_str()) != 0; }
         else if (k == "band")    { el_band_pct = atof(v.c_str()); }
         else if (k == "bandpace") { el_band_pace = std::max<int64_t>(1, atoll(v.c_str())); }
         else if (k == "psifloor") { el_psi_floor = el_parse_size(v); }
@@ -22913,8 +22932,8 @@ void llama_moe_stream::el_check_wave_need(const char * where) const {
 // removed - no stutter is the default's job). Returns the bytes to give back: 0 (TEST ONLY GIVE_NOREASON: a step - the check's failure test)
 int64_t llama_moe_stream::el_swap_look(int64_t pages, int64_t x) {
     el_n_swap_idle += 1;
-    fprintf(stderr, "llama_moe_stream: elastic RAM swap-out of %lld pages at %.3f s with %.0f MiB free (our empty slots counted as used): idle "
-            "memory compressed - logged, not answered (the rule: only under keep-free or a memory-pressure event)%s\n", (long long) pages,
+    fprintf(stderr, "llama_moe_stream: elastic RAM swap-out of %lld pages at %.3f s with %.0f MiB free (our empty slots counted as used): "
+            "that much handed back, the discardable band first%s\n", (long long) pages,
             ggml_time_us()/1e6, x/1048576.0, el_test_give_noreason ? "; TEST: GIVE_NOREASON asks a step anyway" : "");
     return el_test_give_noreason ? el_step : 0;   // (TEST ONLY: the failure test asks with no reason - the check must stop the run)
 }
@@ -23594,15 +23613,18 @@ void llama_moe_stream::el_loop() {
             int64_t give = 0, allow = 0;
             int reason = 0;   // 0 none (the check), 1 under keep-free, 2 foreseen under it, 3 PSI
             if (el_swap_on && swp >= 0 && swp_last >= 0 && swp - swp_last >= 64) {   // 64 pages = 256 KiB: a swap-out, not noise
-                give   = el_swap_look(swp - swp_last, x);   // logged
-                reason = 0;
-                allow  = give;
-                // The system pushes other apps' memory out while our band still holds slots - with free RAM near
-                // keep-free (not the kernel's background tidying with plenty free) elastic RAM discards that much of our band itself (after the lock)
-                if (el_sd_ok && room_t >= 0 && room_t < keep + el_sd_near && el_dz_now.load() > 0) {
-                    sd_bytes = std::min<int64_t>((swp - swp_last)*4096, (int64_t) 1 << 30);
-                } else if (el_sd_ok && room_t >= keep + el_sd_near) {
-                    el_sd_n_far += 1;   // (a swap-out with plenty free: not answered - counted, the report's "no false alarms")
+                // A swap-out means the system is short, whatever free RAM reads: elastic RAM hands back as much as was swapped out,
+                // its discardable band first (discarded by itself after the lock, no write), the rest as slots - at any free level
+                const int64_t blk_b   = il_of_moe.empty() ? 0 : (int64_t) layers[il_of_moe[0]]->block_bytes;
+                const int64_t swapped = std::min<int64_t>((swp - swp_last)*4096, (int64_t) 1 << 30);
+                el_swap_look(swp - swp_last, x);   // logged
+                if (el_sd_ok && el_dz_now.load() > 0) {
+                    sd_bytes = std::min<int64_t>(swapped, el_dz_now.load()*blk_b);
+                }
+                if (swapped - sd_bytes > 0 && el_givable_any()) {
+                    give   = swapped - sd_bytes;
+                    allow  = give;
+                    reason = 3;   // counted with the memory-pressure events
                 }
             }
             if (el_test_self_discard && el_sd_ok && el_dz_now.load() > 0) {   // TEST ONLY: at every look, during calls too (the race with a use)
@@ -23807,7 +23829,7 @@ void llama_moe_stream::el_print_stats() const {
             (long long) el_n_refill_val, (long long) el_n_refill_cx, (long long) el_n_raise, (long long) el_n_lower, (long long) el_n_low_calls, (long long) el_n_low_drop, (long long) sh_moves, (long long) sh_checks);
     fprintf(stderr, "llama_moe_stream: zeroing for GPU-capable prompt calls: %lld slots zeroed, %lld already zero (skipped)\n",
             (long long) el_n_zero_done, (long long) el_n_zero_skip);
-    fprintf(stderr, "llama_moe_stream: elastic RAM swap-out signal %s (logged only); keep-free trigger give-backs %lld; frees during "
+    fprintf(stderr, "llama_moe_stream: elastic RAM swap-out signal %s (answered: as much handed back); keep-free trigger give-backs %lld; frees during "
             "a call by elastic RAM's thread %lld (%lld slots); take-backs while idle %lld; the thread: %lld looks, %.3f s of CPU over %.1f s\n",
             el_swap_on ? "on" : "off", (long long) el_n_trigger, (long long) el_n_now_give, (long long) el_n_now_slots,
             (long long) el_n_idle_take, (long long) el_looks.load(), el_thread_cpu_s, el_thread_wall_s);

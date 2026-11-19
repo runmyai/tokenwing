@@ -5044,7 +5044,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-stream-elastic"}, "0|1",
         "1 = elastic RAM (Linux, Windows, macOS): routed-expert RAM pools keep the coldest band% discardable for instant zero-write OS reclaim, "
-        "give RAM back immediately when free RAM dips under --moe-stream-ram-margin, and take RAM back in paced steps once free RAM stays "
+        "give RAM back immediately when free RAM dips under --moe-stream-ram-margin or the system swaps out (as much as was swapped), and take RAM back in paced steps once free RAM stays "
         "calm for settle seconds above again; never above the process's cgroup or job memory limit; tunables in --moe-stream-elastic-opts (default: 0)",
         [](common_params & params, int value) {
             if (value != 0 && value != 1) {   // clamped with a warning
@@ -5057,7 +5057,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--moe-stream-ram-margin"}, "SIZE",
-        "with --moe-stream-elastic 1: OS free-RAM floor protected before giving expert slots back (default: 1280MiB Linux, 1536MiB Windows/macOS, 2GiB with no swap/pagefile)",
+        "RAM kept free: elastic RAM's floor (with --moe-stream-elastic 1) and the prompt guard's margin (default: --moe-stream-ram-free when given, else 1280MiB Linux, 1536MiB Windows/macOS, 2GiB with no swap/pagefile)",
         [](common_params & params, const std::string & value) {
             params.moe_stream_ram_margin = (int64_t) moe_stream_parse_size(value);
         }
@@ -5066,7 +5066,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--moe-stream-elastic-opts"}, "K=V,...",
         "elastic RAM tunables: keep=SIZE free-RAM trigger floor, gap=SIZE deadband above keep (512MiB), again=SIZE free RAM needed to start taking back (keep+1GiB), "
         "settle=SECONDS calm window before taking back (30), refillstep=SIZE max take-back step (256MiB), refillms=MS between take-back steps (5000), "
-        "band=PCT discardable cold band per layer (20), softmin=PCT soft warning floor (25), step=SIZE give-back step (512MiB), lookmin=MS/lookmax=MS (25/250), ceiling=N max slots/layer",
+        "band=PCT discardable cold band per layer (20), softmin=PCT soft warning floor (25), step=SIZE give-back step (512MiB), lookmin=MS/lookmax=MS (25/250), ceiling=N max slots/layer, "
+        "cache=0|1 old file cache (not mapped, nothing to write) counts as free room on Linux (1)",
         [](common_params & params, const std::string & value) {
             params.moe_stream_elastic_opts = value;
         }

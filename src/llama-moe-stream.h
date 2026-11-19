@@ -1709,6 +1709,7 @@ struct llama_moe_stream {
     int64_t  el_psi_floor = (int64_t) 2 << 30;     // opts psifloor=: a PSI event is a need only with less free (2.0 GiB)
     // Discardable expert slots
     bool     el_dz_opt = true;                     // opts discard=0|1
+    bool     el_cache_opt = true;                  // opts cache=0|1: old file cache counts as free room (Linux)
     bool     el_dz_ok = false;                     // the OS has them here (the probe; set by el_parse_opts)
     bool     el_dz_on = false;                     // and every pool is fresh (create_pool): the band runs (a give-back takes it last)
     std::atomic<int64_t> el_dz_now{0};             // discardable slots now (changed under mtx; read by el_room before it)
@@ -1875,6 +1876,7 @@ struct llama_moe_stream {
     el_mem   el_read_mem();
     void     el_take(int mode, const el_mem & m);                                 // mtx, boundary: 0 a request, 1 a reply's end, 3 idle (elastic RAM thread)
     int64_t  el_os_memfree();
+    int64_t  el_old_file_cache();   // Linux: file cache the kernel drops without a write (0 elsewhere)
     void     el_at_call_start(bool decode, int32_t n_tok);                        // set_decode
     void     el_at_call_end(bool complete);                                       // end_call, mtx held
     void     el_at_layer(llama_moe_stream_layer & sl, bool decode, int32_t wave, int64_t n_tok);   // remap_needed, mtx: a prompt's give-back

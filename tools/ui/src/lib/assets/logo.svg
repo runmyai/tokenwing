@@ -1,7 +1,1 @@
-<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <path d="M244.95 8C215.233 8 187.774 23.8591 172.923 49.5999L95.6009 183.625C60.2162 244.959 104.481 321.6 175.29 321.6H208L316.977 132.708C348.959 77.2719 308.95 8 244.95 8ZM208 321.6H351.947C415.982 321.6 456.013 390.91 424.013 446.377C409.155 472.132 381.681 488 351.947 488H271.29C200.481 488 156.216 411.359 191.601 350.026L208 321.6Z" fill="currentColor"/>
-    <path d="M208 321.6H16L106.462 164.8L208 321.6Z" fill="currentColor"/>
-    <path d="M388.923 8L208 321.6L253.6 8H388.923Z" fill="currentColor"/>
-    <path d="M304 488H112L202.462 331.2L304 488Z" fill="currentColor"/>
-    <path d="M496 321.6H208L419.399 454.4L496 321.6Z" fill="currentColor"/>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-5.460 -0.960 101.920 101.920"><path d="M0.000 80.0 L7.200 56 H17.200 L10.000 80.0 Z" fill="currentColor" fill-opacity="0.25"/><path d="M14.000 80.0 L26.000 40 H36.000 L24.000 80.0 Z" fill="currentColor" fill-opacity="0.55"/><path d="M28.000 80.0 L46.000 20.0 H56.000 L38.000 80.0 Z" fill="currentColor" fill-opacity="1"/><path d="M46.000 20.0 H56.000 L74.000 80.0 H64.000 Z" fill="currentColor"/><path d="M66.300 31.000 L63.000 20.000 H73.000 L76.300 31.000 Z" fill="currentColor"/><path d="M81.000 80.000 L68.100 37.000 H78.100 L91.000 80.000 Z" fill="currentColor"/></svg>

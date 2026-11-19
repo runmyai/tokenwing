@@ -14,10 +14,10 @@ export const MEDIA_QUERIES = {
 export const THEME_COLORS = {
 	ACCENT_BLUE: '#2563eb',
 	ACCENT_BLUE_HOVER: '#1d4ed8',
-	BACKGROUND_DARK: '#111111',
-	BACKGROUND_LIGHT: 'white',
-	DARK: '#0d0d0d',
-	LIGHT: '#ffffff',
+	BACKGROUND_DARK: '#060606',
+	BACKGROUND_LIGHT: '#e5e6e8',
+	DARK: '#060606',
+	LIGHT: '#e5e6e8',
 	TITLE_UPDATE_ALERT: {
 		BG_DARK: 'zinc-800',
 		BG_LIGHT: 'white',
@@ -38,8 +38,8 @@ export const FAVICON_PATHS = {
 // Substituted for `currentColor` in src/lib/assets/logo.svg when generating
 // the light/dark static sources consumed by the PWA asset generator.
 export const FAVICON_COLORS = {
-	DARK: '#fafafa',
-	LIGHT: '#111111'
+	DARK: '#f4efe6',
+	LIGHT: '#141414'
 } as const;
 
 export const FAVICON_SELECTORS = {
@@ -53,7 +53,7 @@ export const APPLE_ASSETS = {
 
 export const PWA_MANIFEST = {
 	background_color: THEME_COLORS.BACKGROUND_LIGHT,
-	description: 'Local AI chat interface powered by llama.cpp',
+	description: 'Local AI chat for TokenWing',
 	display: 'standalone' as const,
 	icons: [
 		{ sizes: '64x64', src: 'pwa-64x64.png', type: 'image/png' },

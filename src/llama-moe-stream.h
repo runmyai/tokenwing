@@ -443,7 +443,7 @@ struct llama_moe_stream_layer {
     std::vector<uint8_t>  slot_off;       // [cap + n_zero]
     std::vector<int32_t>  el_drop_e;      // experts a give-back dropped (refill candidates; most recent last)
     std::vector<float>    el_drop_v;      // their keep values when dropped
-    std::vector<uint8_t>  el_refill;      // [cap + n_zero] the slot's read is an idle-time refill (cancelled when a request comes)
+    std::vector<uint8_t>  el_refill;      // [cap + n_zero] the slot's read is a take-back's refill (q_refill, the lowest read priority)
     // A ghost list (the last gh_cap experts evicted in decode words: a needed read of one = one more slot would have saved
     // it) and a victim zone (the zone_n least valuable residents at the last check: a hit on one = one fewer slot would have
     // cost it); both counted per check and averaged over --moe-stream-share-opts half
@@ -941,6 +941,7 @@ struct llama_moe_stream_job {
     bool     pr_down     = false;   // the down request of a needed read split as gate+up, then down
     bool     dz_touch    = false;   // the slot was discardable - write one word per page before the read
     bool     idle        = false;   // an idle-time load (q_idle, the lowest priority; kept out of the call counters)
+    bool     refill      = false;   // a take-back's refill read (q_refill: after every needed and guessed read, a few at a time)
 };
 
 // the userdata of one wave's remapping op: the layer and which wave of the ubatch it loads
@@ -1677,6 +1678,9 @@ struct llama_moe_stream {
     std::atomic<int64_t> el_req{0};                // bytes the pressure alarm asked to give back, not given yet
     std::atomic<int64_t> el_events{0};             // pressure events (real + test)
     bool     el_in_call = false;                   // mtx: a decode() call is between set_decode and end_call
+    bool     el_hold_gives = false;                // mtx: a prompt call with GPU-wave copies (tail waves, copy-ahead) runs - slots are switched
+                                                   // off at its end, not during it (the band still frees RAM at any moment)
+    int64_t  el_n_held_gives = 0;                  // give-backs put off to such a call's end
     int64_t  el_last_give_us = 0;                  // mtx
     int64_t  el_last_big_give_us = 0;              // mtx: the last give-back asked of settlefall or more (the trim waits after it)
     int64_t  el_last_change_word = -1000000;       // mtx: the decode word of the last total change (slot shares wait)
@@ -1723,6 +1727,13 @@ struct llama_moe_stream {
     int32_t  fb_test_commit_part = 0;               // TEST ONLY (MOE_STREAM_TEST_COMMIT_FAIL_PART=0|1|2): at which projection
     int64_t  n_fb_commit_released = 0;              // projections committed before a refusal and given back
     int64_t  dz_n_probe = 0, dz_n_probe_slots = 0, dz_n_hits = 0, dz_n_falls = 0;
+    // Taking band slots back ahead of use: a guess that names an expert sitting in a band slot queues it here (mtx), a reader takes it back
+    // before the layer's remap op reaches it; the remap op's own take-back stays as the fallback
+    struct dz_ahead_t { llama_moe_stream_layer * sl; int32_t slot, expert; };
+    std::deque<dz_ahead_t> dz_ahead_q;
+    int64_t  dz_n_ahead = 0, dz_n_ahead_lost = 0, dz_n_onpath = 0;   // taken back by a reader (the OS had taken it), by the remap op
+    int64_t  el_band_age = 1024;                   // opts age=: reply words a slot's expert must go unused before it joins the band
+    int64_t  dz_age_used = 0;                      // the age the last upkeep used (in the layer's expert uses; the stats line)
     double   dz_probe_ms_sum = 0.0, dz_probe_ms_max = 0.0, dz_hold_ms_max = 0.0, dz_lock_us_sum = 0.0, dz_unlock_us_sum = 0.0;
     int64_t  el_n_settle_wait = 0;                 // idle looks a take-back waited for the settle rule
     int64_t  el_others_last = -1;                  // the other programs' memory at the last look (the settle rule)
@@ -1773,6 +1784,8 @@ struct llama_moe_stream {
     bool     el_test_discard = false, el_test_discard_nolock = false, el_test_unlock_every = false;   // TEST ONLY
     bool     el_test_thp_always = false, el_test_thp_keep = false, el_test_look_log = false;                                    // TEST ONLY
     bool     dz_unlock(llama_moe_stream_layer & sl, int32_t s);   // mtx: a filled, droppable slot becomes discardable
+    void     dz_ahead(llama_moe_stream_layer & sl, int32_t s);    // mtx: a guess named the expert of slot s - taken back ahead if in the band
+    void     dz_take_ahead(std::unique_lock<std::mutex> & lock);  // a reader, mtx held: the queued take-backs, one lock turn each
     bool     slot_use(llama_moe_stream_layer & sl, int32_t s);    // mtx: about to be READ - lock it (false: the OS took it, it is EMPTY now)
     void     dz_claim(llama_moe_stream_layer & sl, int32_t s);    // mtx: about to be WRITTEN - an ordinary slot again (never O_DIRECT into it)
     void     dz_forget(llama_moe_stream_layer & sl, int32_t s);   // mtx: its discardable state dropped (its pages go back with the caller)
@@ -1836,7 +1849,9 @@ struct llama_moe_stream {
     std::atomic<int64_t> el_fk_t0_us{0}, el_fk_swp{0}, el_fk_swapped{0};
     int64_t  el_fk_a0 = 0, el_fk_given0 = 0, el_fk_taken0 = 0;
     bool     el_quiet_drop = false;                // mtx: the low-only drop (counted on its own line, not as an eviction)
-    int64_t  el_n_refill_seen = 0;                 // mtx: refills already cancelled
+    int32_t  el_refill_io = 2;                     // opts refillio=: refill reads in flight at most (behind every other read)
+    int32_t  n_refill_run = 0;                     // mtx: refill pieces in a reader now
+    void     el_refill_drain(llama_moe_stream_layer * only, int32_t s_lo, int32_t s_hi);   // mtx: queued refill reads taken back
     std::atomic<int64_t> el_n_ignored{0};          // pressure events with more than margin + step free (not a shortage)
     int64_t  el_n_lower = 0, el_n_raise = 0;       // zero-block moves (graph rebuilds)
     bool     el_min_dirty = false;                 // mtx: a prompt's layer op gave back; settled at the call's end
@@ -2892,6 +2907,7 @@ struct llama_moe_stream {
     std::deque<llama_moe_stream_job> q_demand;
     std::deque<llama_moe_stream_job> q_prefetch;
     std::deque<llama_moe_stream_job> q_idle;   // idle-time loads, taken only when nothing else waits
+    std::deque<llama_moe_stream_job> q_refill; // elastic RAM's refill reads: after every needed and guessed read, el_refill_io at a time
     std::vector<std::thread>    io_threads;
     bool                        io_stop = false;
     int32_t                     n_inflight = 0;      // reads in flight right now
@@ -3294,7 +3310,7 @@ struct llama_moe_stream {
     // Lead / rank / extra flags describe a guess for the event recorder (lead = layers ahead of the layer that
     // issued it, rank = position in its guess list); they change nothing in the read
     void   enqueue(llama_moe_stream_layer & sl, int32_t expert, int32_t slot, bool prefetch,
-                   int32_t lead = 0, int32_t rank = -1, uint8_t rflags = 0, bool pr_split_ok = false, bool idle = false);
+                   int32_t lead = 0, int32_t rank = -1, uint8_t rflags = 0, bool pr_split_ok = false, bool idle = false, bool refill = false);
     // A remap call's split needed reads queue their gate+up job at once and hold the down job here; the call
     // queues the held downs after its last needed read (or before it releases the lock to wait), so every gate+up of the call
     // is ahead of its downs. mtx held.

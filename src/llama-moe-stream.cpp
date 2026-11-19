@@ -20879,9 +20879,12 @@ int64_t llama_moe_stream::el_room() {
     int64_t room = avail - el_dz_now.load()*(int64_t) blk;
     if (el_test_fake_squeeze == 0) {
 #if EL_OS_WIN32
-        // Windows OfferVirtualMemory moves band pages to Standby immediately (raising ullAvailPhys), so room = ullAvailPhys - band,
-        // bounded also by remaining system-wide commit charge (ullAvailPageFile)
-        room = std::min<int64_t>(room, el_win_commit_free());
+        // Windows OfferVirtualMemory moves band pages to Standby immediately (raising ullAvailPhys), so room = ullAvailPhys - band.
+        // The commit rooms (ullAvailPageFile, the job's) already count our switched-on empty slots, which every caller subtracts from
+        // this room again: so their bound goes to el_x_committed as a shortfall, not here (else those slots count twice)
+        const int64_t cr = std::min<int64_t>(el_win_commit_free(), el_cgroup_room(el_cgroup_dir()));
+        el_win_cshort.store(std::max<int64_t>(0, room - cr), std::memory_order_relaxed);
+        return room;
 #else
         const int64_t mf = el_os_memfree();
         if (mf < 0) {
@@ -23021,7 +23024,11 @@ void llama_moe_stream::sh_tick() {
 // mtx held: our switched-on empty slots as elastic RAM's decisions count them - 0 in the fake squeeze, whose pretend MemAvailable already counts
 // every switched-on slot as used
 int64_t llama_moe_stream::el_x_committed() const {
-    return el_test_fake_squeeze > 0 ? 0 : el_committed();
+    if (el_test_fake_squeeze > 0) {
+        return 0;
+    }
+    // Windows: room - this = min(free RAM - our empty slots, the commit room), which already left the empty slots out (el_room)
+    return EL_OS_WIN32 ? std::max<int64_t>(el_committed(), el_win_cshort.load(std::memory_order_relaxed)) : el_committed();
 }
 
 // mtx held: switched-on EMPTY slots' bytes - promised to the next reads, no RAM yet (the start-up fill, a take-back's steps)

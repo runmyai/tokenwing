@@ -1722,6 +1722,7 @@ struct llama_moe_stream {
     bool     el_dz_ok = false;                     // the OS has them here (the probe; set by el_parse_opts)
     bool     el_dz_on = false;                     // and every pool is fresh (create_pool): the band runs (a give-back takes it last)
     std::atomic<int64_t> el_dz_now{0};             // discardable slots now (changed under mtx; read by el_room before it)
+    std::atomic<int64_t> el_win_cshort{0};         // Windows: el_room's room minus the commit room at its last read (>= 0; el_x_committed)
     int64_t  dz_n_unlock = 0, dz_n_lock_ok = 0, dz_n_lock_fail = 0, dz_n_claim = 0, dz_n_taken = 0, dz_n_relock = 0, dz_n_relock_fail = 0;
     int64_t  n_dz_unlock_fail = 0;                  // the OS refused an unlock (discardable slots off from then on)
     int64_t  n_fb_noslot = 0, n_fb_noslot_freed = 0; // "no free slot" fallbacks (kept sets released, VRAM follow drained) - usually a bug

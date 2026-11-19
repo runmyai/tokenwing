@@ -4196,7 +4196,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "and saved next to the sidecar by an atomic replace; the first start reads <table>-seed (counted from recordings) when the table "
         "does not exist yet. 2 = 1, and the model counts as loaded only once every RAM slot is filled (every expert when all fit, else "
         "each layer's most-used; no time limit): the first request does not start cold, the load takes longer (progress lines "
-        "'llama_moe_stream: loading: experts into RAM ...' on stderr). Not with elastic RAM (default: 0)",
+        "'llama_moe_stream: loading: experts into RAM ...' on stderr). With --moe-stream-elastic 1 only the slots switched on now are "
+        "filled (the pools sized at start from free RAM minus the RAM headroom); during the fill and 10 s after it (until the first request) elastic RAM gives back "
+        "only for a swap-out or free RAM under the headroom (default: 0)",
         [](common_params & params, int value) {
             if (value < 0 || value > 2) {   // clamped with a warning
                 const int v0 = value;
@@ -4261,7 +4263,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "pools are one window over the layers (the same total): while a layer computes, the next streamed layers' most-used experts "
         "(the usage table) are read into room taken from finished layers, empty slots and - in a full RAM - the layers farthest ahead, "
         "below the running layer's needed reads; a finished layer keeps its share's worth of the call's experts by the prompt-end "
-        "weight, set for the reply. Needs --moe-stream-layer-major 1 and --moe-stream-wave-plan 1; not with "
+        "weight, set for the reply. Needs --moe-stream-layer-major 1 and --moe-stream-wave-plan 1; not with --moe-stream-elastic / "
         "--moe-stream-shares / --moe-stream-hugepages / --moe-stream-pin (default: 0)",
         [](common_params & params, int value) {
             if (value != 0 && value != 1) {   // clamped with a warning

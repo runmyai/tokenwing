@@ -785,6 +785,10 @@ constexpr uint64_t MOE_STREAM_LFU_DECAY = 64;
 
 // what the machine must still have free after the pools are allocated
 constexpr int64_t MOE_STREAM_MIN_AVAIL = 4LL*1024*1024*1024;   // the old fixed margin
+// With elastic RAM, how long after the fill at start (--moe-stream-idle-load 2) it still gives back only for a swap-out or free RAM under
+// the headroom (no early give-back or trim from its rate estimates: the load's own reads and page faults are not another program); the
+// first request ends it sooner
+constexpr int64_t MOE_STREAM_EL_FILL_SETTLE_US = 10LL*1000*1000;   // 10 s
 // What the pools have to leave for everything else in the process that the model file does not
 // describe: the KV cache, the compute buffers, the ggml context, and the CUDA driver/runtime host
 // allocations - which are made *after* this number is needed, which is why it cannot be measured here.
@@ -1809,6 +1813,7 @@ struct llama_moe_stream {
     int64_t  el_last_call_end_us = 0;              // mtx: the last call's end (idle = no call for 2 s)
     int64_t  el_n_looks_idle = 0;
     int64_t  el_last_obj_us = 0;                   // mtx: the last need that was no give-back (a PSI need, a fall): a take-back waits el_cool_s
+    std::atomic<int64_t> el_quiet_until_us{0};     // while the fill at start runs and a short settle after it: no give-back or trim from rate estimates
     bool     el_call_known = true;                 // mtx: decode_phase describes the running call (false from el_enter to el_at_call_start)
     void     el_check_wave_need(const char * where) const;   // mtx held: the check - a prompt call's layers keep its wave width
     int32_t  el_test_fake_swap = 0;                // TEST ONLY: MOE_STREAM_TEST_FAKE_SWAP=N

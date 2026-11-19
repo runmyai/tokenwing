@@ -1156,6 +1156,7 @@ int main(int argc, char ** argv) {
             char gb[32];
             snprintf(gb, sizeof(gb), "%.0f", gpu_gbps(g.first, seconds));
             out += (out.empty() ? "" : ", ") + std::string("{\"name\": \"") + json_escape(ggml_backend_dev_name(g.first)) +
+                   "\", \"desc\": \"" + json_escape(ggml_backend_dev_description(g.first)) +
                    "\", \"mib\": " + std::to_string(g.second) + ", \"gbps\": " + gb + "}";
         }
         return out;

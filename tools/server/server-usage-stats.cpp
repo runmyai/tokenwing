@@ -133,8 +133,12 @@ static std::string os_cpu_name() {
     char buf[256] = {};
     DWORD size = sizeof(buf);
     if (RegGetValueA(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "ProcessorNameString",
-                     RRF_RT_REG_SZ, nullptr, buf, &size) == ERROR_SUCCESS && buf[0]) {
-        return buf;
+                     RRF_RT_REG_SZ, nullptr, buf, &size) == ERROR_SUCCESS) {
+        // the processor fills the name to a fixed width with spaces (AMD's at the end, some Intel ones in front)
+        const std::string name = string_strip(buf);
+        if (!name.empty()) {
+            return name;
+        }
     }
 #    if defined(_M_ARM64)
     return "arm64";

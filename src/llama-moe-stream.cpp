@@ -23843,7 +23843,10 @@ void llama_moe_stream::el_loop() {
             const int64_t mid       = el_target_rule();   // keep-free + the gap
             int64_t give = 0, allow = 0;
             int reason = 0;   // 0 none (the check), 1 under keep-free, 2 foreseen under it, 3 PSI
-            if (el_swap_on && swp >= 0 && swp_last >= 0 && swp - swp_last >= 64) {   // 64 pages = 256 KiB: a swap-out, not noise
+            // Windows' modified-page writer writes changed pages of idle programs to the page file at any free level, to keep that
+            // list short: there a page-file write tells of a short system only with free RAM near keep-free (under keep-free + the gap)
+            const bool swap_means_short = !EL_OS_WIN32 || (room_t >= 0 && x < mid);
+            if (el_swap_on && swap_means_short && swp >= 0 && swp_last >= 0 && swp - swp_last >= 64) {   // 64 pages = 256 KiB, not noise
                 // A swap-out means the system is short, whatever free RAM reads: elastic RAM hands back as much as was swapped out,
                 // its discardable band first (discarded by itself after the lock, no write), the rest as slots - at any free level
                 const int64_t blk_b   = il_of_moe.empty() ? 0 : (int64_t) layers[il_of_moe[0]]->block_bytes;

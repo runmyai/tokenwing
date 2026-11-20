@@ -1936,6 +1936,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             const auto it = keep_named.find(ggml_backend_dev_name(d));
             return it != keep_named.end() ? it->second : std::max<int64_t>(0, params.moe_stream_vram_free);
         };
+        // What the whole-layer fits leave free on a device: its --moe-stream-vram-free value, except on the VRAM pool's GPU. There the pool
+        // keeps it free itself, measured once the context exists, and loads the model again with one whole layer fewer when whole layers
+        // left too little (keeping it here as well turned one whole layer into pool places, with the same VRAM free at the end)
+        const auto fit_keep = [&](ggml_backend_dev_t d) -> int64_t {
+            return d != nullptr && d == ms_pool_dev ? 0 : vram_keep(d);
+        };
         // the compute buffers' margin per token of the physical batch (the auto-fit's, and the whole-layer check's estimate)
         static const double fit_mib_per_token = getenv("MOE_STREAM_FIT_MIB_PER_TOKEN")
             ? atof(getenv("MOE_STREAM_FIT_MIB_PER_TOKEN")) : 0.5;
@@ -2050,7 +2056,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 ggml_backend_dev_t d = auto_devs[k];
                 size_t f = 0, tot = 0;
                 ggml_backend_dev_memory(d, &f, &tot);
-                int64_t room = (int64_t) f - vram_keep(d) - wl_compute - wl_prewarm - (k == 0 ? out_b : 0);
+                int64_t room = (int64_t) f - fit_keep(d) - wl_compute - wl_prewarm - (k == 0 ? out_b : 0);
                 int n = 0, lo = -1, hi = -1;
                 int64_t used = 0;
                 for (; il >= (int) hparams.n_layer_dense_lead; il--) {
@@ -2076,7 +2082,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 }
                 say += format("%s%s %s (%.2f GiB of experts, %.0f MiB of %.0f free kept free)", say.empty() ? "" : "; ", ggml_backend_dev_name(d),
                         n > 0 ? format("takes layers %d-%d", lo, hi).c_str() : "takes no layer", used/1073741824.0,
-                        vram_keep(d)/1048576.0, f/1048576.0);
+                        fit_keep(d)/1048576.0, f/1048576.0);
             }
             if (pick) {
                 for (const int32_t x : spec_order) {   // the layers named with a device come first, in the order given
@@ -2357,8 +2363,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 (int64_t) (params.moe_stream_ubatch > 0 ? params.moe_stream_ubatch : 512);
             const int64_t vram_reserve_total = params.moe_stream_vram_reserve + ubatch_margin;
 
-            // a --moe-stream-vram-free list: the device's own value stays free too (0 without a list)
-            const int64_t keep0 = vram_keep(devices[0].dev);
+            // a --moe-stream-vram-free list: the device's own value stays free too (0 without a list; 0 on the VRAM pool's GPU: fit_keep)
+            const int64_t keep0 = fit_keep(devices[0].dev);
             vram_reserve = (int64_t) vram_free - gpu_weight_bytes - vram_reserve_total - keep0;
 
             fprintf(stderr, "%s: VRAM for whole MoE layers: %.2f GiB free on %s, %.2f GiB of weights go there, "
@@ -2421,7 +2427,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     w.compute = wl_compute;
                     w.prewarm = wl_prewarm;
                 }
-                w.keep = vram_keep(dv.dev);
+                w.keep = fit_keep(dv.dev);
                 wl_devs.push_back(w);
             }
         }

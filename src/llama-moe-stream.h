@@ -1230,6 +1230,8 @@ struct llama_moe_stream {
     // GPU -> (pinned bounce ->) the slot (no engine lock: the slot is LOADING and only the copy-back writes it), settle it READY
     // (mtx held: the I/O threads' settle), and the keep value an expert leaving VRAM has
     void vf_cb_take(vf_job_t & j);
+    void cb_claim(llama_moe_stream_layer & B, int32_t v, int32_t e, vf_job_t & j);
+    bool tail_copy_back(int32_t g, int32_t p, int32_t il, int32_t e);
     void vf_cb_copy(vf_job_t & j, bool async);
     void vf_cb_settle(vf_job_t & j);
     float vf_keep_value(const llama_moe_stream_layer & sl, int32_t e) const;
@@ -1418,6 +1420,8 @@ struct llama_moe_stream {
     std::unordered_map<const ggml_tensor *, int32_t> tail_mm_uses;   // of them, MUL_MAT_IDs that read it as their weights
     int32_t  tail_split_used[3] = { -1, -1, -1 };         // the split that last took projection k's target
     int64_t  tail_n_vac_last = 0, tail_n_vac_max = 0;   // places emptied (the last vacate's range, the largest)
+    int64_t  tail_n_cb = 0, tail_cb_us = 0, tail_cb_noroom = 0;   // held experts copied back to RAM at a vacate, the time, none free
+    bool     vx_keep_short = false;   // the VRAM pool's sizing ended with less than --moe-stream-vram-free free on its GPU
     int64_t  tail_n_vacate = 0, tail_n_vac_places = 0, tail_n_fill_calls = 0, tail_n_fill_jobs = 0, tail_n_fill_noram = 0;
     int64_t  tail_n_taken = 0, tail_n_declined[8] = { 0 }; // the hook: copies given a target / refused, by reason
     int64_t  tail_n_taken_real = 0;                        // of the copies given a target: in graphs that were computed (tail_real)

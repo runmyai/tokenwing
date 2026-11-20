@@ -4007,11 +4007,12 @@ llama_moe_stream::~llama_moe_stream() {
                     "not in RAM)\n", (long long) n_lm_lend, (long long) tail_n_fill_calls, (long long) tail_n_fill_jobs, (long long) tail_n_fill_noram);
         }
         if (tail_on) {
-            fprintf(stderr, "llama_moe_stream: tail: %d places%s; vacated %lld times (%lld held experts stepped aside; places emptied: last %lld, "
-                    "most %lld, copy places %d), refill calls %lld, fill jobs %lld "
+            fprintf(stderr, "llama_moe_stream: tail: %d places%s; vacated %lld times (%lld held experts stepped aside, %lld of them copied back to "
+                    "RAM in %.1f ms, %lld without an empty slot; places emptied: last %lld, most %lld, copy places %d), refill calls %lld, fill jobs %lld "
                     "(%lld candidates not in RAM); scheduler copies given a tail target %lld (%lld in computed graphs), refused %lld (device %lld, not a pool %lld, consumer %lld, "
                     "shared %lld, size %lld, two in a split %lld, view offset %lld, state %lld)\n", tail_n, tail_preset ? "" : " (preset copy off)",
-                    (long long) tail_n_vacate, (long long) tail_n_vac_places, (long long) tail_n_vac_last, (long long) tail_n_vac_max, tail_copy_n,
+                    (long long) tail_n_vacate, (long long) tail_n_vac_places, (long long) tail_n_cb, tail_cb_us/1000.0, (long long) tail_cb_noroom,
+                    (long long) tail_n_vac_last, (long long) tail_n_vac_max, tail_copy_n,
                     (long long) tail_n_fill_calls, (long long) tail_n_fill_jobs,
                     (long long) tail_n_fill_noram, (long long) tail_n_taken, (long long) tail_n_taken_real,
                     (long long) (tail_n_declined[0] + tail_n_declined[1] + tail_n_declined[2] + tail_n_declined[3] + tail_n_declined[4] + tail_n_declined[5] + tail_n_declined[6] + tail_n_declined[7]),
@@ -15156,6 +15157,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
     if (vx_ready) {
         return true;
     }
+    vx_keep_short = false;
     if (uma_active) {
         vx_flags_off("unified-memory mode (--moe-stream-uma 1) shares physical RAM with the GPU without a duplicate VRAM pool");
         return false;
@@ -15552,6 +15554,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                     p1.vram_free/1048576.0, vfree/1048576.0, bytes_zero/1048576.0, vx_growth_used/1048576.0, bytes_per_n/1048576.0);
         }
         if (n_use < 1) {   // the run goes on without the pool
+            vx_keep_short = (int64_t) vfree - vx_growth_used < p1.vram_free;   // whole layers may have left less than the keep-free (the context decides)
             vx_flags_off(format("no GPU expert fits (free %.1f MiB, needs %.1f MiB for the zero slices%s, %.1f MiB growth and %.1f MiB for one "
                     "expert in every streamed layer, before the %.1f MiB keep-free)", vfree/1048576.0, bytes_zero/1048576.0, vp ? " and the id table" : "",
                     vx_growth_used/1048576.0, bytes_per_n/1048576.0, p1.vram_free/1048576.0).c_str());
@@ -15999,6 +16002,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                     // kept 1 per layer with 41.2 MiB free under 87.5 MiB of growth and ran out of
                     // VRAM at the first reply word - so the growth decides, the margin only gives the line)
                     if (!failed && (int64_t) f_after >= vx_growth_used) {   // only the keep-free margin is short: keep it and run
+                        vx_keep_short = true;   // (the context loads the model again with one whole layer fewer when the pool's GPU holds one)
                         fprintf(stderr, "%s: --moe-stream-vram-free: the GPU pool keeps %u expert per layer; free after the compute buffers %.1f MiB, "
                                 "under the %.1f MiB asked for (keep-free %.1f + growth %.1f) - running with less kept free\n", __func__, N,
                                 f_after/1048576.0, need/1048576.0, p1.vram_free/1048576.0, vx_growth_used/1048576.0);
@@ -16006,6 +16010,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                     }
                     // the compute buffers and their growth do not fit next to even that: the run goes on without the pool (reserved again
                     // without it)
+                    vx_keep_short = true;
                     vx_free_pool();
                     vx_flags_off((failed ? format("not even 1 expert per layer fits next to the compute buffers at -c %lld -ub %lld (the reserve failed "
                             "at 1 per layer)", (long long) n_ctx_run, (long long) n_ubatch)
@@ -17106,6 +17111,41 @@ float llama_moe_stream::vf_keep_value(const llama_moe_stream_layer & sl, int32_t
     return sl.p1_dval[e] <= 0.0f ? 0.0f : sl.p1_dval[e]*p1_decay(n_tok_outer - sl.p1_dword[e]);
 }
 
+// Mtx held: slot v of layer B becomes expert e's copy-back target, filled from VRAM place j.place of group j.group without a read -
+// enqueue()'s bookkeeping of a new resident: LOADING with source "copy" (slot_cb bit0), so no I/O thread settles it, drop stale never
+// frees it (no list entry bound it) and a pick waits for it. vf_cb_copy then fills it, vf_cb_settle makes it READY
+void llama_moe_stream::cb_claim(llama_moe_stream_layer & B, int32_t v, int32_t e, vf_job_t & j) {
+    drop_slot(B, v, e, /* taker_guess = */ true, /* to_vram = */ false, /* by_copyback = */ true);   // EVICT bit7 (a victim held one)
+    // enqueue()'s bookkeeping of a new resident, without a read: LOADING, not ready, no issue time (no lead / landing sample)
+    if (overlap) {
+        moe_slot_ready(B, v).store(0, std::memory_order_relaxed);
+    }
+    B.slot_state   [v] = MOE_STREAM_SLOT_LOADING; B.gsf_dirty = 1;
+    B.slot_expert  [v] = e; B.gsf_dirty = 1;
+    B.expert_slot  [e] = v; B.gsf_dirty = 1;
+    B.slot_prefetch[v] = 0;   // its keep value is its own, not an unused guess's 0
+    B.slot_covered [v] = 0;
+    B.slot_cancel  [v] = 0; B.gsf_dirty = 1;
+    B.slot_chunk_bad[v] = 0;
+    B.slot_issue_us[v] = 0;
+    if (!B.issue_us.empty()) {
+        B.issue_us[v] = 0;
+    }
+    if (policy == MOE_STREAM_POLICY_DECAY) {
+        B.p1_issue_word[v] = -1;
+    }
+    if (pr_on) {   // no projection is ready and no I/O bytes will come (drop_slot cleared
+        pr_clear(B, v);   // them already; kept explicit: the copy-back owns the slot outside enqueue's per-projection path)
+    }
+    B.slot_cb[v]  = 3;        // in flight, not picked since
+    B.vf_n_cb    += 1;
+    j.cb_slot = v;
+    j.cb_gen  = B.slot_gen[v];
+    j.cb_t0   = ggml_time_us();
+    j.cb_seq  = vf_call_seq.load();
+    j.cb_done.store(false);
+}
+
 // Mtx held (the tick, word boundary 1, after the leaving expert stopped being held): take
 // a RAM slot for the leaving expert's copy-back - through pick_victim (the VRAM follow hook applies: no marked slot) as a speculative fill (a
 // guess's rules: no pending guess, no read in flight), only into an EMPTY slot or when the expert's keep value is above the victim's
@@ -17140,35 +17180,7 @@ void llama_moe_stream::vf_cb_take(vf_job_t & j) {
         }
     }
     vf_cb_evict += B.slot_state[v] != MOE_STREAM_SLOT_EMPTY ? 1 : 0;   // counted as "evictions by VRAM copy-back"
-    drop_slot(B, v, e, /* taker_guess = */ true, /* to_vram = */ false, /* by_copyback = */ true);   // EVICT bit7 (a victim held one)
-    // enqueue()'s bookkeeping of a new resident, without a read: LOADING, not ready, no issue time (no lead / landing sample)
-    if (overlap) {
-        moe_slot_ready(B, v).store(0, std::memory_order_relaxed);
-    }
-    B.slot_state   [v] = MOE_STREAM_SLOT_LOADING; B.gsf_dirty = 1;
-    B.slot_expert  [v] = e; B.gsf_dirty = 1;
-    B.expert_slot  [e] = v; B.gsf_dirty = 1;
-    B.slot_prefetch[v] = 0;   // its keep value is its own, not an unused guess's 0
-    B.slot_covered [v] = 0;
-    B.slot_cancel  [v] = 0; B.gsf_dirty = 1;
-    B.slot_chunk_bad[v] = 0;
-    B.slot_issue_us[v] = 0;
-    if (!B.issue_us.empty()) {
-        B.issue_us[v] = 0;
-    }
-    if (policy == MOE_STREAM_POLICY_DECAY) {
-        B.p1_issue_word[v] = -1;
-    }
-    if (pr_on) {   // no projection is ready and no I/O bytes will come (drop_slot cleared
-        pr_clear(B, v);   // them already; kept explicit: the copy-back owns the slot outside enqueue's per-projection path)
-    }
-    B.slot_cb[v]  = 3;        // in flight, not picked since
-    B.vf_n_cb    += 1;
-    j.cb_slot = v;
-    j.cb_gen  = B.slot_gen[v];
-    j.cb_t0   = ggml_time_us();
-    j.cb_seq  = vf_call_seq.load();
-    j.cb_done.store(false);
+    cb_claim(B, v, e, j);
     vf_cb            += 1;
     B.c().n_copyback += 1;
     // the recorder: an ISSUE with bit7 (no READBACK: the expert left RAM for VRAM, which is no eviction; any older eviction record
@@ -17984,7 +17996,10 @@ void llama_moe_stream::tail_vacate_t(std::unique_lock<std::mutex> & lock, int32_
     GGML_ASSERT(vf_jobs.empty() && "a job survived the drain before the tail was vacated");
     const int32_t g = tail_group;
     n_places = std::min<int32_t>(std::max<int32_t>(n_places, tail_copy_n), tail_n);   // (the copy places + what the call needs)
-    int32_t n = 0;
+    int32_t n = 0, n_cb = 0;
+    const int64_t t_cb0 = ggml_time_us();
+    // TEST ONLY: the held experts without a RAM copy leave the tail without being copied back (the old behaviour, for the A/B)
+    static const bool tail_cb_off = getenv("MOE_STREAM_TEST_NO_TAIL_COPYBACK") && atoi(getenv("MOE_STREAM_TEST_NO_TAIL_COPYBACK")) != 0;
     for (int32_t p = tail_first; p < tail_first + n_places; p++) {
         const int32_t il = vf_place_il[g][p], e = vf_place_e[g][p];
         if (il < 0) {
@@ -18000,6 +18015,9 @@ void llama_moe_stream::tail_vacate_t(std::unique_lock<std::mutex> & lock, int32_
         vf_place_il[g][p] = -1;
         vf_place_e [g][p] = -1;
         n++;
+        if (sl.expert_slot[e] < 0 && !tail_cb_off) {   // no RAM copy (elastic RAM drops them): the place's bytes are still there
+            n_cb += tail_copy_back(g, p, il, e) ? 1 : 0;
+        }
     }
     tail_vacated    = true;
     tail_vac_n      = n_places;
@@ -18010,11 +18028,39 @@ void llama_moe_stream::tail_vacate_t(std::unique_lock<std::mutex> & lock, int32_
     tail_n_vac_places += n;
     tail_n_vac_last   = n_places;
     tail_n_vac_max    = std::max<int64_t>(tail_n_vac_max, n_places);
+    tail_n_cb        += n_cb;
+    tail_cb_us       += n_cb > 0 ? ggml_time_us() - t_cb0 : 0;
     if (tail_n_vacate <= 3) {
         fprintf(stderr, "%s: %d of the pool's tail's %d places (%d copy places + %d for a layer-major call's tensors) are free for the "
-                "GPU-wave copies: %d held experts stepped aside (vacate %lld)\n", __func__, n_places, tail_n, tail_copy_n,
-                n_places - tail_copy_n, n, (long long) tail_n_vacate);
+                "GPU-wave copies: %d held experts stepped aside, %d of them copied back to RAM (%.1f ms) (vacate %lld)\n", __func__,
+                n_places, tail_n, tail_copy_n, n_places - tail_copy_n, n, n_cb, n_cb > 0 ? (ggml_time_us() - t_cb0)/1000.0 : 0.0,
+                (long long) tail_n_vacate);
     }
+}
+
+// Mtx held, in tail_vacate_t, right after expert e of layer il left tail place p of group g: it has no RAM copy (VRAM-held experts drop
+// theirs while elastic RAM may give slots back), so the prompt that borrows the place would read it from the SSD again. Its bytes are
+// still in the place: copy them into an EMPTY RAM slot of the layer that a prompt may read (the first n_slots; never a slot elastic RAM
+// switched off, never an eviction). No such slot: false, and the expert is read from the SSD when it is needed, as without this
+bool llama_moe_stream::tail_copy_back(int32_t g, int32_t p, int32_t il, int32_t e) {
+    auto & B = *layers[il];
+    int32_t v = -1;
+    const uint32_t n = std::min<uint32_t>(B.n_slots, n_slots);
+    for (uint32_t s = 0; s < n && v < 0; s++) {
+        if (B.slot_state[s] == MOE_STREAM_SLOT_EMPTY && !B.keep[s] && !B.slot_off[s] && (B.vf_mark.empty() || !B.vf_mark[s])) {
+            v = (int32_t) s;
+        }
+    }
+    if (v < 0) {
+        tail_cb_noroom += 1;
+        return false;
+    }
+    vf_job_t j;
+    j.group = g; j.place = p; j.leave_il = il; j.leave_e = e;
+    cb_claim(B, v, e, j);
+    vf_cb_copy(j, vf_be != nullptr);   // (the uploader's stream and pinned bounce when VRAM follow runs, else a plain synchronous read)
+    vf_cb_settle(j);
+    return true;
 }
 
 // llama_context's layer signals

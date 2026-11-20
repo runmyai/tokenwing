@@ -185,6 +185,20 @@ static void * moe_aligned_alloc(size_t n) {
     return moe_aligned_alloc_n(n, MOE_STREAM_ALIGN);
 }
 
+const ggml_cpu_moe_api * llama_cpu_moe_api() {
+    static const ggml_cpu_moe_api * api = [] {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CPU");
+        auto * a = reg ? (const ggml_cpu_moe_api *) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_api") : nullptr;
+        if (a == nullptr || a->size < sizeof(ggml_cpu_moe_api)) {
+            // a CPU backend from another build: its kernels do not know the engine's expert pools
+            GGML_ABORT("the CPU backend (%s) has no MoE entry table of this build: use the ggml libraries that came with this program",
+                       reg ? "a different build" : "not loaded");
+        }
+        return a;
+    }();
+    return api;
+}
+
 bool llama_moe_stream_dev_is_uma(ggml_backend_dev_t dev) {
     if (dev == nullptr) {
         return false;
@@ -3652,36 +3666,36 @@ llama_moe_stream::llama_moe_stream(
 
     // process-wide ggml-cpu choices (with two models in one process the last one set wins); both give the same
     // bits as the defaults. ggml-cpu takes one snapshot of them per graph compute.
-    ggml_cpu_set_mxfp4_kernel(p1.cpu_x4, p1.cpu_x4_pf);
-    ggml_cpu_set_moe_fuse(p1.cpu_fuse ? 1 : 0);
+    llama_cpu_moe_api()->set_mxfp4_kernel(p1.cpu_x4, p1.cpu_x4_pf);
+    llama_cpu_moe_api()->set_moe_fuse(p1.cpu_fuse ? 1 : 0);
     if (p1.cpu_fa == 2) {   // the ik_llama.cpp kernel is not built on this branch - one line, the default kernel
         fprintf(stderr, "llama_moe_stream: --moe-stream-cpu-fa 2 (ik_llama.cpp's kernel) is not built here; using 0 (the default CPU flash attention)\n");
         p1.cpu_fa = 0;
     }
     if (p1.cpu_fuse_small != 0) {
-        ggml_cpu_set_fuse_small(p1.cpu_fuse_small);
+        llama_cpu_moe_api()->set_fuse_small(p1.cpu_fuse_small);
     }
     if (p1.cpu_fa == 1) {
-        ggml_cpu_set_fa_kernel(1);   // (off unless asked: the environment's GGML_CPU_FA_KERNEL stays the test tools' switch)
+        llama_cpu_moe_api()->set_fa_kernel(1);   // (off unless asked: the environment's GGML_CPU_FA_KERNEL stays the test tools' switch)
     }
     if (p1.cpu_iqk > 0) {
-        ggml_cpu_set_iqk(p1.cpu_iqk);   // (off unless asked: the environment's GGML_CPU_IQK stays the test tools' switch)
+        llama_cpu_moe_api()->set_iqk(p1.cpu_iqk);   // (off unless asked: the environment's GGML_CPU_IQK stays the test tools' switch)
     }
     if (p1.cpu_mmid_merge) {
-        ggml_cpu_set_mmid_merge(1);   // (off unless asked: the environment's GGML_CPU_MMID_MERGE stays the test tools' switch)
+        llama_cpu_moe_api()->set_mmid_merge(1);   // (off unless asked: the environment's GGML_CPU_MMID_MERGE stays the test tools' switch)
     }
     if (p1.cpu_q8_tiled) {
-        ggml_cpu_set_q8_tiled(p1.cpu_q8_tiled);   // (off unless asked: the environment's GGML_CPU_Q8_TILED stays the test tools' switch)
+        llama_cpu_moe_api()->set_q8_tiled(p1.cpu_q8_tiled);   // (off unless asked: the environment's GGML_CPU_Q8_TILED stays the test tools' switch)
     }
-    ggml_cpu_set_moe_dispatch(p1.cpu_dispatch ? 1 : 0);
+    llama_cpu_moe_api()->set_moe_dispatch(p1.cpu_dispatch ? 1 : 0);
     if (p1.timing) {
         ggml_prof_enable(1);   // --moe-stream-timing: the host / device / copy / sync timers of ggml's profiler
     }
-    ggml_cpu_set_moe_pieces(p1.cpu_pieces);
-    ggml_cpu_set_moe_conv1(p1.cpu_conv1 ? 1 : 0);
+    llama_cpu_moe_api()->set_moe_pieces(p1.cpu_pieces);
+    llama_cpu_moe_api()->set_moe_conv1(p1.cpu_conv1 ? 1 : 0);
     // GET_ROWS on all threads with --moe-stream-cpu-state-inplace (its conv / extra state rows; the main state
     // row is not copied at all there), the expert pick and CONCAT with --moe-stream-cpu-small-ops; the same bits as off
-    ggml_cpu_set_track((p1.cpu_state_inplace ? GGML_CPU_TRACK_ROWS : 0) |
+    llama_cpu_moe_api()->set_track((p1.cpu_state_inplace ? GGML_CPU_TRACK_ROWS : 0) |
                        (p1.cpu_small_ops ? GGML_CPU_TRACK_PICK | GGML_CPU_TRACK_CAT : 0));
     if (p1.cpu_pieces > 1 || p1.cpu_conv1) {
         fprintf(stderr, "%s: one-token CPU expert steps (the fused gate/up step%s): %d work piece%s per thread and expert, "
@@ -3851,19 +3865,19 @@ llama_moe_stream::~llama_moe_stream() {
     }
     if (p1.cpu_iqk > 0) {   // once per run
         int64_t ik_e = 0, ik_o = 0, ik_r = 0, ik_n = 0;
-        ggml_cpu_get_iqk_counts(&ik_e, &ik_o, &ik_r, &ik_n);
+        llama_cpu_moe_api()->get_iqk_counts(&ik_e, &ik_o, &ik_r, &ik_n);
         fprintf(stderr, "llama_moe_stream: --moe-stream-cpu-iqk %d: experts computed with ik's kernels %lld (%lld rows); experts in those nodes left to the plain path %lld; "
                 "started before their bytes landed %lld (must be 0)\n", p1.cpu_iqk, (long long) ik_e, (long long) ik_r, (long long) ik_o, (long long) ik_n);
     }
     if (p1.cpu_mmid_merge) {   // once per run
         fprintf(stderr, "llama_moe_stream: --moe-stream-cpu-mmid-merge: activation unpacks saved in the tiled MUL_MAT_ID %lld\n",
-                (long long) ggml_cpu_get_mmid_merge_count());
+                (long long) llama_cpu_moe_api()->get_mmid_merge_count());
     }
     if (p1.guess_skip_full) {   // once per run
         fprintf(stderr, "llama_moe_stream: --moe-stream-guess-skip-full: %lld reply words, full layers per word %.2f (max %lld), %lld changes; "
                 "guess rows skipped on the CPU %lld; layers looked at again %lld (%.2f per word), the call start %.1f us per word, "
                 "guesses not handed to the marks %lld%s%s\n", (long long) gsf_words, gsf_words ? (double) gsf_full_sum / gsf_words : 0.0,
-                (long long) gsf_full_max, (long long) gsf_changes, (long long) ggml_cpu_get_guess_skip_rows(), (long long) gsf_rescans,
+                (long long) gsf_full_max, (long long) gsf_changes, (long long) llama_cpu_moe_api()->get_guess_skip_rows(), (long long) gsf_rescans,
                 gsf_words ? (double) gsf_rescans / gsf_words : 0.0, gsf_words ? (double) gsf_t_us / gsf_words : 0.0, (long long) gsf_lag_skipped,
                 gsf_test_check ? "; MOE_STREAM_TEST_GSF_CHECK: 0 differences" : "", gsf_test_rescan ? "; MOE_STREAM_TEST_GSF_RESCAN (every layer, skip-full as built)" : "");
     }
@@ -3874,7 +3888,7 @@ llama_moe_stream::~llama_moe_stream() {
     }
     if (p1.cpu_fuse_small != 0) {   // once per run (the process's CPU graphs)
         int64_t nr = 0, ng = 0, nm = 0;
-        ggml_cpu_get_fuse_small_counts(&nr, &ng, &nm);
+        llama_cpu_moe_api()->get_fuse_small_counts(&nr, &ng, &nm);
         fprintf(stderr, "llama_moe_stream: --moe-stream-cpu-fuse-small %d: fused steps run: router chains %lld, guess chains %lld, same-input matmul runs %lld\n",
                 p1.cpu_fuse_small, (long long) nr, (long long) ng, (long long) nm);
     }
@@ -3927,7 +3941,7 @@ llama_moe_stream::~llama_moe_stream() {
     }
     {   // GGML_MOE_CPU_TIMERS=1 (test only): the CPU expert step's counters, on their own line (no existing line changes)
         char m11[2048];
-        if (ggml_cpu_m11_report(m11, sizeof(m11))) {
+        if (llama_cpu_moe_api()->m11_report(m11, sizeof(m11))) {
             fprintf(stderr, "llama_moe_stream: %s\n", m11);
         }
     }
@@ -4772,7 +4786,7 @@ ggml_tensor * llama_moe_stream::create_pool(int32_t il, const std::string & name
         }
 
         if (cpu_repack || n_repacked_blocks > 0) {
-            ggml_backend_buffer_t rbuf = ggml_backend_cpu_repack_buffer_from_ptr(mem, nbytes);
+            ggml_backend_buffer_t rbuf = llama_cpu_moe_api()->repack_buffer_from_ptr(mem, nbytes);
 
             if (rbuf) {
                 ggml_backend_buffer_init_tensor(rbuf, pool);   // sets pool->extra to the repack traits
@@ -6580,18 +6594,18 @@ void llama_moe_stream::register_pool(void * pool_data, size_t bytes, size_t slic
     // With --moe-stream-proj-ready 1 each projection's pool gets its own flags (proj_ready[pi]); a gate / up pool also
     // learns the down pool's flags, so mul_mat_id can count a projection computed before its expert's down landed
     const bool pr = pr_on && overlap && pi >= 0 && pi < 3;
-    ggml_cpu_moe_slots_register(pool_data, bytes, slice_bytes, n_as,
+    llama_cpu_moe_api()->moe_slots_register(pool_data, bytes, slice_bytes, n_as,
                                 overlap ? (pr ? sl->proj_ready[pi].data() : sl->slot_ready.data()) : nullptr,
                                 &sl->read_failed, moe_slot_error, this,
                                 overlap ? (pr ? sl->proj_ready_us[pi].data() : sl->slot_ready_us.data()) : nullptr);
     if (pr && pi < 2) {
-        ggml_cpu_moe_slots_set_later(pool_data, sl->proj_ready[2].data());
+        llama_cpu_moe_api()->moe_slots_set_later(pool_data, sl->proj_ready[2].data());
     }
     if (overlap && p1.vram_copyback) {   // a wait on a copy-back in flight is booked apart from the SSD wait
-        ggml_cpu_moe_slots_set_cb(pool_data, sl->slot_cb.data(), (int) sl->slot_cb.size());
+        llama_cpu_moe_api()->moe_slots_set_cb(pool_data, sl->slot_cb.data(), (int) sl->slot_cb.size());
     }
     if (p1.cpu_skip_zero) {
-        ggml_cpu_moe_slots_skip_zero(pool_data, n_real);   // slices [n_slots, n_slots + n_zero) are all zeros
+        llama_cpu_moe_api()->moe_slots_skip_zero(pool_data, n_real);   // slices [n_slots, n_slots + n_zero) are all zeros
     }
     if (overlap) {
         sl->ovl_pools.push_back(pool_data);
@@ -6600,7 +6614,7 @@ void llama_moe_stream::register_pool(void * pool_data, size_t bytes, size_t slic
 
 void llama_moe_stream::unregister_pool(void * pool_data) {
     if (overlap || p1.cpu_skip_zero) {
-        ggml_cpu_moe_slots_unregister(pool_data);
+        llama_cpu_moe_api()->moe_slots_unregister(pool_data);
     }
 }
 
@@ -7963,7 +7977,7 @@ void llama_moe_stream::ws_split_issued(ggml_backend_t backend, ggml_cgraph * g) 
         if (!ws_src(V)) {
             continue;   // a streamed layer's guess: its remap op queues it (ne_mark)
         }
-        if (ggml_backend_is_cpu(backend)) {   // (its producer never runs - every one of its guesses would be lost)
+        if (llama_cpu_moe_api()->backend_is_cpu(backend)) {   // (its producer never runs - every one of its guesses would be lost)
             moe_stream_fail("needed-early's GPU producer: word-start source %d's marked guess runs in a CPU split, where nothing writes its slot "
                     "(check -ot / placement: its targets' routers are on the GPU, its guess is not)", V);
         }
@@ -9340,7 +9354,7 @@ bool llama_moe_stream::rd_input_hook(ggml_backend_t split_backend, int n_inputs,
             break;
         }
     }
-    if (mk == nullptr || !(ne_gpu_graph() || ps_ub) || !ggml_backend_is_cpu(split_backend)) {   // or a prompt-split ubatch
+    if (mk == nullptr || !(ne_gpu_graph() || ps_ub) || !llama_cpu_moe_api()->backend_is_cpu(split_backend)) {   // or a prompt-split ubatch
         return false;
     }
     const int32_t il = mk->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1];
@@ -9799,18 +9813,18 @@ void llama_moe_stream::take_overlap_waits(llama_moe_stream_layer & sl) {
     }
     for (const void * p : sl.ovl_pools) {
         if (pr_on) {
-            sl.c().n_pr_early += ggml_cpu_moe_slots_take_early(p);   // (the down pool counts none)
+            sl.c().n_pr_early += llama_cpu_moe_api()->moe_slots_take_early(p);   // (the down pool counts none)
         }
-        const int64_t w_ssd = ggml_cpu_moe_slots_take_wait(p);
+        const int64_t w_ssd = llama_cpu_moe_api()->moe_slots_take_wait(p);
         int64_t w_cb = 0, w_all = 0;
         if (p1.vram_copyback) {
-            ggml_cpu_moe_slots_take_wait_cb(p, &w_cb, &w_all);   // only with the copy-back on
+            llama_cpu_moe_api()->moe_slots_take_wait_cb(p, &w_cb, &w_all);   // only with the copy-back on
         }
         sl.c().t_stall_us    += w_ssd;
         sl.c().t_cb_wait_us  += w_cb;
         sl.c().t_wait_all_us += w_all > 0 ? w_all : w_ssd;
         int64_t ho_sum = 0, ho_n = 0, ho_max = 0;   // the spin-wait hand-off of the call
-        ggml_cpu_moe_slots_take_handoff(p, &ho_sum, &ho_n, &ho_max);
+        llama_cpu_moe_api()->moe_slots_take_handoff(p, &ho_sum, &ho_n, &ho_max);
         sl.c().g12_ho_spin_n   += ho_n;
         sl.c().g12_ho_spin_us  += ho_sum;
         sl.c().g12_ho_spin_max  = std::max(sl.c().g12_ho_spin_max, ho_max);
@@ -14372,11 +14386,11 @@ void llama_moe_stream::print_stats() const {
 
     // Proof that --moe-stream-cpu-fuse reached the CPU op (0 when off, about one per streamed layer per word when on)
     fprintf(stderr, "moe-stream: cpu-x4 %s, cpu-fuse %s, fused gate+up steps %lld\n", p1.cpu_x4 ? "on" : "off",
-            p1.cpu_fuse ? "on" : "off", (long long) ggml_cpu_moe_fuse_count());
+            p1.cpu_fuse ? "on" : "off", (long long) llama_cpu_moe_api()->moe_fuse_count());
     // Proof that --moe-stream-cpu-dispatch reached the CPU op (0 when off; one per streamed layer per decode word
     // for the down matmul, and the gate / up matmuls too when they are not fused)
     fprintf(stderr, "moe-stream: cpu-dispatch %s, one-token split ops %lld\n", p1.cpu_dispatch ? "on" : "off",
-            (long long) ggml_cpu_moe_dispatch_count());
+            (long long) llama_cpu_moe_api()->moe_dispatch_count());
 
     // What the instrumentation is for. The fraction of (layer, word) pairs that had at
     // least one miss is what the design had to assume from a Poisson model; the issue->land window of
@@ -19423,7 +19437,7 @@ void llama_moe_stream::psplit_release_held() {
 // the scheduler's split hook: a layer's CPU split of a prompt-split ubatch has computed - its CPU time per expert measured, its held set
 // released, the next layer's copies waited for and that layer's held set made, all before the next GPU launch
 void llama_moe_stream::psplit_split_end(ggml_backend_t be) {
-    if (psplit_remap_il < 0 || !ggml_backend_is_cpu(be)) {
+    if (psplit_remap_il < 0 || !llama_cpu_moe_api()->backend_is_cpu(be)) {
         return;
     }
     const int32_t il = psplit_remap_il;
@@ -21808,7 +21822,7 @@ void llama_moe_stream::el_move_zero(llama_moe_stream_layer & sl, uint32_t zb) {
     sl.n_slots = zb;
     if (p1.cpu_skip_zero) {
         for (int p = 0; p < 3; p++) {
-            ggml_cpu_moe_slots_skip_zero(sl.weights[p].pool->data, (int) zb);   // the CPU kernels' first zero slice
+            llama_cpu_moe_api()->moe_slots_skip_zero(sl.weights[p].pool->data, (int) zb);   // the CPU kernels' first zero slice
         }
     }
     // (a GPU prompt-wave view covers the start size + the zero slices, wave_view_slots(), and the graphs read no layer's own size; with
@@ -22790,7 +22804,7 @@ void llama_moe_stream::el_low_start(std::unique_lock<std::mutex> & lock) {
         }
         if (p1.cpu_skip_zero) {   // the CPU kernels skip from the start size during the call (no real expert sits higher in it)
             for (int p = 0; p < 3; p++) {
-                ggml_cpu_moe_slots_skip_zero(sl.weights[p].pool->data, (int) n_slots);
+                llama_cpu_moe_api()->moe_slots_skip_zero(sl.weights[p].pool->data, (int) n_slots);
             }
         }
         std::atomic_thread_fence(std::memory_order_release);
@@ -22878,7 +22892,7 @@ void llama_moe_stream::el_low_end() {
         }
         if (p1.cpu_skip_zero) {
             for (int p = 0; p < 3; p++) {
-                ggml_cpu_moe_slots_skip_zero(sl.weights[p].pool->data, (int) sl.n_slots);
+                llama_cpu_moe_api()->moe_slots_skip_zero(sl.weights[p].pool->data, (int) sl.n_slots);
             }
         }
         const uint32_t tz_end = std::min<uint32_t>(sl.n_slots, n_slots + n_expert_used);

@@ -702,6 +702,43 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
         return (void *)ggml_backend_cpu_set_use_ref;
     }
+    if (strcmp(name, "ggml_cpu_moe_api") == 0) {
+        static const ggml_cpu_moe_api api = {
+            /* .size                    = */ sizeof(ggml_cpu_moe_api),
+            /* .set_mxfp4_kernel        = */ ggml_cpu_set_mxfp4_kernel,
+            /* .set_moe_fuse            = */ ggml_cpu_set_moe_fuse,
+            /* .set_q8_tiled            = */ ggml_cpu_set_q8_tiled,
+            /* .set_fa_kernel           = */ ggml_cpu_set_fa_kernel,
+            /* .set_fuse_small          = */ ggml_cpu_set_fuse_small,
+            /* .set_mmid_merge          = */ ggml_cpu_set_mmid_merge,
+            /* .set_iqk                 = */ ggml_cpu_set_iqk,
+            /* .set_moe_dispatch        = */ ggml_cpu_set_moe_dispatch,
+            /* .set_moe_pieces          = */ ggml_cpu_set_moe_pieces,
+            /* .set_moe_conv1           = */ ggml_cpu_set_moe_conv1,
+            /* .set_track               = */ ggml_cpu_set_track,
+            /* .get_mmid_merge_count    = */ ggml_cpu_get_mmid_merge_count,
+            /* .get_iqk_counts          = */ ggml_cpu_get_iqk_counts,
+            /* .get_guess_skip_rows     = */ ggml_cpu_get_guess_skip_rows,
+            /* .get_fuse_small_counts   = */ ggml_cpu_get_fuse_small_counts,
+            /* .moe_fuse_count          = */ ggml_cpu_moe_fuse_count,
+            /* .moe_dispatch_count      = */ ggml_cpu_moe_dispatch_count,
+            /* .m11_report              = */ ggml_cpu_m11_report,
+            /* .gated_delta_net_inplace = */ ggml_cpu_gated_delta_net_inplace,
+            /* .moe_slots_register      = */ ggml_cpu_moe_slots_register,
+            /* .moe_slots_unregister    = */ ggml_cpu_moe_slots_unregister,
+            /* .moe_slots_take_wait     = */ ggml_cpu_moe_slots_take_wait,
+            /* .moe_slots_set_cb        = */ ggml_cpu_moe_slots_set_cb,
+            /* .moe_slots_take_wait_cb  = */ ggml_cpu_moe_slots_take_wait_cb,
+            /* .moe_slots_take_handoff  = */ ggml_cpu_moe_slots_take_handoff,
+            /* .moe_slots_skip_zero     = */ ggml_cpu_moe_slots_skip_zero,
+            /* .moe_slots_set_later     = */ ggml_cpu_moe_slots_set_later,
+            /* .moe_slots_take_early    = */ ggml_cpu_moe_slots_take_early,
+            /* .repack_buffer_from_ptr  = */ ggml_backend_cpu_repack_buffer_from_ptr,
+            /* .get_type_traits_cpu     = */ ggml_get_type_traits_cpu,
+            /* .backend_is_cpu          = */ ggml_backend_is_cpu,
+        };
+        return (void *) const_cast<ggml_cpu_moe_api *>(&api);
+    }
 
     // threadpool - TODO:  move to ggml-base
     if (strcmp(name, "ggml_threadpool_new") == 0) {

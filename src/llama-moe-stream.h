@@ -57,6 +57,10 @@ inline void moe_tt(const char * tag, long long arg = 0) {
 
 bool llama_moe_stream_dev_is_uma(ggml_backend_dev_t dev);
 
+// The CPU backend's MoE entry table (ggml-cpu.h, struct ggml_cpu_moe_api), found once through the "CPU" registry: the engine
+// never links to ggml-cpu, so it also runs when the CPU backend is a module picked at start for the CPU's level
+const ggml_cpu_moe_api * llama_cpu_moe_api();
+
 // SSD streaming of MoE routed expert weights
 //
 // Streamed layers do not materialize their ffn_{gate,up,down}_exps tensors: the routed experts
@@ -3195,7 +3199,7 @@ struct llama_moe_stream {
     // x / 2^n gives the same integers and a block scale 2^n smaller, all exact, and the output times 2^n is the same float - the scale
     // is exactly 2^n while expf(n ln2) is (n <= 12 with glibc: every row's max |x| <= 2^22). A q8_0 down (fp16 block scale) keeps it.
     bool down_scale_skip(ggml_type down_type, int64_t n_rows, bool gpu_wave, bool op_offload) const {
-        if (uma_gpu_pool || !p1.cpu_down_scale || ggml_get_type_traits_cpu(down_type)->vec_dot_type != GGML_TYPE_Q8_K) {
+        if (uma_gpu_pool || !p1.cpu_down_scale || llama_cpu_moe_api()->get_type_traits_cpu(down_type)->vec_dot_type != GGML_TYPE_Q8_K) {
             return false;
         }
         if (!el_has_gpu) {

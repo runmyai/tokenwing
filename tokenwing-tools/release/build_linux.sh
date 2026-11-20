@@ -50,7 +50,6 @@ CMAKE_ARGS=(
   -DGGML_NATIVE=OFF
   -DBUILD_SHARED_LIBS=ON
   -DGGML_BACKEND_DL=ON
-  -DGGML_CPU_ALL_VARIANTS=ON
   -DGGML_CUDA_NCCL=OFF
   -DLLAMA_BUILD_TESTS=OFF
   -DLLAMA_BUILD_EXAMPLES=OFF
@@ -63,6 +62,10 @@ CMAKE_ARGS=(
   '-DCMAKE_INSTALL_RPATH=$ORIGIN:$ORIGIN/..'
   -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
 )
+
+# every x86 CPU level as its own module (AVX-512 machines get their kernels); ARM64 keeps one CPU build: the ARM levels need
+# a compiler newer than the one this release is built with (Ubuntu 22.04, so the engine runs on older Linux too)
+[ "$(uname -m)" = x86_64 ] && CMAKE_ARGS+=(-DGGML_CPU_ALL_VARIANTS=ON)
 
 case "$BACKEND" in
   cpu)
@@ -105,7 +108,7 @@ if [ "$BACKEND" = cuda ]; then
   cp -a "$CUDA_LIB"/libcudart.so* "$CUDA_LIB"/libcublas.so* "$CUDA_LIB"/libcublasLt.so* "$STAGE/"
 fi
 chmod +x "$STAGE/llama-server" "$STAGE/autotuner"
-ls "$STAGE"/libggml-cpu-*.so >/dev/null || { echo "No CPU modules in the archive" >&2; exit 1; }
+ls "$STAGE"/libggml-cpu*.so >/dev/null || { echo "No CPU module in the archive" >&2; exit 1; }
 
 echo "=== Binary inspection ($VARIANT) ==="
 file "$STAGE/llama-server" "$STAGE/autotuner"

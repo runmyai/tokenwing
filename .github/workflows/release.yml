@@ -132,7 +132,7 @@ jobs:
       - name: Setup Vulkan SDK 1.4.363.1 (Linux)
         if: matrix.backend == 'vulkan'
         run: |
-          sudo apt-get install -y --no-install-recommends libvulkan1
+          sudo apt-get install -y --no-install-recommends libvulkan1 libvulkan-dev
           curl -fsSL -o /tmp/vulkansdk.tar.xz \
             https://sdk.lunarg.com/sdk/download/1.4.363.1/linux/vulkansdk-linux-x86_64-1.4.363.1.tar.xz
           mkdir -p /tmp/vulkansdk
@@ -168,6 +168,7 @@ jobs:
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
                 ca-certificates cmake curl file git ninja-build pkg-config python3 xz-utils ${EXTRA_APT}
+              git config --global --add safe.directory /src
               ./tokenwing-tools/release/build_linux.sh \
                 --variant '${{ matrix.variant }}' \
                 --backend '${{ matrix.backend }}' \

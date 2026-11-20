@@ -203,7 +203,8 @@ def stage_dlls(
         assert cuda_root is not None
         major = "12" if backend == "cuda12" else "13"
         for name in (f"cudart64_{major}.dll", f"cublas64_{major}.dll", f"cublasLt64_{major}.dll"):
-            matches = sorted((cuda_root / "bin").rglob(name))
+            # a full CUDA 13 toolkit holds both bin\x64 and bin\arm64; the CUDA packages are x64
+            matches = sorted(p for p in (cuda_root / "bin").rglob(name) if "arm64" not in p.parts)
             if not matches:
                 raise FileNotFoundError(f"Missing {name} under {cuda_root / 'bin'}")
             shutil.copy2(matches[0], stage / name)

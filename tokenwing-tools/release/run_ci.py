@@ -66,6 +66,9 @@ def main() -> int:
             "-DBUILD_SHARED_LIBS=OFF",
             "-DGGML_CUDA_NCCL=OFF",
             "-DLLAMA_OPENSSL=OFF",
+            # the tests need no web page (the release builds embed it)
+            "-DLLAMA_BUILD_UI=OFF",
+            "-DLLAMA_USE_PREBUILT_UI=OFF",
             "-DLLAMA_BUILD_TESTS=ON",
             "-DLLAMA_BUILD_SERVER=ON",
             "-DLLAMA_BUILD_TOOLS=ON",

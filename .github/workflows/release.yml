@@ -27,9 +27,41 @@ concurrency:
 permissions:
   contents: write
 
+env:
+  # a tiny model for the release check (a 32-token reply from every package that can run here)
+  SMOKE_MODEL_URL: https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf
+
 jobs:
+  ui:
+    name: web page
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build the web page once for every package
+        working-directory: tools/ui
+        run: |
+          npm ci
+          npm run build
+          test -f dist/index.html
+          grep -q TokenWing dist/manifest.webmanifest
+
+      - name: Upload the web page
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: tools/ui/dist
+          if-no-files-found: error
+
   build-linux:
     name: ${{ matrix.variant }}
+    needs: ui
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -44,12 +76,12 @@ jobs:
             os: ubuntu-22.04
             backend: cuda
             image: nvidia/cuda:12.8.1-devel-ubuntu22.04
-            smoke: ''
+            smoke: '--smoke'
           - variant: tokenwing-linux-x64-cuda13
             os: ubuntu-22.04
             backend: cuda
             image: nvidia/cuda:13.4.1-devel-ubuntu22.04
-            smoke: ''
+            smoke: '--smoke'
           - variant: tokenwing-linux-x64-rocm
             os: ubuntu-22.04
             backend: rocm
@@ -59,7 +91,7 @@ jobs:
             os: ubuntu-22.04
             backend: vulkan
             image: ''
-            smoke: ''
+            smoke: '--smoke'
           - variant: tokenwing-linux-arm64-cpu
             os: ubuntu-22.04-arm
             backend: cpu
@@ -69,11 +101,22 @@ jobs:
             os: ubuntu-22.04-arm
             backend: cuda
             image: nvidia/cuda:13.4.1-devel-ubuntu22.04
-            smoke: ''
+            smoke: '--smoke'
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Download the web page
+        uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: tools/ui/dist
+
+      - name: Download the release-check model
+        run: |
+          mkdir -p smoke
+          curl -fsSL -o smoke/model.gguf "$SMOKE_MODEL_URL"
 
       - name: Reclaim runner disk space for container build
         if: matrix.image != ''
@@ -84,7 +127,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential ca-certificates cmake curl file ninja-build pkg-config xz-utils
+            build-essential ca-certificates cmake curl file git ninja-build pkg-config python3 xz-utils
 
       - name: Setup Vulkan SDK 1.4.363.1 (Linux)
         if: matrix.backend == 'vulkan'
@@ -101,6 +144,8 @@ jobs:
 
       - name: Build native Linux release archive
         if: matrix.image == ''
+        env:
+          SMOKE_MODEL: ${{ github.workspace }}/smoke/model.gguf
         run: >-
           ./tokenwing-tools/release/build_linux.sh
           --variant "${{ matrix.variant }}"
@@ -116,12 +161,13 @@ jobs:
           docker run --rm \
             -v "${{ github.workspace }}:/src" \
             -w /src \
+            -e SMOKE_MODEL=/src/smoke/model.gguf \
             "${{ matrix.image }}" \
             bash -lc "
               set -euo pipefail
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                ca-certificates cmake curl file ninja-build pkg-config xz-utils ${EXTRA_APT}
+                ca-certificates cmake curl file git ninja-build pkg-config python3 xz-utils ${EXTRA_APT}
               ./tokenwing-tools/release/build_linux.sh \
                 --variant '${{ matrix.variant }}' \
                 --backend '${{ matrix.backend }}' \
@@ -138,6 +184,7 @@ jobs:
 
   build-windows:
     name: ${{ matrix.variant }}
+    needs: ui
     runs-on: windows-2022
     strategy:
       fail-fast: false
@@ -150,19 +197,19 @@ jobs:
           - variant: tokenwing-windows-x64-cuda12
             backend: cuda12
             cuda_version: '12.8.1'
-            smoke: ''
+            smoke: '--smoke'
           - variant: tokenwing-windows-x64-cuda13
             backend: cuda13
             cuda_version: '13.4.1'
-            smoke: ''
+            smoke: '--smoke'
           - variant: tokenwing-windows-x64-vulkan
             backend: vulkan
             cuda_version: ''
-            smoke: ''
+            smoke: '--smoke'
           - variant: tokenwing-windows-x64-hip
             backend: hip
             cuda_version: ''
-            smoke: ''
+            smoke: '--smoke'
           - variant: tokenwing-windows-arm64-cpu
             backend: arm64-cpu
             cuda_version: ''
@@ -176,6 +223,17 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      - name: Download the web page
+        uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: tools/ui/dist
+
+      - name: Download the release-check model
+        run: |
+          New-Item -ItemType Directory -Force smoke | Out-Null
+          Invoke-WebRequest -Uri $env:SMOKE_MODEL_URL -OutFile smoke/model.gguf
 
       - name: Ensure Ninja is installed
         run: |
@@ -225,6 +283,8 @@ jobs:
           Remove-Item -Force $zip -ErrorAction SilentlyContinue
 
       - name: Build and package Windows release archive
+        env:
+          SMOKE_MODEL: ${{ github.workspace }}\smoke\model.gguf
         run: |
           $extra = @()
           if ("${{ matrix.backend }}" -like "cuda*") {
@@ -260,7 +320,7 @@ jobs:
       - name: Download all 13 release artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: dist-*
+          pattern: dist-tokenwing-*
           merge-multiple: true
           path: release-assets
 

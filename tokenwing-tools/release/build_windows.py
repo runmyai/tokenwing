@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Builds and packages Windows release archives for TokenWing (llama-server + autotuner)."""
+"""Builds and packages Windows release archives for TokenWing (llama-server + autotuner).
+
+x64 archives carry the CPU code for every CPU level (picked at start), HTTPS built in (BoringSSL) and our web page, built once
+by the workflow into tools/ui/dist (a build without it fails). --smoke starts the packed server from its own folder, checks
+the page and writes a short reply with the model in SMOKE_MODEL."""
 
 from __future__ import annotations
 
@@ -195,7 +199,7 @@ def stage_dlls(
     if backend in ("cuda12", "cuda13"):
         assert cuda_root is not None
         major = "12" if backend == "cuda12" else "13"
-        for name in (f"cublas64_{major}.dll", f"cublasLt64_{major}.dll"):
+        for name in (f"cudart64_{major}.dll", f"cublas64_{major}.dll", f"cublasLt64_{major}.dll"):
             matches = sorted((cuda_root / "bin").rglob(name))
             if not matches:
                 raise FileNotFoundError(f"Missing {name} under {cuda_root / 'bin'}")
@@ -225,7 +229,6 @@ def main() -> int:
     parser.add_argument("--cuda-root", type=Path, default=None)
     parser.add_argument("--vulkan-sdk", type=Path, default=None)
     parser.add_argument("--mingw-root", type=Path, default=None)
-    parser.add_argument("--prebuilt-ui", default="ON", choices=("ON", "OFF"))
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--check-env", action="store_true")
     args = parser.parse_args()
@@ -242,21 +245,27 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix=f"tw-{args.variant}-") as tmp:
         work = Path(tmp)
         bld = work / "build"
+        if not (repo / "tools" / "ui" / "dist" / "index.html").is_file():
+            raise FileNotFoundError("No web page in tools/ui/dist: build it first (npm ci && npm run build in tools/ui)")
+        # every CPU level as a module loaded at start; the ARM64 cross build stays one static program
+        modules = args.backend != "arm64-cpu"
         cmake_args = [
             f'-S "{repo.as_posix()}"',
             f'-B "{bld.as_posix()}"',
             "-G Ninja",
             "-DCMAKE_BUILD_TYPE=Release",
             "-DGGML_NATIVE=OFF",
-            "-DBUILD_SHARED_LIBS=OFF",
+            "-DBUILD_SHARED_LIBS=ON" if modules else "-DBUILD_SHARED_LIBS=OFF",
+            *(["-DGGML_BACKEND_DL=ON", "-DGGML_CPU_ALL_VARIANTS=ON"] if modules else []),
             "-DGGML_CUDA_NCCL=OFF",
             "-DLLAMA_BUILD_TESTS=OFF",
             "-DLLAMA_BUILD_EXAMPLES=OFF",
             "-DLLAMA_BUILD_APP=OFF",
             "-DLLAMA_BUILD_SERVER=ON",
             "-DLLAMA_BUILD_TOOLS=ON",
-            "-DLLAMA_OPENSSL=OFF",
-            f"-DLLAMA_USE_PREBUILT_UI={args.prebuilt_ui}",
+            "-DLLAMA_BUILD_BORINGSSL=ON",
+            "-DLLAMA_BUILD_UI=ON",
+            "-DLLAMA_USE_PREBUILT_UI=OFF",
         ]
         extra_env: dict[str, str] = {}
         rocm_dirs: list[Path] = []
@@ -264,13 +273,12 @@ def main() -> int:
         vcvarsall = None if vs_dir is None else vs_dir / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"
 
         if args.backend == "cpu":
-            cmake_args.append("-DGGML_STATIC=ON")
+            pass
         elif args.backend in ("cuda12", "cuda13"):
             if not args.cuda_root:
                 raise ValueError("--cuda-root is required for CUDA builds")
             cr = args.cuda_root.resolve()
             cmake_args.extend([
-                "-DGGML_STATIC=ON",
                 "-DGGML_CUDA=ON",
                 f'-DCMAKE_CUDA_COMPILER="{(cr / "bin" / "nvcc.exe").as_posix()}"',
                 f'-DCUDAToolkit_ROOT="{cr.as_posix()}"',
@@ -283,14 +291,13 @@ def main() -> int:
             vk = (args.vulkan_sdk or Path(os.environ.get("VULKAN_SDK", ""))).resolve()
             if not vk.is_dir():
                 raise ValueError("Valid --vulkan-sdk or VULKAN_SDK env var is required")
-            cmake_args.extend(["-DGGML_STATIC=ON", "-DGGML_VULKAN=ON"])
+            cmake_args.append("-DGGML_VULKAN=ON")
             extra_env["VULKAN_SDK"] = str(vk)
             extra_env["PATH"] = f"{vk / 'Bin'}{os.pathsep}{os.environ.get('PATH', '')}"
         elif args.backend == "hip":
             root, cmake_dir, clang_c, clang_cxx, rocm_dirs = find_rocm_paths()
             targets = os.environ.get("AMDGPU_TARGETS", ROCM_ARCH_DEFAULT)
             cmake_args.extend([
-                "-DGGML_STATIC=OFF",
                 "-DGGML_HIP=ON",
                 f'-DAMDGPU_TARGETS="{targets}"',
                 f'-DGPU_TARGETS="{targets}"',
@@ -317,7 +324,8 @@ def main() -> int:
         run_in_env(
             vcvarsall,
             "x64",
-            [f"cmake {' '.join(cmake_args)}", f'cmake --build "{bld.as_posix()}" -j {jobs} --target llama-server autotuner'],
+            # every target: the backend modules are loaded at start, so no target needs them
+            [f"cmake {' '.join(cmake_args)}", f'cmake --build "{bld.as_posix()}" -j {jobs}'],
             work,
             extra_env,
         )
@@ -334,9 +342,16 @@ def main() -> int:
         for pe in [*stage.glob("*.exe"), *stage.glob("*.dll")]:
             verify_pe_machine(pe, arch)
 
-        if args.smoke and args.backend in ("cpu",):
+        if modules and not any(stage.glob("ggml-cpu-*.dll")):
+            raise FileNotFoundError("No CPU modules in the archive")
+        if args.smoke:
             subprocess.run([str(stage / "llama-server.exe"), "--version"], check=True)
             subprocess.run([str(stage / "autotuner.exe"), "--self-test"], check=True)
+            model = os.environ.get("SMOKE_MODEL")
+            if not model:
+                raise ValueError("SMOKE_MODEL (a small GGUF) is needed for --smoke")
+            subprocess.run([sys.executable, str(Path(__file__).with_name("smoke.py")), str(stage / "llama-server.exe"), model],
+                           check=True)
 
         zip_path = out_dir / f"{args.variant}.zip"
         build_zip(stage_parent, zip_path)

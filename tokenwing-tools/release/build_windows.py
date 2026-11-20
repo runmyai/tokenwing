@@ -196,7 +196,7 @@ def stage_dlls(
         return
 
     assert vs_dir is not None
-    for dll in collect_vc_redist_dlls(vs_dir, include_omp=(backend != "hip")):
+    for dll in collect_vc_redist_dlls(vs_dir, include_omp=True):
         shutil.copy2(dll, stage / dll.name)
 
     if backend in ("cuda12", "cuda13"):
@@ -241,7 +241,7 @@ def main() -> int:
     arch = "arm64" if args.backend == "arm64-cpu" else "x64"
     vs_dir = None if args.backend == "arm64-cpu" else find_vs_installation()
     if args.check_env:
-        dlls = [] if vs_dir is None else [d.name for d in collect_vc_redist_dlls(vs_dir, include_omp=(args.backend != "hip"))]
+        dlls = [] if vs_dir is None else [d.name for d in collect_vc_redist_dlls(vs_dir, include_omp=True)]
         print(f"variant={args.variant} backend={args.backend} arch={arch} vs={vs_dir} vc_dlls={dlls}")
         return 0
 
@@ -298,18 +298,10 @@ def main() -> int:
             extra_env["VULKAN_SDK"] = str(vk)
             extra_env["PATH"] = f"{vk / 'Bin'}{os.pathsep}{os.environ.get('PATH', '')}"
         elif args.backend == "hip":
-            root, cmake_dir, clang_c, clang_cxx, rocm_dirs = find_rocm_paths()
-            targets = os.environ.get("AMDGPU_TARGETS", ROCM_ARCH_DEFAULT)
-            cmake_args.extend([
-                "-DGGML_HIP=ON",
-                f'-DAMDGPU_TARGETS="{targets}"',
-                f'-DGPU_TARGETS="{targets}"',
-                f'-DCMAKE_C_COMPILER="{clang_c.as_posix()}"',
-                f'-DCMAKE_CXX_COMPILER="{clang_cxx.as_posix()}"',
-                f'-DCMAKE_PREFIX_PATH="{root.as_posix()};{cmake_dir.as_posix()};{(root / "lib" / "llvm").as_posix()}"',
-            ])
-            extra_env["HIP_PATH"] = str(root)
-            extra_env["PATH"] = os.pathsep.join([str(d) for d in rocm_dirs] + [os.environ.get("PATH", "")])
+            # as llama.cpp's own Windows releases: the server, the autotuner and the CPU modules are built with Microsoft's
+            # compiler (this build), and only the GPU module ggml-hip.dll with AMD's clang (the second build below); the
+            # modules talk through ggml's C interface, so they work together
+            pass
         elif args.backend == "arm64-cpu":
             if not args.mingw_root:
                 raise ValueError("--mingw-root is required for arm64-cpu builds")
@@ -333,10 +325,34 @@ def main() -> int:
             extra_env,
         )
 
+        hip_dll = None
+        if args.backend == "hip":
+            root, cmake_dir, clang_c, clang_cxx, rocm_dirs = find_rocm_paths()
+            bld_hip = work / "build-hip"
+            hip_args = [
+                f'-S "{repo.as_posix()}"', f'-B "{bld_hip.as_posix()}"', "-G Ninja", "-DCMAKE_BUILD_TYPE=Release",
+                "-DGGML_NATIVE=OFF", "-DBUILD_SHARED_LIBS=ON", "-DGGML_BACKEND_DL=ON", "-DGGML_CPU=OFF", "-DGGML_HIP=ON",
+                "-DLLAMA_BUILD_TESTS=OFF", "-DLLAMA_BUILD_EXAMPLES=OFF", "-DLLAMA_BUILD_TOOLS=OFF", "-DLLAMA_BUILD_SERVER=OFF",
+                "-DLLAMA_BUILD_UI=OFF", "-DLLAMA_OPENSSL=OFF",
+                f'-DAMDGPU_TARGETS="{rocm_targets}"', f'-DGPU_TARGETS="{rocm_targets}"',
+                f'-DCMAKE_C_COMPILER="{clang_c.as_posix()}"', f'-DCMAKE_CXX_COMPILER="{clang_cxx.as_posix()}"',
+                f'-DCMAKE_PREFIX_PATH="{root.as_posix()};{cmake_dir.as_posix()};{(root / "lib" / "llvm").as_posix()}"',
+                # the GPU code's compile ignores Windows' dllimport on every declaration: one warning each, millions in all
+                '"-DCMAKE_HIP_FLAGS=-Wno-ignored-attributes"',
+            ]
+            hip_env = {"HIP_PATH": str(root), "PATH": os.pathsep.join([str(d) for d in rocm_dirs] + [os.environ.get("PATH", "")])}
+            run_in_env(vcvarsall, "x64", [f"cmake {' '.join(hip_args)}", f'cmake --build "{bld_hip.as_posix()}" -j {jobs} --target ggml-hip'],
+                       work, hip_env)
+            hip_dll = bld_hip / "bin" / "ggml-hip.dll"
+            if not hip_dll.is_file():
+                raise FileNotFoundError(f"The AMD build made no {hip_dll}")
+
         stage_parent = work / "stage"
         stage = stage_parent / "tokenwing"
         stage.mkdir(parents=True)
         build_bin = bld / "bin"
+        if hip_dll is not None:
+            shutil.copy2(hip_dll, stage / hip_dll.name)
         shutil.copy2(build_bin / "llama-server.exe", stage / "llama-server.exe")
         shutil.copy2(build_bin / "autotuner.exe", stage / "autotuner.exe")
         stage_dlls(args.backend, stage, build_bin, vs_dir, args.cuda_root, args.mingw_root, rocm_dirs, rocm_targets)

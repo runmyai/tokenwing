@@ -82,6 +82,11 @@ if (WIN32)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
 
+if (MINGW)
+    # Windows 10 is the oldest Windows supported; MinGW headers hide newer calls (e.g. FILE_STORAGE_INFO) below it
+    add_compile_definitions(_WIN32_WINNT=0x0A00)
+endif()
+
 if (MSVC)
     add_compile_options("$<$<COMPILE_LANGUAGE:C>:/utf-8>")
     add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/utf-8>")

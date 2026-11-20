@@ -353,9 +353,43 @@ jobs:
           assert any(n.startswith("tokenwing/rocblas/library/") for n in names), "Missing rocblas/library in Windows HIP zip"
           assert any(n.startswith("tokenwing/hipblaslt/library/gfx1201/") for n in names), "Missing hipblaslt/library/gfx1201 in Windows HIP zip"
           '
-          sha256sum "${expected[@]}" > SHA256SUMS
+
+      - name: Engine file list, and the files Hugging Face does not have yet
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          python3 -m pip install --no-cache-dir huggingface_hub
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then TAG="${GITHUB_REF_NAME}"; else TAG="${INPUT_TAG:-trial-${GITHUB_SHA::9}}"; fi
+          # the files are uploaded for a real release and for the trial branch (they are named by their SHA-256, so an
+          # upload never changes a file another release uses)
+          up=()
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] || [ "${{ inputs.publish }}" = "true" ] || [ "${GITHUB_REF_NAME}" = "release-trial" ]; then
+            up=(--upload runmyai/tokenwing-files)
+          fi
+          python3 tokenwing-tools/release/engine_files.py release-assets "$TAG" "${up[@]}"
+
+      - name: SHA256SUMS, signed
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          cd release-assets
+          sha256sum tokenwing-*.tar.gz tokenwing-*.zip engine-files.json > SHA256SUMS
           sha256sum -c SHA256SUMS
           cat SHA256SUMS
+          # the app trusts a checksum only when this signature verifies against the public key built into it
+          umask 077
+          printf '%s\n' "$UPDATE_SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
+          openssl pkeyutl -sign -inkey "$RUNNER_TEMP/key.pem" -rawin -in SHA256SUMS -out "$RUNNER_TEMP/sig.bin"
+          rm -f "$RUNNER_TEMP/key.pem"
+          base64 -w0 "$RUNNER_TEMP/sig.bin" > SHA256SUMS.sig
+          cat > "$RUNNER_TEMP/pub.pem" <<'KEY'
+          -----BEGIN PUBLIC KEY-----
+          MCowBQYDK2VwAyEAlShWZZ8GZEQ/xfNza+uGHveSCMOtk+utSJBiE5TyKTw=
+          -----END PUBLIC KEY-----
+          KEY
+          sed -i 's/^ *//' "$RUNNER_TEMP/pub.pem"
+          openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/pub.pem" -rawin -in SHA256SUMS -sigfile "$RUNNER_TEMP/sig.bin"
 
       - name: Upload combined release bundle
         uses: actions/upload-artifact@v4

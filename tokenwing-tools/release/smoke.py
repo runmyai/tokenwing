@@ -8,6 +8,7 @@ a backend that fails on the first request) fails here, not on a user's machine.
 
 import gzip
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -26,7 +27,8 @@ def main() -> int:
     port = free_port()
     log = open("smoke-server.log", "w")
     proc = subprocess.Popen([server, "-m", model, "-c", "512", "-ngl", "0", "--host", "127.0.0.1", "--port", str(port),
-                             "--no-stats"], stdout=log, stderr=subprocess.STDOUT)
+                             "--no-stats"], stdout=log, stderr=subprocess.STDOUT,
+                            env=dict(os.environ, TOKENWING_NO_UPDATE_CHECK="1"))   # a build check is not a user: not counted
     base = f"http://127.0.0.1:{port}"
     try:
         for _ in range(240):

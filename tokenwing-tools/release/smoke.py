@@ -6,6 +6,7 @@ a backend that fails on the first request) fails here, not on a user's machine.
     python3 smoke.py <path to llama-server> <small model .gguf>
 """
 
+import gzip
 import json
 import socket
 import subprocess
@@ -38,7 +39,10 @@ def main() -> int:
                 time.sleep(0.5)
         else:
             raise RuntimeError("the server did not answer /health within 120 s")
-        manifest = urllib.request.urlopen(base + "/manifest.webmanifest", timeout=10).read().decode("utf-8", "replace")
+        # the page's files are stored compressed and sent to clients that accept that, as browsers do
+        req = urllib.request.Request(base + "/manifest.webmanifest", headers={"Accept-Encoding": "gzip"})
+        raw = urllib.request.urlopen(req, timeout=10).read()
+        manifest = (gzip.decompress(raw) if raw[:2] == b"\x1f\x8b" else raw).decode("utf-8", "replace")
         if "TokenWing" not in manifest:
             raise RuntimeError("the server does not carry our web page")
         body = json.dumps({"prompt": "Once upon a time", "n_predict": 32, "temperature": 0, "ignore_eos": True}).encode()

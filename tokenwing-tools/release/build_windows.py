@@ -182,6 +182,9 @@ def stage_dlls(
     rocm_targets: str = ROCM_ARCH_DEFAULT,
 ) -> None:
     for built_dll in sorted(build_bin.glob("*.dll")):
+        # only the server and the autotuner are shipped: the other tools' libraries stay out
+        if re.fullmatch(r"llama-.*-impl\.dll", built_dll.name) and built_dll.name != "llama-server-impl.dll":
+            continue
         shutil.copy2(built_dll, stage / built_dll.name)
 
     if backend == "arm64-cpu":

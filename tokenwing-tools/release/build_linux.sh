@@ -97,6 +97,8 @@ mkdir -p "$STAGE"
 cp -f "$WORK_DIR/build/bin/llama-server" "$STAGE/"
 cp -f "$WORK_DIR/build/bin/autotuner" "$STAGE/"
 cp -a "$WORK_DIR/build/bin/"*.so* "$STAGE/"
+# only the server and the autotuner are shipped: the other tools' libraries stay out
+find "$STAGE" -name 'libllama-*-impl.so*' ! -name 'libllama-server-impl.so*' -delete
 if [ "$BACKEND" = cuda ]; then
   # the CUDA runtime and cuBLAS the CUDA module needs (the user's driver supplies the rest)
   CUDA_LIB="${CUDA_HOME:-/usr/local/cuda}/lib64"

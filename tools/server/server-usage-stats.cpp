@@ -7,6 +7,7 @@
 #include "ggml-backend.h"
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
@@ -38,6 +39,8 @@ namespace fs = std::filesystem;
 static const char * STATS_URL = "https://firestore.googleapis.com/v1/projects/run-my-ai-5876c/databases/(default)/"
                                 "documents:commit?key=AIzaSyDN01Y9bvnKceKI0wbmnsexVyOdC5M1JBU";
 static const char * STATS_DOC = "projects/run-my-ai-5876c/databases/(default)/documents/engineStats/";
+// The website's update check: it counts one check (engine version and system) and answers with the release list.
+static const char * CHECK_URL = "https://runmyai.org/api/releases";
 
 //
 // OS functions: one small function per question, each OS with its own version
@@ -158,6 +161,24 @@ static std::string os_cpu_name() {
     }
     struct utsname u;
     return uname(&u) == 0 ? std::string(u.machine) : std::string("unknown");
+#endif
+}
+
+// The system and processor kind in the app's words, e.g. "linux-x64".
+static std::string os_kind() {
+#if defined(_WIN32)
+    std::string os = "windows";
+#elif defined(__APPLE__)
+    std::string os = "macos";
+#else
+    std::string os = "linux";
+#endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return os + "-arm64";
+#elif defined(__x86_64__) || defined(_M_X64)
+    return os + "-x64";
+#else
+    return os + "-other";
 #endif
 }
 
@@ -337,29 +358,100 @@ static void send_record(const std::shared_ptr<usage_stats_state> & st, const std
     }
 }
 
+static std::string url_escape(const std::string & s) {
+    static const char * hex = "0123456789ABCDEF";
+    std::string out;
+    for (unsigned char c : s) {
+        if (isalnum(c) || c == '-' || c == '.' || c == '_' || c == '~') {
+            out += (char) c;
+        } else {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 15];
+        }
+    }
+    return out;
+}
+
+// Asks the website's update check once a day, which counts this engine (its version and system, nothing that tells one
+// PC from another). Only for an engine started by hand: the app makes its own check. The answer is not used.
+static void send_update_check(const std::shared_ptr<usage_stats_state> & st) {
+    const fs::path dir = os_state_dir();
+    if (dir.empty()) {
+        throw std::runtime_error("no state folder");
+    }
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    const std::string day = os_utc_day();
+    const fs::path day_file = dir / "update-check-day";
+    if (read_first_line(day_file) == day) {
+        return;
+    }
+    const std::string version = cut(std::string(llama_version()) + " " + llama_commit(), 40);
+
+    // test only: ask another address (plain http allowed)
+    std::string url = env_str("TOKENWING_UPDATE_URL");
+    if (url.empty()) {
+        url = CHECK_URL;
+    }
+    auto [cli, parts] = common_http_client(url);
+    cli.set_follow_location(false); // the count is made before the redirect; the list it leads to is not needed
+    cli.set_connection_timeout(10, 0);
+    cli.set_read_timeout(20, 0);
+    cli.set_max_timeout(20000);
+    {
+        std::lock_guard<std::mutex> lock(st->mutex);
+        if (st->stopping) {
+            return;
+        }
+        st->client = &cli;
+    }
+    auto res = cli.Get(parts.path + "?repo=tokenwing&v=" + url_escape(version) + "&os=" + url_escape(os_kind()));
+    {
+        std::lock_guard<std::mutex> lock(st->mutex);
+        st->client = nullptr;
+    }
+    if (!res) {
+        throw std::runtime_error("request failed: " + httplib::to_string(res.error()));
+    }
+    // the website counts, then sends the asker on to the list (302); the list itself is not needed
+    if (res->status != 302 && res->status != 200) {
+        throw std::runtime_error("HTTP " + std::to_string(res->status));
+    }
+    write_file(day_file, day);
+    if (!st->stopping) {
+        SRV_DBG("update check: done for %s\n", day.c_str());
+    }
+}
+
 void server_usage_stats_start(const common_params & params) {
     auto off = [](const char * name) {
         std::string v = env_str(name);
         return !v.empty() && v != "0";
     };
-    if (!params.usage_stats || off("TOKENWING_NO_STATS") || env_str("DO_NOT_TRACK") == "1" || g_state) {
+    if (g_state) {
         return;
     }
-#if !defined(CPPHTTPLIB_OPENSSL_SUPPORT)
-    // a build without HTTPS cannot reach the database; only the test address can be plain http
-    if (env_str("TOKENWING_STATS_URL").rfind("http://", 0) != 0) {
-        return;
-    }
-#endif
-
     std::string launcher = env_str("TOKENWING_LAUNCHER");
     if (launcher.empty() || launcher.size() > 32 || !all_of_chars(launcher, "abcdefghijklmnopqrstuvwxyz0123456789-")) {
         launcher = "direct";
     }
+    const bool dnt = env_str("DO_NOT_TRACK") == "1";
+    bool stats = params.usage_stats && !off("TOKENWING_NO_STATS") && !dnt;
+    // --no-stats leaves the update check on, as in the app; it has its own switch
+    bool check = launcher == "direct" && !off("TOKENWING_NO_UPDATE_CHECK") && !dnt;
+#if !defined(CPPHTTPLIB_OPENSSL_SUPPORT)
+    // a build without HTTPS cannot reach the database or the website; only the test addresses can be plain http
+    stats = stats && env_str("TOKENWING_STATS_URL").rfind("http://", 0) == 0;
+    check = check && env_str("TOKENWING_UPDATE_URL").rfind("http://", 0) == 0;
+#endif
+    if (!stats && !check) {
+        return;
+    }
 
     // read the device list here: the backends are freed on the main thread at exit
     std::vector<std::string> gpus;
-    for (size_t i = 0; i < ggml_backend_dev_count() && gpus.size() < 8; i++) {
+    for (size_t i = 0; stats && i < ggml_backend_dev_count() && gpus.size() < 8; i++) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         auto type = ggml_backend_dev_type(dev);
         if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -368,19 +460,37 @@ void server_usage_stats_start(const common_params & params) {
         }
     }
 
-    SRV_INF("%s", "usage stats: one anonymous record a day (engine version, OS, CPU and GPU names); "
-                  "--no-stats or TOKENWING_NO_STATS=1 turns it off\n");
+    if (stats) {
+        SRV_INF("%s", "usage stats: one anonymous record a day (engine version, OS, CPU and GPU names); "
+                      "--no-stats or TOKENWING_NO_STATS=1 turns it off\n");
+    }
+    if (check) {
+        SRV_INF("%s", "update check: once a day the engine asks runmyai.org for the newest release (sends the engine "
+                      "version and system); TOKENWING_NO_UPDATE_CHECK=1 turns it off\n");
+    }
 
     g_state = std::make_shared<usage_stats_state>();
     try {
-        std::thread([st = g_state, launcher, gpus]() {
-            try {
-                send_record(st, launcher, gpus);
-            } catch (const std::exception & e) {
-                if (!st->stopping) {
-                    SRV_DBG("usage stats: not sent: %s\n", e.what());
+        std::thread([st = g_state, launcher, gpus, stats, check]() {
+            if (stats) {
+                try {
+                    send_record(st, launcher, gpus);
+                } catch (const std::exception & e) {
+                    if (!st->stopping) {
+                        SRV_DBG("usage stats: not sent: %s\n", e.what());
+                    }
+                } catch (...) {
                 }
-            } catch (...) {
+            }
+            if (check && !st->stopping) {
+                try {
+                    send_update_check(st);
+                } catch (const std::exception & e) {
+                    if (!st->stopping) {
+                        SRV_DBG("update check: not done: %s\n", e.what());
+                    }
+                } catch (...) {
+                }
             }
             st->done = true;
         }).detach();

@@ -118,7 +118,7 @@ No. SSDs wear when they're written, not when they're read. Expert streaming only
 Yes, with an experts file and code for its architecture. See [Adding a model](docs/adding-a-model.md).
 
 **Does it send anything?**
-One anonymous record a day from `llama-server`: a random install id, the date, the engine version, the OS, CPU and GPU names, and whether it was started directly or by an app. No prompts, replies, model names, paths or user names. `--no-stats`, `TOKENWING_NO_STATS=1` or `DO_NOT_TRACK=1` turns it off. See [Settings](docs/settings.md#usage-statistics).
+One anonymous record a day from `llama-server`: a random install id, the date, the engine version, the OS, CPU and GPU names, and whether it was started directly or by an app. No prompts, replies, model names, paths or user names. `--no-stats`, `TOKENWING_NO_STATS=1` or `DO_NOT_TRACK=1` turns it off. When you start `llama-server` yourself (not through the Run My AI app, which checks on its own), it also asks runmyai.org once a day for the newest release, sending only the engine version and the system (e.g. `linux-x64`); the site counts these checks. `TOKENWING_NO_UPDATE_CHECK=1` or `DO_NOT_TRACK=1` turns it off. See [Settings](docs/settings.md#usage-statistics).
 
 ## Docs
 

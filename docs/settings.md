@@ -303,6 +303,7 @@ These are read once at start-up. The ones under "Test only" exist for tests: mos
 | `TOKENWING_INSTALL_ID` | 32 lowercase hex characters: the install id the usage record carries instead of the one in the state folder (an app that starts the engine passes its own); the state folder's id file is then not written. |
 | `TOKENWING_LAUNCHER` | Who started the engine, as the usage record names it (lowercase letters, digits and `-`, at most 32 characters; anything else counts as `direct`). Each value gets its own record a day. |
 | `TOKENWING_NO_STATS` | Any value other than empty or 0 turns the usage record off, like --no-stats. `DO_NOT_TRACK=1` does the same. |
+| `TOKENWING_NO_UPDATE_CHECK` | Any value other than empty or 0 turns off the daily update check: an engine started by hand (`TOKENWING_LAUNCHER` not set) asks runmyai.org once a day for the newest release, sending the engine version and the system; the site counts the checks, the engine shows nothing. `DO_NOT_TRACK=1` turns it off too; `--no-stats` does not. |
 
 ### Measuring
 
@@ -481,4 +482,5 @@ These are read once at start-up. The ones under "Test only" exist for tests: mos
 | `MOE_STREAM_TEST_WS_INELIGIBLE` | Names a word-start source layer V that counts as not eligible, so all sources keep the word-start op, and the run aborts if it needs --moe-stream-needed-early 1, --moe-stream-wordstart above 0 and the GPU producer and they are not there. |
 | `MOE_STREAM_TEST_ZERO_WRITE` | When 1, each pool is allocated normally and its all-zero block is written at start and counted in the RAM plan, instead of being left unwritten. |
 | `MOE_STREAM_VRAM_TEST_EMPTY` | When 1, the VRAM expert pool and its device pass exist but hold no expert, so every device id names a zero slice and the output must equal the run without --moe-stream-vram-experts. |
+| `TOKENWING_UPDATE_URL` | Sends the daily update check to this address instead of runmyai.org (plain http allowed), so tests are not counted. |
 | `TOKENWING_STATS_URL` | Sends the usage record to this address instead of the real database (plain http allowed), so tests never write to it. |

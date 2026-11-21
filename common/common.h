@@ -936,6 +936,9 @@ struct common_params {
     int32_t     moe_stream_uma               = 0; // unified-memory zero-copy streaming mode (0 = off, 1)
     int32_t     moe_stream_hip_mmvq          = 0; // RDNA2/3/3.5/4 short-row & RDNA3.5 multi-warp MMVQ under ROCm/HIP (0 = off, 1)
     int32_t     moe_stream_hip_sync          = 0; // ROCm/HIP CPU-GPU handoff spin window in us (1 = auto 400 us, 0 = off)
+    int32_t     moe_stream_guess_gate        = 0; // bind-time victim- & queue-priced guesser gate (0 = off, 1)
+    int32_t     moe_stream_ssd_latency_us    = 0; // single-read SSD latency in us for congestion pricing (0 = auto)
+    float       moe_stream_ssd_gbps          = 0.0f; // sequential/chunk SSD bandwidth in GB/s for congestion pricing (0 = auto)
     int32_t     moe_stream_vram_follow_tick = 8;
     int32_t     moe_stream_vram_follow_swaps = 64;
     int32_t     moe_stream_vram_follow_recent = 256;

@@ -114,9 +114,16 @@ struct ggml_riscv_arch_features_type {
 
 #if defined(_MSC_VER) && !defined(__clang__) && defined(__STDC_NO_ATOMICS__)
 
-typedef volatile LONG atomic_int;
-typedef atomic_int atomic_bool;
-typedef atomic_int atomic_flag;
+#include <intrin.h>
+
+#ifndef _Atomic
+#define _Atomic volatile
+#endif
+
+typedef volatile LONG   atomic_int;
+typedef volatile LONG64 atomic_int64_t;
+typedef atomic_int      atomic_bool;
+typedef atomic_int      atomic_flag;
 
 #define ATOMIC_FLAG_INIT 0
 
@@ -129,27 +136,75 @@ typedef enum {
     memory_order_seq_cst
 } memory_order;
 
-static void atomic_store(atomic_int * ptr, LONG val) {
-    InterlockedExchange(ptr, val);
+static inline int64_t ggml_msvc_atomic_load(const volatile void * ptr, size_t sz, memory_order mo) {
+    (void) mo;
+    int64_t r = 0;
+    if (sz == 1) {
+        r = *(const volatile uint8_t *) ptr;
+    } else if (sz == 4) {
+        r = *(const volatile uint32_t *) ptr;
+    } else {
+        r = *(const volatile int64_t *) ptr;
+    }
+    _ReadWriteBarrier();
+    return r;
 }
-static void atomic_store_explicit(atomic_int * ptr, LONG val, memory_order mo) {
-    // TODO: add support for explicit memory order
-    InterlockedExchange(ptr, val);
+
+static inline int64_t ggml_msvc_atomic_exchange(volatile void * ptr, int64_t val, size_t sz, memory_order mo) {
+    (void) mo;
+    if (sz == 1) {
+        return (uint8_t) _InterlockedExchange8((volatile char *) ptr, (char) val);
+    }
+    if (sz == 4) {
+        return (uint32_t) InterlockedExchange((volatile LONG *) ptr, (LONG) val);
+    }
+    return (int64_t) InterlockedExchange64((volatile LONG64 *) ptr, (LONG64) val);
 }
-static LONG atomic_load(atomic_int * ptr) {
-    return InterlockedCompareExchange(ptr, 0, 0);
+
+static inline void ggml_msvc_atomic_store(volatile void * ptr, int64_t val, size_t sz, memory_order mo) {
+    (void) ggml_msvc_atomic_exchange(ptr, val, sz, mo);
 }
-static LONG atomic_load_explicit(atomic_int * ptr, memory_order mo) {
-    // TODO: add support for explicit memory order
-    return InterlockedCompareExchange(ptr, 0, 0);
+
+static inline int64_t ggml_msvc_atomic_fetch_add(volatile void * ptr, int64_t inc, size_t sz, memory_order mo) {
+    (void) mo;
+    if (sz == 4) {
+        return (int64_t) InterlockedExchangeAdd((volatile LONG *) ptr, (LONG) inc);
+    }
+    return (int64_t) InterlockedExchangeAdd64((volatile LONG64 *) ptr, (LONG64) inc);
 }
-static LONG atomic_fetch_add(atomic_int * ptr, LONG inc) {
-    return InterlockedExchangeAdd(ptr, inc);
+
+static inline int ggml_msvc_atomic_cas32(volatile LONG * ptr, int * expected, int desired) {
+    LONG prev = InterlockedCompareExchange(ptr, (LONG) desired, (LONG) *expected);
+    if (prev == (LONG) *expected) {
+        return 1;
+    }
+    *expected = (int) prev;
+    return 0;
 }
-static LONG atomic_fetch_add_explicit(atomic_int * ptr, LONG inc, memory_order mo) {
-    // TODO: add support for explicit memory order
-    return InterlockedExchangeAdd(ptr, inc);
+
+static inline int ggml_msvc_atomic_cas64(volatile LONG64 * ptr, int64_t * expected, int64_t desired) {
+    LONG64 prev = InterlockedCompareExchange64(ptr, (LONG64) desired, (LONG64) *expected);
+    if (prev == (LONG64) *expected) {
+        return 1;
+    }
+    *expected = (int64_t) prev;
+    return 0;
 }
+
+#define atomic_store(ptr, val)                 ggml_msvc_atomic_store((ptr), (int64_t)(val), sizeof(*(ptr)), memory_order_seq_cst)
+#define atomic_store_explicit(ptr, val, mo)    ggml_msvc_atomic_store((ptr), (int64_t)(val), sizeof(*(ptr)), (mo))
+#define atomic_exchange(ptr, val)              ggml_msvc_atomic_exchange((ptr), (int64_t)(val), sizeof(*(ptr)), memory_order_seq_cst)
+#define atomic_exchange_explicit(ptr, val, mo) ggml_msvc_atomic_exchange((ptr), (int64_t)(val), sizeof(*(ptr)), (mo))
+#define atomic_load(ptr)                       ggml_msvc_atomic_load((ptr), sizeof(*(ptr)), memory_order_seq_cst)
+#define atomic_load_explicit(ptr, mo)          ggml_msvc_atomic_load((ptr), sizeof(*(ptr)), (mo))
+#define atomic_fetch_add(ptr, inc)             ggml_msvc_atomic_fetch_add((ptr), (int64_t)(inc), sizeof(*(ptr)), memory_order_seq_cst)
+#define atomic_fetch_add_explicit(ptr, inc, mo) ggml_msvc_atomic_fetch_add((ptr), (int64_t)(inc), sizeof(*(ptr)), (mo))
+#define atomic_compare_exchange_strong(ptr, exp, des) \
+    (sizeof(*(ptr)) == 4 ? ggml_msvc_atomic_cas32((volatile LONG *)(ptr), (int *)(exp), (int)(des)) \
+                         : ggml_msvc_atomic_cas64((volatile LONG64 *)(ptr), (int64_t *)(exp), (int64_t)(des)))
+#define atomic_compare_exchange_weak_explicit(ptr, exp, des, mos, mof) \
+    ((void)(mos), (void)(mof), atomic_compare_exchange_strong((ptr), (exp), (des)))
+
 static atomic_bool atomic_flag_test_and_set(atomic_flag * ptr) {
     return InterlockedExchange(ptr, 1);
 }
@@ -157,6 +212,7 @@ static void atomic_flag_clear(atomic_flag * ptr) {
     InterlockedExchange(ptr, 0);
 }
 static void atomic_thread_fence(memory_order mo) {
+    (void) mo;
     MemoryBarrier();
 }
 #else // clang

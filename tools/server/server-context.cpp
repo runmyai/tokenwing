@@ -423,12 +423,20 @@ static json moe_stream_figures_json(const llama_moe_stream_stats & ms, const lla
             { "wasted",        now.n_pref_waste - base.n_pref_waste },
             { "cancelled",     n_cancel },
         };
-        if (reply) {   // the engine tells why a reply word's expert was read on demand
+        if (reply) {   // the engine tells why a reply word's expert was read on demand, and the 2x2 guesser census
             guesses["missed_by_cause"] = {
                 { "no_guess",       now.n_cause[1] - base.n_cause[1] },
                 { "not_named",      now.n_cause[3] - base.n_cause[3] },
                 { "named_not_read", now.n_cause[2] - base.n_cause[2] },
             };
+            guesses["mem_right"]  = now.n_gg_mem_right  - base.n_gg_mem_right;
+            guesses["mem_wrong"]  = now.n_gg_mem_wrong  - base.n_gg_mem_wrong;
+            guesses["ssd_right"]  = now.n_gg_ssd_right  - base.n_gg_ssd_right;
+            guesses["ssd_wrong"]  = now.n_gg_ssd_wrong  - base.n_gg_ssd_wrong;
+            guesses["skip_floor"] = now.n_gg_skip_floor - base.n_gg_skip_floor;
+            guesses["skip_vic"]   = now.n_gg_skip_vic   - base.n_gg_skip_vic;
+            guesses["defer_q"]    = now.n_gg_defer_q    - base.n_gg_defer_q;
+            guesses["pn_skip"]    = now.n_gg_pn_skip    - base.n_gg_pn_skip;
         }
         return json {
             { "tokens",             n_tok },
@@ -480,6 +488,14 @@ static json moe_stream_figures_json(const llama_moe_stream_stats & ms, const lla
             { "missed",       n_miss },
             { "wasted",       ms.n_pref_waste - b.n_pref_waste },
             { "cancelled",    n_cancel },
+            { "mem_right",    ms.dec.n_gg_mem_right  - b.dec.n_gg_mem_right },
+            { "mem_wrong",    ms.dec.n_gg_mem_wrong  - b.dec.n_gg_mem_wrong },
+            { "ssd_right",    ms.dec.n_gg_ssd_right  - b.dec.n_gg_ssd_right },
+            { "ssd_wrong",    ms.dec.n_gg_ssd_wrong  - b.dec.n_gg_ssd_wrong },
+            { "skip_floor",   ms.dec.n_gg_skip_floor - b.dec.n_gg_skip_floor },
+            { "skip_vic",     ms.dec.n_gg_skip_vic   - b.dec.n_gg_skip_vic },
+            { "defer_q",      ms.dec.n_gg_defer_q    - b.dec.n_gg_defer_q },
+            { "pn_skip",      ms.dec.n_gg_pn_skip    - b.dec.n_gg_pn_skip },
         } },
         { "vram", {
             { "follow_swaps",     ms.n_vf_swaps  - b.n_vf_swaps },

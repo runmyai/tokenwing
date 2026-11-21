@@ -64,6 +64,13 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         )
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
+    if (MSVC AND NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
+        include(CheckCCompilerFlag)
+        check_c_compiler_flag("/experimental:c11atomics" GGML_HAVE_MSVC_C11_ATOMICS)
+        if (GGML_HAVE_MSVC_C11_ATOMICS)
+            target_compile_options(${GGML_CPU_NAME} PRIVATE "$<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>")
+        endif()
+    endif()
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
 
     if (APPLE AND GGML_ACCELERATE)

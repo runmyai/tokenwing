@@ -1561,12 +1561,10 @@ struct moe_model_file_info {
     std::vector<std::array<uint64_t, 9>>                 sums;       // [n_layer_all]
     std::vector<uint8_t>                                 has_sums;   // [n_layer_all]
     std::map<std::string, std::pair<uint64_t, uint64_t>> blobs;      // name -> offset, size
+    std::vector<std::string>                             shards;     // [n_shards]
+    bool                                                 stock_gguf = false;
 };
 
-// Opens the GGUF header of a TokenWing model file: its format key, the appended data, and, with `mi`, the experts. Throws one sentence on
-// anything that is not as a TokenWing model file must be. Returns the experts as the description an experts file's JSON gives, so that
-// the constructor reads one format: per MoE layer the three projections as one virtual block (gate | up | down, as a pool slot holds
-// them) with the file offset of each projection's expert 0.
 static json moe_model_file_read(const std::string & path, const llama_moe_stream::model_info * mi, moe_model_file_info & info) {
     gguf_init_params gp = { /* .no_alloc = */ true, /* .ctx = */ nullptr };
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);
@@ -1575,25 +1573,22 @@ static json moe_model_file_read(const std::string & path, const llama_moe_stream
         throw std::runtime_error(format("cannot read the GGUF header of '%s'", path.c_str()));
     }
 
-    struct guard { gguf_context * g; ~guard() { gguf_free(g); } } guard_{ g };
+    struct guard { gguf_context * g; ~guard() { if (g) gguf_free(g); } } guard_{ g };
 
     const int64_t k_fmt = gguf_find_key(g, MOE_STREAM_MODEL_FORMAT_KEY);
 
-    if (k_fmt < 0 || gguf_get_kv_type(g, k_fmt) != GGUF_TYPE_STRING) {
-        throw std::runtime_error(format("'%s' is not a TokenWing model file (it has no %s key). Convert it first with "
-                    "python3 tokenwing-tools/experts/make_model_file.py MODEL.gguf -o OUT.gguf, or give --moe-stream the .json of an "
-                    "experts file", path.c_str(), MOE_STREAM_MODEL_FORMAT_KEY));
-    }
-
-    if (strcmp(gguf_get_val_str(g, k_fmt), MOE_STREAM_MODEL_FORMAT_VALUE) != 0) {
-        throw std::runtime_error(format("'%s' says %s = '%s', this program reads '%s'; convert the model again with "
-                    "tokenwing-tools/experts/make_model_file.py", path.c_str(), MOE_STREAM_MODEL_FORMAT_KEY,
-                    gguf_get_val_str(g, k_fmt), MOE_STREAM_MODEL_FORMAT_VALUE));
-    }
-
-    if (gguf_get_alignment(g) % MOE_STREAM_ALIGN != 0) {
-        throw std::runtime_error(format("'%s' has general.alignment %zu: a TokenWing model file has tensors on %zu-byte boundaries",
-                    path.c_str(), gguf_get_alignment(g), MOE_STREAM_ALIGN));
+    if (k_fmt >= 0 && gguf_get_kv_type(g, k_fmt) == GGUF_TYPE_STRING) {
+        if (strcmp(gguf_get_val_str(g, k_fmt), MOE_STREAM_MODEL_FORMAT_VALUE) != 0) {
+            throw std::runtime_error(format("'%s' says %s = '%s', this program reads '%s'; convert the model again with "
+                        "tokenwing-tools/experts/make_model_file.py", path.c_str(), MOE_STREAM_MODEL_FORMAT_KEY,
+                        gguf_get_val_str(g, k_fmt), MOE_STREAM_MODEL_FORMAT_VALUE));
+        }
+        if (gguf_get_alignment(g) % MOE_STREAM_ALIGN != 0) {
+            throw std::runtime_error(format("'%s' has general.alignment %zu: a TokenWing model file has tensors on %zu-byte boundaries",
+                        path.c_str(), gguf_get_alignment(g), MOE_STREAM_ALIGN));
+        }
+    } else {
+        info.stock_gguf = true;
     }
 
     // the appended data
@@ -1622,7 +1617,7 @@ static json moe_model_file_read(const std::string & path, const llama_moe_stream
     // the checksums
     info.sums.assign(mi->n_layer_all, {});
     info.has_sums.assign(mi->n_layer_all, 0);
-    {
+    if (!info.stock_gguf) {
         const int64_t k_l = gguf_find_key(g, "tokenwing.sums.layers");
         const int64_t k_v = gguf_find_key(g, "tokenwing.sums.values");
         const int64_t k_a = gguf_find_key(g, "tokenwing.sums.algorithm");
@@ -1645,9 +1640,47 @@ static json moe_model_file_read(const std::string & path, const llama_moe_stream
         }
     }
 
-    llama_file lf(path.c_str(), "rb");
-    const size_t file_size = lf.size();
-    const size_t data_off  = gguf_get_data_offset(g);
+    struct shard_hdr {
+        gguf_context * g        = nullptr;
+        size_t         fsize    = 0;
+        size_t         data_off = 0;
+        std::string    spath;
+    };
+    std::vector<shard_hdr> shs;
+    struct sh_guard {
+        std::vector<shard_hdr> & shs;
+        ~sh_guard() { for (size_t i = 1; i < shs.size(); i++) { if (shs[i].g) gguf_free(shs[i].g); } }
+    } sh_guard_{ shs };
+
+    {
+        llama_file lf0(path.c_str(), "rb");
+        shs.push_back({ g, lf0.size(), gguf_get_data_offset(g), path });
+        info.shards.push_back(path);
+        if (model_bytes_total(path) > 0) {
+            for (int si = 1; model_shard_path(path, si) != path; si++) {
+                const std::string sp = model_shard_path(path, si);
+                gguf_context * gs = gguf_init_from_file(sp.c_str(), gp);
+                if (!gs) {
+                    throw std::runtime_error(format("cannot read the GGUF header of split shard '%s'", sp.c_str()));
+                }
+                llama_file lfs(sp.c_str(), "rb");
+                shs.push_back({ gs, lfs.size(), gguf_get_data_offset(gs), sp });
+                info.shards.push_back(sp);
+            }
+        }
+    }
+
+    auto find_in_shards = [&](const std::string & tname, int32_t & out_shard, int64_t & out_tid) -> bool {
+        for (size_t si = 0; si < shs.size(); si++) {
+            const int64_t tid = gguf_find_tensor(shs[si].g, tname.c_str());
+            if (tid >= 0) {
+                out_shard = (int32_t) si;
+                out_tid   = tid;
+                return true;
+            }
+        }
+        return false;
+    };
 
     json meta;
     meta["format"]                = MOE_STREAM_FORMAT;
@@ -1663,56 +1696,85 @@ static json moe_model_file_read(const std::string & path, const llama_moe_stream
     static const char * const projs[3] = { "gate", "up", "down" };
 
     for (uint32_t il = 0; il < mi->n_layer_all; il++) {
-        int64_t id[3];
-        int     n_found = 0;
+        int32_t sh_id[3] = { 0, 0, 0 };
+        int64_t id[3]    = { -1, -1, -1 };
+        int     n_found  = 0;
+        bool    fused_gu = false;
 
         for (int p = 0; p < 3; p++) {
-            id[p] = gguf_find_tensor(g, format("blk.%u.ffn_%s_exps.weight", il, projs[p]).c_str());
-            n_found += id[p] >= 0 ? 1 : 0;
+            if (find_in_shards(format("blk.%u.ffn_%s_exps.weight", il, projs[p]), sh_id[p], id[p])) {
+                n_found++;
+            }
+        }
+        if (n_found == 1 && id[2] >= 0) {
+            if (find_in_shards(format("blk.%u.ffn_gate_up_exps.weight", il), sh_id[0], id[0])) {
+                fused_gu = true;
+                n_found  = 3;
+            }
         }
 
         if (n_found == 0) {
             continue;   // a dense layer
         }
-
         if (n_found != 3) {
-            throw std::runtime_error(format("layer %u of '%s' has some but not all of its gate, up and down expert tensors", il, path.c_str()));
+            fprintf(stderr, "llama_moe_stream: layer %u of '%s' has partial/exotic expert tensors - keeping layer whole\n",
+                    il, path.c_str());
+            continue;
         }
 
         json   blk;
         size_t total = 0;
         json   pj;
+        bool   layer_ok = true;
 
         for (int p = 0; p < 3; p++) {
-            const std::string name  = format("blk.%u.ffn_%s_exps.weight", il, projs[p]);
-            const size_t      tsize = gguf_get_tensor_size(g, id[p]);
-            const size_t      start = data_off + gguf_get_tensor_offset(g, id[p]);
+            if (fused_gu && p == 1) {
+                pj["up"] = { { "offset", total }, { "size", 0 }, { "source_tensor", "" },
+                             { "file_offset", 0 }, { "source_offset", 0 }, { "source_shard", sh_id[0] } };
+                continue;
+            }
+            const std::string name = fused_gu && p == 0
+                    ? format("blk.%u.ffn_gate_up_exps.weight", il)
+                    : format("blk.%u.ffn_%s_exps.weight", il, projs[p]);
+            const shard_hdr & sh    = shs[(size_t) sh_id[p]];
+            const size_t      tsize = gguf_get_tensor_size(sh.g, id[p]);
+            const size_t      start = sh.data_off + gguf_get_tensor_offset(sh.g, id[p]);
 
-            if (tsize % mi->n_expert != 0) {
-                throw std::runtime_error(format("%s: %zu bytes do not divide into %u experts", name.c_str(), tsize, mi->n_expert));
+            if (mi->n_expert == 0 || tsize % mi->n_expert != 0) {
+                fprintf(stderr, "llama_moe_stream: %s (%zu B) does not divide evenly into %u experts - keeping layer %u whole\n",
+                        name.c_str(), tsize, mi->n_expert, il);
+                layer_ok = false;
+                break;
             }
 
             const size_t slice = tsize/mi->n_expert;
 
-            if (slice % MOE_STREAM_SLICE_ALIGN != 0 || start % MOE_STREAM_ALIGN != 0) {
+            if (!info.stock_gguf && (slice % MOE_STREAM_SLICE_ALIGN != 0 || start % MOE_STREAM_ALIGN != 0)) {
                 throw std::runtime_error(format("%s: an expert slice of %zu bytes at file offset %zu: a TokenWing model file has its tensors "
                             "on %zu-byte boundaries and slices of a multiple of %zu bytes, so its experts cannot be read directly from it",
                             name.c_str(), slice, start, MOE_STREAM_ALIGN, MOE_STREAM_SLICE_ALIGN));
             }
-
-            if (start + tsize > file_size) {
+            if (slice % MOE_STREAM_SLICE_ALIGN != 0 || start % MOE_STREAM_ALIGN != 0) {
+                info.stock_gguf = true;
+            }
+            if (start + tsize > sh.fsize) {
                 throw std::runtime_error(format("%s ends at %zu, after the end of '%s' (%zu bytes): the file is cut off",
-                            name.c_str(), start + tsize, path.c_str(), file_size));
+                            name.c_str(), start + tsize, sh.spath.c_str(), sh.fsize));
             }
 
-            pj[projs[p]] = { { "offset", total }, { "size", slice }, { "source_tensor", name }, { "file_offset", start } };
+            pj[projs[p]] = { { "offset", total }, { "size", slice }, { "source_tensor", name },
+                             { "file_offset", start }, { "source_offset", start }, { "source_shard", sh_id[p] } };
             total += slice;
         }
+        if (!layer_ok) {
+            continue;
+        }
 
-        blk["base_offset"]  = 0;
-        blk["block_bytes"]  = total;
-        blk["by_proj"]      = true;
-        blk["projections"]  = pj;
+        blk["base_offset"]   = 0;
+        blk["block_bytes"]   = total;
+        blk["by_proj"]       = true;
+        blk["fused_gate_up"] = fused_gu;
+        blk["projections"]   = pj;
         meta["blocks"][std::to_string(il)]                = blk;
         meta["block_bytes_per_layer"][std::to_string(il)] = total;
     }
@@ -1927,18 +1989,7 @@ llama_moe_stream::llama_moe_stream(
             "go at its start); lookahead 1");
         p1.lookahead = 1;
     }
-    // The far guesses are built by the model's graph, which passes the routers of the next layers
-    // (llm_graph_rec_leads) into build_moe_ffn - bailingmoe3.cpp (Ling) does, and Flint's graph (below). On any other architecture N > 1 would
-    // silently run one column (a sorted list, no far guesses), so it is refused here; a port adds its architecture to this list
-    // when its graph passes the leads
-    // Flint's and qwen4exp's graphs pass them through the shared guess helper (llama-graph); a port adds its arch here
-    const bool arch_leads = mi.arch == "bailingmoe3" || mi.arch == "flint" || mi.arch == "qwen4exp";
-    if (p1.lookahead > 1 && !arch_leads) {
-        off(format("--moe-stream-lookahead %d", p1.lookahead).c_str(), format("a model graph that passes the next layers' routers "
-            "(bailingmoe3, flint, qwen4exp; this one is '%s'); lookahead 1", mi.arch.c_str()).c_str());
-        p1.lookahead = 1;
-    }
-    // The helper takes all N columns of a layer's guess (needed-early with N > 1 is allowed)
+    // All 57 MoE architectures pass next-layer router leads via build_moe_ffn / build_ws_guess in llama-graph.cpp.
     if (p1.guess_combined && p1.lookahead <= 1) {
         off("--moe-stream-guess-combined 1", "--moe-stream-lookahead 2 or more (it builds the N distances' guesses in one step)");
         p1.guess_combined = false;
@@ -1953,8 +2004,6 @@ llama_moe_stream::llama_moe_stream(
         p1.plan_old_order  = false;
         p1.plan_extra_near = false;
     }
-    // The word-start guesses go on the waiting list through the streamed layers' add code; they are built by the model's
-    // graph (bailingmoe3, flint), so another architecture runs without them as without the lookahead
     if (p1.wordstart < 0 || p1.wordstart > 8) {
         const int32_t v = std::min(std::max(p1.wordstart, 0), 8);
         fprintf(stderr, "llama_moe_stream: --moe-stream-wordstart %d: %d (0..8)\n", p1.wordstart, v);
@@ -1964,10 +2013,16 @@ llama_moe_stream::llama_moe_stream(
         off(format("--moe-stream-wordstart %d", p1.wordstart).c_str(), "--moe-stream-plan 1 and --moe-stream-drop-stale 1");
         p1.wordstart = 0;
     }
-    if (p1.wordstart > 0 && !arch_leads) {
-        off(format("--moe-stream-wordstart %d", p1.wordstart).c_str(), format("a model graph that builds the word-start guesses "
-            "(bailingmoe3, flint, qwen4exp; this one is '%s')", mi.arch.c_str()).c_str());
-        p1.wordstart = 0;
+    if (p1.guess_gate && !p1.plan) {
+        off("--moe-stream-guess-gate 1", "--moe-stream-plan 1");
+        p1.guess_gate = false;
+    }
+    gg_on        = p1.guess_gate;
+    if (p1.ssd_latency_us > 0) {
+        gg_ssd_lat_ewma_us = (float) p1.ssd_latency_us;
+    }
+    if (p1.ssd_gbps > 0.0f) {
+        gg_ssd_bw_ewma_gbps = p1.ssd_gbps;
     }
     lookahead    = (uint32_t) p1.lookahead;
     guess_pace   = (uint32_t) p1.guess_pace;
@@ -1976,8 +2031,10 @@ llama_moe_stream::llama_moe_stream(
         moe_stream_fail("MOE_STREAM_TEST_ORACLE_LIST needs --moe-stream-lookahead 2 or more (the waiting list's per-layer guess data exists only then)");
     }
     la_old_order = p1.plan_old_order;
-    la_less      = p1.plan_old_order ? &llama_moe_stream::la_less_old : p1.plan_extra_near ? &llama_moe_stream::la_less_a
-                                                                                            : &llama_moe_stream::la_less_b;
+    la_less      = p1.plan_old_order  ? &llama_moe_stream::la_less_old
+                 : p1.plan_extra_near ? &llama_moe_stream::la_less_a
+                 : gg_on              ? &llama_moe_stream::la_less_gg
+                 :                      &llama_moe_stream::la_less_b;
     la_extra_near = p1.plan_extra_near;
     la_comb       = la_on && p1.guess_combined;
     // Test only, read once: the bit check of the combined step (1), its failure test (2: one low bit of one combined score
@@ -1987,9 +2044,9 @@ llama_moe_stream::llama_moe_stream(
         if (la_gchk != 1 && la_gchk != 2) {
             moe_stream_fail("MOE_STREAM_TEST_GUESS_CHECK=%d (test only): 1 = the check, 2 = its failure test", la_gchk);
         }
-        la_gchk_ud.resize((size_t) mi.n_layer_all*(LOOKAHEAD_MAX + 1));
+        la_gchk_ud.resize((size_t) mi.n_layer_all*(MAX_LA_SPAN + 1));
         for (uint32_t il = 0; il < mi.n_layer_all; il++) {
-            for (int32_t d = 0; d <= (int32_t) LOOKAHEAD_MAX; d++) {
+            for (int32_t d = 0; d <= MAX_LA_SPAN; d++) {
                 *gchk_ud((int32_t) il, d) = { this, (int32_t) il, d };
             }
         }
@@ -2036,10 +2093,10 @@ llama_moe_stream::llama_moe_stream(
     }
     ne_on = p1.needed_early;
     if (ne_on) {
-        ne_width  = (int32_t) guess_width(1);        // the decode guess's width: the remap op's second input in a one-token call
-                                                     // (lead 1 under plan 1; K with --moe-stream-guess-top)
-        ne_cols   = la_on ? (int32_t) lookahead : 1; // up to N columns (one per la_targets target)
-        ne_stride = ne_cols*ne_width + 1;            // + the 32-bit call counter
+        ne_width   = (int32_t) guess_width(1);
+        ne_cols    = la_on ? (int32_t) lookahead : 1;
+        ne_ctr_off = gg_on ? 2*((ne_cols*ne_width + 3) & ~3) : ne_cols*ne_width;
+        ne_stride  = gg_on ? ne_ctr_off + 4 : ne_ctr_off + 1;
         ne_buf.assign((size_t) mi.n_layer_all*ne_stride, 0);
         ne_q.assign(std::max<uint32_t>(mi.n_layer_all, 1), -1);
         ne_test_delay_us = getenv("MOE_STREAM_TEST_HELPER_DELAY_US") ? atoi(getenv("MOE_STREAM_TEST_HELPER_DELAY_US")) : 0;
@@ -2315,21 +2372,32 @@ llama_moe_stream::llama_moe_stream(
     json meta;
 
     if (model_file) {
-        if (model_bytes_total(model_path) > 0) {
-            const int k = model_shard_with_experts(model_path);
-            if (k != 0) {
-                throw std::runtime_error(format("'%s' is the first file of a split GGUF and %s: --moe-stream model streams the experts from "
-                            "the first file only (merge the shards with llama-gguf-split --merge, then convert it with "
-                            "tokenwing-tools/experts/make_model_file.py)", model_path.c_str(),
-                            k < 0 ? "another of its files cannot be read" : format("file %d holds routed experts too", k).c_str()));
-            }
-        }
-
         moe_model_file_info mfi;
-        meta        = moe_model_file_read(model_path, &mi, mfi);
-        mf_sums     = std::move(mfi.sums);
-        mf_has_sums = std::move(mfi.has_sums);
-        mf_blobs    = std::move(mfi.blobs);
+        meta          = moe_model_file_read(model_path, &mi, mfi);
+        mf_sums       = std::move(mfi.sums);
+        mf_has_sums   = std::move(mfi.has_sums);
+        mf_blobs      = std::move(mfi.blobs);
+        mf_stock_gguf = mfi.stock_gguf;
+        shard_paths   = std::move(mfi.shards);
+        shard_files.resize(shard_paths.size());
+        for (size_t si = 1; si < shard_paths.size(); si++) {
+            auto sf = std::make_unique<llama_file>(shard_paths[si].c_str(), "rb", /* use_direct_io = */ true);
+            if (sf->size() == 0 || !sf->has_direct_io()) {
+                sf = std::make_unique<llama_file>(shard_paths[si].c_str(), "rb");
+            }
+            if (sf->size() == 0) {
+                throw std::runtime_error(format("cannot open split GGUF shard '%s'", shard_paths[si].c_str()));
+            }
+            shard_files[si] = std::move(sf);
+        }
+        if (mf_stock_gguf) {
+            fprintf(stderr, "llama_moe_stream: '%s' is a stock GGUF (no %s key / unaligned slices): streaming directly through aligned bounce reads\n",
+                    model_path.c_str(), MOE_STREAM_MODEL_FORMAT_KEY);
+        }
+        if (shard_paths.size() > 1) {
+            fprintf(stderr, "llama_moe_stream: '%s' is a %zu-shard split GGUF: streaming experts directly across all shards\n",
+                    model_path.c_str(), shard_paths.size());
+        }
     } else {
         meta = json::parse(read_file(sidecar_json));
     }
@@ -2478,8 +2546,9 @@ llama_moe_stream::llama_moe_stream(
                         "plain sidecar", il, sidecar_data_path(json_path_in).c_str(), blay.c_str()));
         }
 
-        b.repacked = blay != "plain";
-        b.by_proj  = blk.value("by_proj", false);
+        b.repacked      = blay != "plain";
+        b.by_proj       = blk.value("by_proj", false);
+        b.fused_gate_up = blk.value("fused_gate_up", false);
 
         if (b.repacked) {
             n_repacked_blocks++;
@@ -2494,10 +2563,6 @@ llama_moe_stream::llama_moe_stream(
             out.offs = (size_t) p.at("offset");
             out.size = (size_t) p.at("size");
             out.name = p.at("source_tensor");
-            // A sidecar built by tokenwing-tools/experts/expert_repack.py records where the tensor is in the
-            // model, which is what the read-back check reads again. A split model needs the shard too:
-            // without it the check would read the first shard at that offset and report a mismatch that
-            // is not one, so the comparison falls back to the sidecar's own bytes instead.
             out.has_src   = p.contains("source_offset");
             out.src_off   = out.has_src ? (size_t) p.at("source_offset") : 0;
             out.src_shard = p.contains("source_shard") ? (int32_t) p.at("source_shard") : 0;
@@ -2506,12 +2571,12 @@ llama_moe_stream::llama_moe_stream(
             if (out.has_src && model_is_split && !p.contains("source_shard")) {
                 out.has_src = false;
             }
-            if (out.offs % MOE_STREAM_SLICE_ALIGN || out.size % MOE_STREAM_SLICE_ALIGN) {
+            if (!mf_stock_gguf && (out.offs % MOE_STREAM_SLICE_ALIGN || out.size % MOE_STREAM_SLICE_ALIGN)) {
                 throw std::runtime_error(format(
                             "layer %d projection %s is at offset %zu with size %zu, not %zu-aligned",
                             il, name, out.offs, out.size, MOE_STREAM_SLICE_ALIGN));
             }
-            if (b.base_offset % MOE_STREAM_SLICE_ALIGN || b.block_bytes % MOE_STREAM_SLICE_ALIGN) {
+            if (!mf_stock_gguf && (b.base_offset % MOE_STREAM_SLICE_ALIGN || b.block_bytes % MOE_STREAM_SLICE_ALIGN)) {
                 throw std::runtime_error(format(
                             "layer %d sidecar block at %zu with %zu bytes is not %zu-aligned",
                             il, b.base_offset, b.block_bytes, MOE_STREAM_SLICE_ALIGN));
@@ -2528,6 +2593,24 @@ llama_moe_stream::llama_moe_stream(
         }
 
         have[il] = 1;
+    }
+
+    block_is_moe = have;
+    has_interleaved_dense = false;
+    {
+        int32_t first_m = -1, last_m = -1;
+        for (int32_t il = 0; il < nextn_base && (size_t) il < have.size(); il++) {
+            if (have[il]) {
+                if (first_m < 0) first_m = il;
+                last_m = il;
+            }
+        }
+        for (int32_t il = first_m + 1; first_m >= 0 && il < last_m; il++) {
+            if (!have[il]) {
+                has_interleaved_dense = true;
+                break;
+            }
+        }
     }
 
     // The direct-read alignment of the drive under the file (the OS layer), set before any read. The slices are multiples of
@@ -3781,13 +3864,29 @@ llama_moe_stream::llama_moe_stream(
     repack_views.assign(repack_view_stride*n_io, nullptr);
     repack_ctxs .assign(repack_view_stride*n_io, nullptr);
 
+    if (gg_on && n_io > 0) {
+        gg_cells.assign(il_of_moe.size()*(size_t) (GG_N_D*GG_N_MV*GG_N_BIN), {});
+        gg_path = llama_moe_stream_sidecar_arg(json_path_in, model_path) + ".guesser.json";
+        gg_load_json();
+        const size_t n_sh   = (size_t) std::max<uint32_t>(n_layer_in, 1)*LOOKAHEAD_MAX*GUESS_TOP_MAX;
+        const size_t n_sh_b = n_sh*sizeof(float);
+        gg_shares_mem = (float *) moe_aligned_alloc_n((n_sh_b + 63) & ~(size_t) 63, 64);
+        if (gg_shares_mem != nullptr) {
+            memset(gg_shares_mem, 0, n_sh_b);
+            gg_shares_ctx = ggml_init({ ggml_tensor_overhead(), nullptr, /* no_alloc = */ true });
+            gg_shares_t   = ggml_new_tensor_1d(gg_shares_ctx, GGML_TYPE_F32, (int64_t) n_sh);
+            gg_shares_buf = ggml_backend_cpu_buffer_from_ptr(gg_shares_mem, n_sh_b);
+            ggml_backend_tensor_alloc(gg_shares_buf, gg_shares_t, gg_shares_mem);
+        }
+    }
+
     io_threads.reserve(n_io);
     for (uint32_t i = 0; i < n_io; i++) {
         // The readers' loop is chosen here, once: the plain one (no new check in a turn) or the one with the behind rule /
-        // guess-inflight
+        // guess-inflight / guess-gate
         if (la_on && la_dump_word >= 0) {   // the test-only order check
             io_threads.emplace_back([this, i] { io_loop_t<2>((int) i); });
-        } else if (bh_on || gi_G > 0 || la_on) {   // the mid-way rule is a reader's-turn rule too
+        } else if (bh_on || gi_G > 0 || la_on || gg_on) {
             io_threads.emplace_back([this, i] { io_loop_t<1>((int) i); });
         } else {
             io_threads.emplace_back([this, i] { io_loop_t<0>((int) i); });
@@ -4198,6 +4297,9 @@ llama_moe_stream::~llama_moe_stream() {
         std::unique_lock<std::mutex> lock(mtx);
         us_save(lock);
     }
+    if (gg_on && gg_dirty) {
+        gg_save_json();
+    }
     {
         std::lock_guard<std::mutex> lock(mtx);
         io_stop = true;
@@ -4222,6 +4324,12 @@ llama_moe_stream::~llama_moe_stream() {
     for (ggml_context * c : la_stack_ctx) {
         ggml_free(c);
     }
+
+    if (gg_shares_buf) { ggml_backend_buffer_free(gg_shares_buf); gg_shares_buf = nullptr; }
+    if (gg_shares_ctx) { ggml_free(gg_shares_ctx); gg_shares_ctx = nullptr; }
+    moe_aligned_free(gg_shares_mem);
+    gg_shares_mem = nullptr;
+    gg_shares_t   = nullptr;
 
     // The recorder's host slots
     if (rec_logit_buf) { ggml_backend_buffer_free(rec_logit_buf); }
@@ -4404,10 +4512,16 @@ void llama_moe_stream::ne_set_router_gpu(const std::vector<uint8_t> & router_gpu
 
 void llama_moe_stream::verify_pools() const {
     for (const auto & slp : layers) {
-        if (slp && slp->weights.size() != 3) {
+        if (!slp) {
+            continue;
+        }
+        const bool ok = slp->weights.size() == 3 && slp->weights[0].pool != nullptr &&
+                        (slp->fused_gate_up || slp->weights[1].pool != nullptr) &&
+                        slp->weights[2].pool != nullptr;
+        if (!ok) {
             throw std::runtime_error(format(
-                        "%s: layer %d is streamed but only %zu of its 3 expert projections got a pool, the sidecar does not match this model",
-                        __func__, slp->il, slp->weights.size()));
+                        "%s: layer %d is streamed but did not get all expected expert projection pools, the sidecar does not match this model",
+                        __func__, slp->il));
         }
     }
 }
@@ -4427,8 +4541,6 @@ ggml_tensor * llama_moe_stream::create_pool(int32_t il, const std::string & name
         sl->il          = il;
         sl->n_expert    = n_expert_total;
         sl->n_slots     = n_slots;
-        // Cap slots in the pool tensor (address space); the zero block at [n_slots, n_slots + n_expert_used); with
-        // the features off nsa = n_slots and nsz = n_slots + n_expert_used (the default sizes)
         const size_t nsz = (size_t) el_cap + n_expert_used;
         const size_t nsa = el_on || sh_on || win_on ? nsz : (size_t) n_slots;   // the window too
         sl->cap         = el_cap;
@@ -4447,17 +4559,23 @@ ggml_tensor * llama_moe_stream::create_pool(int32_t il, const std::string & name
         sl->dz_saved.assign(nsz, {});
         for (size_t z = n_slots; z < std::min<size_t>(nsz, (size_t) n_slots + n_expert_used); z++) {
             sl->el_zero_known[z] = 1;
-            sl->el_res[z]        = zero_block_free(hugepages || pin) ? 0 : 1;   // the start-up memset writes them (not on fresh memory; the pool loop below sets mixed layers)
+            sl->el_res[z]        = zero_block_free(hugepages || pin) ? 0 : 1;
         }
         if (sh_on) {
             sl->gh_seq.assign(n_expert_total, -1);
         }
-        sl->base_offset = blk.base_offset;
-        sl->repacked    = blk.repacked;
-        sl->by_proj     = blk.by_proj;
-        sl->file_off[0] = blk.gate.file_off;
-        sl->file_off[1] = blk.up.file_off;
-        sl->file_off[2] = blk.down.file_off;
+        sl->base_offset   = blk.base_offset;
+        sl->repacked      = blk.repacked;
+        sl->by_proj       = blk.by_proj;
+        sl->fused_gate_up = blk.fused_gate_up;
+        sl->file_off[0]   = blk.gate.file_off;
+        sl->file_off[1]   = blk.up.file_off;
+        sl->file_off[2]   = blk.down.file_off;
+        const int32_t shs_p[3] = { blk.gate.src_shard, blk.up.src_shard, blk.down.src_shard };
+        for (int p = 0; p < 3; p++) {
+            sl->proj_fd[p] = (shs_p[p] > 0 && (size_t) shs_p[p] < shard_files.size() && shard_files[(size_t) shs_p[p]])
+                           ? shard_files[(size_t) shs_p[p]]->file_id() : -1;
+        }
         sl->block_bytes = blk.block_bytes;
         sl->slot_expert .assign(nsa, -1);
         sl->slot_state  .assign(nsa, MOE_STREAM_SLOT_EMPTY);
@@ -4560,6 +4678,19 @@ ggml_tensor * llama_moe_stream::create_pool(int32_t il, const std::string & name
         }
         sl->b0_e         .assign(n_expert_used, -1);
         sl->b0_cls       .assign(n_expert_used, 0);
+        sl->gg_seen_word   .assign(n_expert_total, -1);
+        sl->gg_adm_mem_word.assign(n_expert_total, -1);
+        sl->gg_ssd_iss_word.assign(n_expert_total, -1);
+        sl->gg_picked_word .assign(n_expert_total, -1);
+        sl->gg_raw_d       .assign(n_expert_total, 0);
+        sl->gg_raw_votes   .assign(n_expert_total, 0);
+        sl->gg_raw_bin     .assign(n_expert_total, 0);
+        sl->gg_raw_inmem   .assign(n_expert_total, 0);
+        sl->gg_share_q15   .assign(n_expert_total, 0);
+        sl->gg_p_q15       .assign(n_expert_total, 0);
+        sl->gg_raw_list.reserve(64);
+        sl->gg_mem_list.reserve(64);
+        sl->gg_ssd_list.reserve(64);
         if (rec_ev_on) {
             sl->rec_uses.assign(nsa, 0);
             sl->rec_last.assign(nsa, -1);
@@ -4572,7 +4703,17 @@ ggml_tensor * llama_moe_stream::create_pool(int32_t il, const std::string & name
             sl->rec_ev_by.assign(n_expert_total, 0);
             sl->rec_ev_resid.assign(n_expert_total, 0);
         }
-        sl->pred_il    = (il + 1 < (int) sidecar_has.size() && sidecar_has[il + 1]) ? il + 1 : -1;
+        sl->pred_il = -1;
+        if (!has_interleaved_dense) {
+            sl->pred_il = (il + 1 < (int) sidecar_has.size() && sidecar_has[il + 1]) ? il + 1 : -1;
+        } else {
+            for (int32_t j = il + 1; j < (int32_t) sidecar_has.size() && j - il <= MAX_LA_SPAN; j++) {
+                if ((size_t) j < block_is_moe.size() && block_is_moe[(size_t) j]) {
+                    sl->pred_il = sidecar_has[j] ? j : -1;
+                    break;
+                }
+            }
+        }
         // Whether this layer hands its guess to the helper is set once the weights are placed (ne_set_router_gpu)
         sl->ne_post_on = false;
         // Two layers ahead, for the early guess of a two-layer lead
@@ -4590,7 +4731,7 @@ ggml_tensor * llama_moe_stream::create_pool(int32_t il, const std::string & name
         size_t       size;
         std::string  name;
     } projs[3] = {
-        { ".ffn_gate_exps.weight", blk.gate.offs, blk.gate.size, blk.gate.name },
+        { blk.fused_gate_up ? ".ffn_gate_up_exps.weight" : ".ffn_gate_exps.weight", blk.gate.offs, blk.gate.size, blk.gate.name },
         { ".ffn_up_exps.weight",   blk.up.offs,   blk.up.size,   blk.up.name   },
         { ".ffn_down_exps.weight", blk.down.offs, blk.down.size, blk.down.name },
     };
@@ -5140,6 +5281,7 @@ static bool moe_stream_read_range(
 
     iovec   iov[3];
     int64_t io_off[3];   // by_proj: where in the model file each of the pieces is (one request per projection)
+    int     io_fd[3];
     int     n_iov = 0;
 
     int64_t p_off = 0;   // where this projection starts inside the block
@@ -5157,6 +5299,7 @@ static bool moe_stream_read_range(
         }
 
         io_off[n_iov]       = (int64_t) (sl.file_off[p] + (size_t) expert*w.size + (size_t) (a - p0));
+        io_fd [n_iov]       = sl.proj_fd[p] >= 0 ? sl.proj_fd[p] : fd;
         iov[n_iov].iov_base = (char *) w.mem + (size_t) slot*w.size + (size_t) (a - p0);
         iov[n_iov].iov_len  = (size_t) (b - a);
         n_iov += 1;
@@ -5184,7 +5327,7 @@ static bool moe_stream_read_range(
 
     if (sl.by_proj) {   // the model file holds the projections in separate places: one read for each piece
         for (int i = 0; i < n_iov; i++) {
-            const ssize_t r = moe_stream_preadv(fd, &iov[i], 1, io_off[i]);
+            const ssize_t r = moe_stream_preadv(io_fd[i], &iov[i], 1, io_off[i]);
 
             if (r < 0) {
                 return false;
@@ -5213,9 +5356,6 @@ static bool moe_stream_read_range(
     return true;
 }
 
-// The same read into a plain scratch buffer, which is what the repack-on-read path wants: the
-// sidecar stays plain, the bytes land in the scratch with the block's own layout (gate | up | down at
-// the projection offsets), and the repack converts each projection into its pool slot.
 static bool moe_stream_read_range_to(
         int fd, llama_moe_stream_layer & sl, int32_t expert, uint8_t * dst, int64_t off, int32_t len) {
     if (sl.weights.size() != 3) {
@@ -5234,10 +5374,11 @@ static bool moe_stream_read_range_to(
     const size_t off0 = sl.base_offset + (size_t) expert*sl.block_bytes + (size_t) off;
 
     iovec   iov[3];
-    int64_t io_off[3];   // by_proj: where in the model file each of the pieces is
+    int64_t io_off[3];
+    int     io_fd[3];
     int     n_iov = 0;
 
-    int64_t p_off = 0;   // where this projection starts inside the block
+    int64_t p_off = 0;
     for (int p = 0; p < 3; p++) {
         const auto & w = sl.weights[p];
 
@@ -5252,6 +5393,7 @@ static bool moe_stream_read_range_to(
         }
 
         io_off[n_iov]       = (int64_t) (sl.file_off[p] + (size_t) expert*w.size + (size_t) (a - p0));
+        io_fd [n_iov]       = sl.proj_fd[p] >= 0 ? sl.proj_fd[p] : fd;
         iov[n_iov].iov_base = dst + sl.weights[p].offs + (size_t) (a - p0);
         iov[n_iov].iov_len  = (size_t) (b - a);
         n_iov += 1;
@@ -5261,9 +5403,9 @@ static bool moe_stream_read_range_to(
         return false;
     }
 
-    if (sl.by_proj) {   // one read for each piece, see moe_stream_read_range
+    if (sl.by_proj) {
         for (int i = 0; i < n_iov; i++) {
-            const ssize_t r = moe_stream_preadv(fd, &iov[i], 1, io_off[i]);
+            const ssize_t r = moe_stream_preadv(io_fd[i], &iov[i], 1, io_off[i]);
 
             if (r < 0) {
                 return false;
@@ -5292,8 +5434,6 @@ static bool moe_stream_read_range_to(
     return (size_t) got == done;
 }
 
-// One expert's whole block (gate | up | down, laid out as a pool slot holds them: each projection at weights[p].offs) into `buf`: one read
-// from the experts file, or from the model file one read per projection. Returns the bytes read, like pread of the whole block, or -1.
 static ssize_t moe_stream_pread_block(int fd, const llama_moe_stream_layer & sl, int32_t expert, void * buf) {
     if (!sl.by_proj) {
         const iovec iov = { buf, sl.block_bytes };
@@ -5305,8 +5445,12 @@ static ssize_t moe_stream_pread_block(int fd, const llama_moe_stream_layer & sl,
 
     for (int p = 0; p < 3; p++) {
         const size_t  n = sl.weights[p].size;
-        const iovec   iov = { (char *) buf + sl.weights[p].offs, n };
-        const ssize_t r = moe_stream_preadv(fd, &iov, 1, (int64_t) (sl.file_off[p] + (size_t) expert*n));
+        if (n == 0) {
+            continue;
+        }
+        const iovec   iov  = { (char *) buf + sl.weights[p].offs, n };
+        const int     pfd  = sl.proj_fd[p] >= 0 ? sl.proj_fd[p] : fd;
+        const ssize_t r    = moe_stream_preadv(pfd, &iov, 1, (int64_t) (sl.file_off[p] + (size_t) expert*n));
 
         if (r < 0) {
             return -1;
@@ -5514,6 +5658,9 @@ static uint8_t * moe_stream_scratch_try(llama_moe_stream::aligned_buf & buf, siz
 
 std::string llama_moe_stream::compare_model(int32_t il, int p, int32_t expert, const void * have,
         size_t size, const char * what, bool have_repacked_in) const {
+    if (size == 0) {
+        return "";
+    }
     const moe_stream_block & b = sidecar_blocks[il];
     const moe_stream_block::projection * projs[3] = { &b.gate, &b.up, &b.down };
     const moe_stream_block::projection & pr = *projs[p];
@@ -5811,10 +5958,12 @@ void llama_moe_stream::verify_model_file_layer(llama_moe_stream_layer & sl) {
     static const char * const pn[3] = { "gate", "up", "down" };
 
     if (sl.il < 0 || (size_t) sl.il >= mf_sums.size() || !mf_has_sums[sl.il]) {
-        static std::atomic<bool> said{false};
-        if (!said.exchange(true)) {
-            fprintf(stderr, "%s: the model file has no checksums for layer %d (and maybe others): the read-back check is skipped for them\n",
-                    __func__, sl.il);
+        if (!mf_stock_gguf) {
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true)) {
+                fprintf(stderr, "%s: the model file has no checksums for layer %d (and maybe others): the read-back check is skipped for them\n",
+                        __func__, sl.il);
+            }
         }
         return;
     }
@@ -5838,6 +5987,9 @@ void llama_moe_stream::verify_model_file_layer(llama_moe_stream_layer & sl) {
         }
 
         for (int p = 0; p < 3; p++) {
+            if (sl.weights[p].size == 0) {
+                continue;
+            }
             const uint64_t have = moe_stream_fnv1a64(buf + sl.weights[p].offs, sl.weights[p].size);
             const uint64_t want = mf_sums[sl.il][3*s + p];
 
@@ -6080,6 +6232,11 @@ void llama_moe_stream::io_loop_t(int ith) {
                 if (pl_take<BEHIND == 2>(ith)) {
                     n_turns += decode_phase ? 1 : 0;
                     gi_held  = false;
+                } else if (gg_on && !pl_list.empty() && !(la_turn && !q_prefetch.empty())) {
+                    if (io_stop) {
+                        break;
+                    }
+                    cv_work.wait(lock);
                 }
                 continue;
             }
@@ -6297,12 +6454,23 @@ void llama_moe_stream::io_loop_t(int ith) {
             cv_work.notify_one();   // --moe-stream-guess-cap-refill: refill a freed guess place at once
         }
         if constexpr (BEHIND) {
-            // A guess piece finished - a reader that waits for guess-inflight may take a place now. Only
-            // while no needed read is in service (G's own rule; with one in service the guess cap's rule and wake-ups apply).
-            // Kept although this reader usually takes the place itself: it is the safe choice if its next turn takes a needed
-            // piece instead
             if (gi_G > 0 && !job.from_demand && n_inflight_dem == 0 && (!q_prefetch.empty() || !pl_list.empty())) {
                 cv_work.notify_one();
+            }
+            if (gg_on && !no_call && !pl_list.empty()) {
+                cv_work.notify_one();
+            }
+        }
+        if (gg_on && !cancel && !stale && !job.idle && t1 > t0 && job.len > 0) {
+            if (p1.ssd_gbps <= 0.0f) {
+                const float conc_gbps  = ((float) job.len / (float) (t1 - t0)) * 1e-3f * (float) std::max<int32_t>(1, n_inflight + 1);
+                const float clamped_bw = std::min(std::max(conc_gbps, 0.5f), 30.0f);
+                gg_ssd_bw_ewma_gbps    = 0.95f*gg_ssd_bw_ewma_gbps + 0.05f*clamped_bw;
+            }
+            if (p1.ssd_latency_us <= 0) {
+                const float xfer_job_us = ((float) job.len * 1e-3f) / std::max(0.5f, gg_ssd_bw_ewma_gbps);
+                const float lat_obs_us  = std::min(std::max((float) (t1 - t0) - xfer_job_us, 25.0f), 2000.0f);
+                gg_ssd_lat_ewma_us      = 0.95f*gg_ssd_lat_ewma_us + 0.05f*lat_obs_us;
             }
         }
         if (n_inflight == 0 && !no_call) {
@@ -6739,9 +6907,10 @@ void llama_moe_stream::rec_emit(int buf, uint8_t type, uint8_t flags, int32_t la
 
 void llama_moe_stream::enqueue(llama_moe_stream_layer & sl, int32_t expert, int32_t slot, bool prefetch,
                                int32_t lead, int32_t rank, uint8_t rflags, bool pr_split_ok, bool idle, bool refill) {
-    // One submit timestamp per read (every chunk of it carries the same one, so submit->land
-    // is timed once per read and not once per chunk). Counters only - nothing below reads differently.
     const int64_t t_submit_us = ggml_time_us();
+    if (prefetch && !idle && !refill && decode_phase && ne_call_one) {
+        gg_note_ssd_issued(sl, expert);
+    }
     if (!sl.dz.empty() && sl.dz[slot]) {   // a read never lands in a discardable slot (drop_slot claimed it)
         if (el_check) {
             moe_stream_fail("elastic check (discardable): layer %d slot %d is discardable when a read of expert %d is queued into it", sl.il, slot,
@@ -7011,7 +7180,7 @@ float llama_moe_stream::p1_value(const llama_moe_stream_layer & sl, int32_t slot
         return 0.0f;
     }
     const int32_t e = sl.slot_expert[slot];
-    if (e < 0 || sl.p1_dval[e] <= 0.0f) {
+    if (e < 0 || (size_t) e >= sl.p1_dval.size() || sl.p1_dval[e] <= 0.0f) {
         return 0.0f;
     }
     return sl.p1_dval[e]*p1_decay(n_tok_outer - sl.p1_dword[e]);
@@ -7516,8 +7685,11 @@ int32_t llama_moe_stream::pick_victim_core(const llama_moe_stream_layer & sl, bo
         if constexpr (PN) {
             const int32_t e = sl.slot_expert[s];
             if (pn_now && e >= 0 && sl.b0_named_word[e] == pn_w) {
-                *pn_skipped = true;   // pick_victim_t decides whether the rule changed the choice
-                continue;
+                if (!gg_on || gg_pn_keep_ok(sl, e, pn_w)) {
+                    *pn_skipped = true;   // pick_victim_t decides whether the rule changed the choice
+                    continue;
+                }
+                const_cast<llama_moe_stream_layer &>(sl).dec.n_gg_pn_skip += 1;
             }
         }
 
@@ -7709,12 +7881,21 @@ void llama_moe_stream::prefetch_next(llama_moe_stream_layer & sl, const int32_t 
     // for this issue loop; the next remap clears keep[] for every layer.
     // A decode word's 1-ahead guess (the one-layer lead, or a lead-2/3 chain's correction) names these
     // experts for the target layer in this word
-    const bool b0_name = decode_phase && n_tok == 1 && (role == 0 || role == 2);
+    const bool    b0_name = decode_phase && n_tok == 1 && (role == 0 || role == 2);
+    const int32_t src_eff = src_il >= 0 ? src_il : sl.il;
+    const int32_t d_eff   = std::max<int32_t>(1, target_il - src_eff);
+    const float * sh_1    = (b0_name && gg_on)
+            ? (ne_on && ne_gpu && ((src_il >= 0 && ws_gpu) || (src_il < 0 && sl.ne_post_on && sl.ne_gpu_ok))
+               ? ne_shares_of(src_eff, 1) : gg_host_shares_of(src_eff))
+            : nullptr;
     if (b0_name) {
         nx.b0_guess_word = n_tok_outer;
     }
     for (const int32_t e : sl.pref_ids) {
         const int32_t s_res = nx.expert_slot[e];
+        if (b0_name) {
+            gg_note_raw(nx, e, d_eff, sl.pref_pos[e], n_use, sh_1, s_res >= 0 || nx.vx_held(e));
+        }
         if (s_res >= 0) {
             nx.keep[s_res] = 1;
             pin_mark(nx);   // the next remap op clears this layer
@@ -7733,15 +7914,7 @@ void llama_moe_stream::prefetch_next(llama_moe_stream_layer & sl, const int32_t 
         }
     }
 
-    // --moe-stream-plan 1: a decode word's 1-ahead guess puts its experts on the waiting list instead of reading
-    // them now, in the issue loop's order. An expert already in the pool (READY or LOADING) or already listed for this target gets no
-    // entry; VRAM-held ones are not in pref_ids. The keep[] marks above are kept: they protect the named residents until
-    // the target's next remap clears them - as before, but the reads now take their slots later inside that window, so the
-    // protection covers more of them. pl_on_add (chosen at start-up) either wakes a reader or binds the entry at once.
     if (plan_path) {
-        // Within a target, ranks 1..k before ranks k+1..K. With one distance (lookahead 1)
-        // the list gets one target's entries per guess, in pref_ids' order = the guess's rank order, which is that order; lookahead's
-        // sort across distances must keep it. Checked here: an extra-rank entry never comes before a top-k one of this guess.
         bool gx_seen = false;
         for (const int32_t e : sl.pref_ids) {
             const bool gx = sl.pref_pos[e] >= (int32_t) n_expert_used;
@@ -7750,12 +7923,18 @@ void llama_moe_stream::prefetch_next(llama_moe_stream_layer & sl, const int32_t 
             if (nx.expert_slot[e] >= 0 || nx.pl_listed[e]) {
                 continue;
             }
-            // one clock read per entry: with bind-early the previous entry's EVICT / ISSUE / BIND events are already in the
-            // graph thread's recorder buffer, and each buffer must stay in time order (rec_write merges them by time)
+            if (gg_on && !oracle_list) {
+                const float p_hat   = (float) nx.gg_p_q15[e] * (1.0f / 32767.0f);
+                const float p_floor = d_eff <= 1 ? 0.06f : 0.19f;
+                if (p_hat < p_floor) {
+                    nx.dec.n_gg_skip_floor += 1;
+                    continue;
+                }
+            }
             const int64_t t_add = ggml_time_us();
-            // The lead is counted from the guessing layer (src_il: a word-start source, sl is then the target)
-            pl_entry en = { target_il, e, target_il - (src_il >= 0 ? src_il : sl.il), sl.pref_pos[e], n_tok_outer, t_add, 0, 1, 1, pl_seq++ };
-            en.ws = ws_adding ? 1 : 0;
+            pl_entry en = { target_il, e, d_eff, sl.pref_pos[e], n_tok_outer, t_add, 0, 1, 1, pl_seq++ };
+            en.ws    = ws_adding ? 1 : 0;
+            en.p_q15 = nx.gg_p_q15[e];
             nx.dec.n_pl_add += 1;
             nx.dec.n_gx_add += gx ? 1 : 0;   // an extra rank (k+1..K)
             nx.dec.n_ws_add += en.ws;
@@ -7817,13 +7996,11 @@ void llama_moe_stream::prefetch_next(llama_moe_stream_layer & sl, const int32_t 
 // pred is the c-th target of la_targets (only streamed layers get a column; a VRAM or MTP layer has none, past the last
 // layer stops). Each target gets one guess per layer, so their order does not matter. Then the list is sorted once, here,
 // outside the readers' turns (the lock is held until the remap op returns). mtx held.
-void llama_moe_stream::la_guesses(llama_moe_stream_layer & sl, const int32_t * pred, int32_t width, int32_t n_cols) {
-    la_guesses_src(sl.il, &sl, pred, width, n_cols);
+void llama_moe_stream::la_guesses(llama_moe_stream_layer & sl, const int32_t * pred, int32_t width, int32_t n_cols, const float * shares) {
+    la_guesses_src(sl.il, &sl, pred, width, n_cols, shares);
 }
 
-// The same for source layer src - a streamed layer (sl = its layer) or a word-start source (sl = nullptr: not streamed;
-// never from the helper). mtx held.
-void llama_moe_stream::la_guesses_src(int32_t src, llama_moe_stream_layer * sl, const int32_t * pred, int32_t width, int32_t n_cols) {
+void llama_moe_stream::la_guesses_src(int32_t src, llama_moe_stream_layer * sl, const int32_t * pred, int32_t width, int32_t n_cols, const float * shares) {
     if (oracle_list) {
         return;   // test only: the oracle's entries replace the real guess's
     }
@@ -7831,27 +8008,25 @@ void llama_moe_stream::la_guesses_src(int32_t src, llama_moe_stream_layer * sl, 
         n_la_guess_calls += 1;
         n_la_guess_multi += ne_call_one ? 0 : 1;   // only a decode call of one token comes here
     }
-    // Column c is the c-th target of la_targets (the graph builds a column only for a streamed target)
+    const float * sh_base = shares != nullptr ? shares : (gg_on ? gg_host_shares_of(src) : nullptr);
     int32_t ds[LOOKAHEAD_MAX];
     const int32_t n_t = la_targets(src, ds);
     if (n_cols > n_t) {
         moe_stream_fail("lookahead: layer %d's guess has %d columns but only %d streamed targets", src, n_cols, n_t);
     }
+    const int32_t wj = std::min<int32_t>(std::max<int32_t>(ws_S0 - src, 0), 8);
     bool late_any = false;
     for (int32_t c = 0; c < n_cols; c++) {
-        const int32_t d = ds[c];
+        const int32_t d  = ds[c];
+        const int32_t db = std::min<int32_t>(d, (int32_t) LOOKAHEAD_MAX);
         llama_moe_stream_layer & nx = *layers[src + d];
-        // With needed-early and N > 1: the helper may come after the target started, or after a nearer guess for it (a layer
-        // with a direct add in between: its router on the CPU) - the guess is too late, its column is skipped (never on the direct
-        // path, which runs in layer order)
-        // (a word-start source's slot - sl null - takes the same rule with its own post word and counters)
         const int64_t post_word = sl ? sl->ne_post_word : ws_post_word[(size_t) src];
         if (la_from_helper && (nx.ne_started_word == post_word ||
                                (nx.la_latest_word == n_tok_outer && d > nx.la_latest_d))) {
             if (sl) {
-                sl->dec.n_ne_late_d[d] += 1;
+                sl->dec.n_ne_late_d[db] += 1;
             } else {
-                n_ws_late_d[ws_S0 - src][d] += 1;
+                n_ws_late_d[wj][db] += 1;
             }
             late_any = true;
             continue;
@@ -7860,30 +8035,26 @@ void llama_moe_stream::la_guesses_src(int32_t src, llama_moe_stream_layer * sl, 
             la_chk_log(nx.il, d, pred + (size_t) c*(size_t) width, width);   // test only: before the guess touches an entry
         }
         if (sl) {
-            sl->la_src_far[d] += d >= 2 ? width : 0;   // far guesses made at this layer
+            sl->la_src_far[db] += d >= 2 ? width : 0;   // far guesses made at this layer
         }
         if (gsf_full != nullptr && gsf_full[src + d]) {
-            gsf_lag_skipped++;   // a full target - its experts are all READY, nothing to read or keep; no placeholder ids reach the marks
+            gsf_lag_skipped++;
             continue;
         }
-        la_guess(nx, d, pred + (size_t) c*(size_t) width, width);
+        const float * sh_col = sh_base != nullptr ? sh_base + (size_t) c*(size_t) width : nullptr;
+        la_guess(nx, d, pred + (size_t) c*(size_t) width, width, sh_col);
     }
     if (sl) {
         sl->dec.n_ne_late += late_any ? 1 : 0;
     } else if (la_from_helper) {
-        n_ws_late[ws_S0 - src] += late_any ? 1 : 0;
+        n_ws_late[wj] += late_any ? 1 : 0;
     }
     (this->*la_sort_fn)();
-    // The sort may have made an entry bindable for a reader that sleeps because it is behind
-    // (a dropped entry named again, a better latest rank) - wake one, as an added entry does (pl_add_late)
-    if (behind_now() && la_live_bindable()) {
+    if ((behind_now() || gg_on) && la_live_bindable()) {
         cv_work.notify_one();
     }
 }
 
-// The host-side stand-in producer of a word-start source's slot: its n_t columns (la_targets order, width
-// ids each) into the source's slot, the call counter after ne_cols columns (as a streamed layer's), then the ring and the helper.
-// The GPU producer at the source layers writes the same slot. mtx held.
 void llama_moe_stream::ws_post(int32_t V, const int32_t * cols, int32_t width, int32_t n_t) {
     GGML_ASSERT(!ws_gpu && "with the sources on the GPU producer the word-start op is not built");
     if (width != ne_width || n_t < 1 || n_t > ne_cols) {
@@ -7898,6 +8069,9 @@ void llama_moe_stream::ws_post(int32_t V, const int32_t * cols, int32_t width, i
     for (int64_t i = 0; i < (int64_t) n_t*width; i++) {
         slot[i] = cols[i];
     }
+    if (gg_on && gg_shares_mem != nullptr) {
+        memcpy(ne_shares_of(V, n_t), gg_host_shares_of(V), (size_t) n_t*(size_t) width*sizeof(float));
+    }
     ne_counter(V) = ne_call_seq;
     if (ws_bad_counter) {   // test only: the first post only
         ws_bad_counter = false;
@@ -7905,34 +8079,31 @@ void llama_moe_stream::ws_post(int32_t V, const int32_t * cols, int32_t width, i
     }
     ws_post_word[(size_t) V] = n_tok_outer;
     ws_post_us  [(size_t) V] = ggml_time_us();
-    n_ws_post[ws_S0 - V]    += 1;
+    n_ws_post[std::min<int32_t>(ws_S0 - V, 8)] += 1;
     ne_q[(ne_q_head + ne_q_n) % ne_q.size()] = V;
     ne_q_n     += 1;
     ne_pending += 1;
     ne_cv.notify_one();
 }
 
-// The helper's adds for word-start source V (its slot passed the counter check) - exactly the word-start op's add code for that source:
-// la_guesses_src at N > 1 (a column whose target has started, or that a nearer guess for it already passed, is skipped and counted per
-// distance), prefetch_next's plan path at N 1 (skipped when the target has started). mtx held.
 void llama_moe_stream::ws_on_guess_ready(int32_t V) {
     int32_t ds[LOOKAHEAD_MAX];
     const int32_t n_t = la_targets(V, ds);
-    const int32_t j   = ws_S0 - V;
+    const int32_t j   = std::min<int32_t>(ws_S0 - V, 8);
     rec_ev_buf_cur = rec_ev_buf_helper;
     ws_adding      = true;
     if (la_on) {
         la_from_helper = true;
-        la_guesses_src(V, nullptr, ne_slot(V), ne_width, n_t);
+        la_guesses_src(V, nullptr, ne_slot(V), ne_width, n_t, gg_on ? ne_shares_of(V, n_t) : nullptr);
         la_from_helper = false;
     } else {
         llama_moe_stream_layer & nx = *layers[V + ds[0]];
         if (nx.ne_started_word == ws_post_word[(size_t) V]) {
             n_ws_late  [j]        += 1;
-            n_ws_late_d[j][ds[0]] += 1;
+            n_ws_late_d[j][std::min<int32_t>(ds[0], (int32_t) LOOKAHEAD_MAX)] += 1;
             ws_adding      = false;
             rec_ev_buf_cur = 0;
-            return;   // (review: a too-late N 1 post is not counted as done, as a streamed layer's in on_guess_ready)
+            return;
         }
         prefetch_next(nx, ne_slot(V), ne_width, 1, nx.il, ne_width, 0, V);
     }
@@ -7942,10 +8113,7 @@ void llama_moe_stream::ws_on_guess_ready(int32_t V) {
     t_ws_delay_us[j] += ggml_time_us() - ws_post_us[(size_t) V];
 }
 
-// The graph builder marks word-start source V's guess (its la_targets(V) columns of ne_width ids, I32,
-// contiguous - what its slot holds) with the guess mark; the GPU backend writes it into ne_slot(V), then the call's number,
-// then records V's "guess done" event, right after the node. Anything else would abort in the producer: stop here, naming it
-void llama_moe_stream::ws_mark_node(int32_t V, ggml_tensor * cols) {
+void llama_moe_stream::ws_mark_node(int32_t V, ggml_tensor * cols, ggml_tensor * shares) {
     int32_t ds[LOOKAHEAD_MAX];
     const int64_t n_want = (int64_t) ne_width*la_targets(V, ds);
     if (!ws_gpu || !ws_src(V) || cols->type != GGML_TYPE_I32 || !ggml_is_contiguous(cols) || ggml_nelements(cols) != n_want ||
@@ -7953,6 +8121,9 @@ void llama_moe_stream::ws_mark_node(int32_t V, ggml_tensor * cols) {
         moe_stream_fail("needed-early's GPU producer: word-start source %d's guess is %s, %lld ids (contiguous %d, a view %d); its slot takes "
                 "%lld int32 (the GPU producer for the sources %d)", V, ggml_type_name(cols->type), (long long) ggml_nelements(cols),
                 ggml_is_contiguous(cols) ? 1 : 0, cols->view_src != nullptr ? 1 : 0, (long long) n_want, ws_gpu ? 1 : 0);
+    }
+    if (gg_on && shares != nullptr && shares->type == GGML_TYPE_F32 && ggml_is_contiguous(shares) && ggml_nelements(shares) == n_want) {
+        cols->src[1] = shares;
     }
     cols->flags |= (int32_t) LLAMA_MOE_STREAM_TENSOR_GUESS_MARK;
     cols->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = V;
@@ -8006,13 +8177,14 @@ void llama_moe_stream::ws_split_issued(ggml_backend_t backend, ggml_cgraph * g) 
         }
         GGML_ASSERT(plan_on && decode_phase && ne_call_one);   // a GPU-producer graph: a decode call of one token (the word-start op's rule)
         const int32_t n_t = la_targets(V, ds);
+        const int32_t wj  = std::min<int32_t>(ws_S0 - V, 8);
         n_ws_words += ws_gpu_posted == 0 ? 1 : 0;
         for (int32_t t = 0; t < n_t; t++) {
-            n_ws_guess[ws_S0 - V][ds[t]] += 1;
+            n_ws_guess[wj][std::min<int32_t>(ds[t], (int32_t) LOOKAHEAD_MAX)] += 1;
         }
         ws_post_word[(size_t) V] = n_tok_outer;
         ws_post_us  [(size_t) V] = ggml_time_us();
-        n_ws_post[ws_S0 - V]    += 1;
+        n_ws_post[wj]           += 1;
         ne_q[(ne_q_head + ne_q_n) % ne_q.size()] = V;
         ne_q_n     += 1;
         ne_pending += 1;
@@ -8036,13 +8208,6 @@ void llama_moe_stream_sched_split_hook(void * user_data, ggml_backend_t split_ba
     ms->psplit_split_end(split_backend);
 }
 
-// --moe-stream-wordstart D: the word-start op's adds - the sources' guess columns (cols: [width, n_cols], source by
-// source in layer order S0 - D .. S0 - 1, each source's la_targets in order), added to the waiting list in that order through the
-// streamed layers' code: with N > 1 la_guesses_src per source (names, votes, latest, live / dropped, pace, the sort, the mid-way
-// rule), with N = 1 prefetch_next's plan path (the plain 1-ahead add; only the source right before S0 has a target). Only a decode
-// call of one token (as the streamed layers' list path); any other call adds nothing. It marks nothing else and
-// waits for nothing. Takes mtx.
-// (with needed-early 1 a slot-source is posted to the helper instead - ws_post)
 void llama_moe_stream::ws_add(const int32_t * cols, int32_t width, int64_t n_cols) {
     std::unique_lock<std::mutex> lock(mtx);
     if (!(plan_on && decode_phase && ne_call_one)) {
@@ -8063,16 +8228,17 @@ void llama_moe_stream::ws_add(const int32_t * cols, int32_t width, int64_t n_col
             moe_stream_fail("wordstart: the op has %lld guess columns, but the sources up to layer %d have %lld targets", (long long) n_cols,
                             V, (long long) (c0 + n_t));
         }
-        const int32_t * p = cols + (size_t) c0*(size_t) width;
+        const int32_t * p  = cols + (size_t) c0*(size_t) width;
+        const int32_t   wj = std::min<int32_t>(ws_S0 - V, 8);
         for (int32_t t = 0; t < n_t; t++) {
-            n_ws_guess[ws_S0 - V][ds[t]] += 1;
+            n_ws_guess[wj][std::min<int32_t>(ds[t], (int32_t) LOOKAHEAD_MAX)] += 1;
         }
         if (ne_on && !ws_slot.empty() && ws_slot[(size_t) V]) {
-            ws_post(V, p, width, n_t);   // a slot-source - the helper makes its adds (host-side stand-in), in source order
+            ws_post(V, p, width, n_t);
         } else if (la_on) {
             la_guesses_src(V, nullptr, p, width, n_t);
         } else {
-            llama_moe_stream_layer & nx = *layers[V + ds[0]];   // N = 1: d = 1, the first streamed layer
+            llama_moe_stream_layer & nx = *layers[V + ds[0]];
             prefetch_next(nx, p, width, 1, nx.il, width, 0, V);
         }
         c0 += n_t;
@@ -8095,16 +8261,9 @@ void llama_moe_stream_wordstart(ggml_tensor * dst, const ggml_tensor * a, int it
     mgr->ws_add((const int32_t *) a->data, (int32_t) a->ne[0], a->ne[1]);
 }
 
-// One guess for target nx at distance d (ids = its first `width` ranks, best first). This guess is now the latest for nx
-// (guesses for a target arrive d = N, ..., 2, 1 in a word): every name updates the expert's votes / latest distance / latest rank;
-// a name already in the pool (READY / LOADING) or VRAM-held adds nothing; one already listed is a vote (and live again if it was
-// dropped); a new one is an entry - all of them at d = 1, at most --moe-stream-guess-pace B at d >= 2 (the rest counted as skipped
-// by the pace). Entries the previous latest guess named and this one does not become dropped; a read bound for nx in this word,
-// still loading, that this guess does not name is moved back (its queued pieces wait behind every live entry), and moved forward
-// again when a later guess names it (not with the old order). The named marks cover every distance; the keep marks and the goal
-// counter stay the 1-ahead guess's (protect named is --moe-stream-protect-named). mtx held.
-void llama_moe_stream::la_guess(llama_moe_stream_layer & nx, int32_t d, const int32_t * ids, int32_t width) {
-    const int64_t w = n_tok_outer;
+void llama_moe_stream::la_guess(llama_moe_stream_layer & nx, int32_t d, const int32_t * ids, int32_t width, const float * shares) {
+    const int64_t w  = n_tok_outer;
+    const int32_t db = std::min<int32_t>(d, (int32_t) LOOKAHEAD_MAX);
     if (nx.la_latest_word != w) {
         nx.la_latest_word = w;
         nx.la_latest_d    = 127;   // no guess for this layer yet in this word
@@ -8118,25 +8277,29 @@ void llama_moe_stream::la_guess(llama_moe_stream_layer & nx, int32_t d, const in
     for (int32_t r = 0; r < width; r++) {
         const int32_t e = ids[r];
         GGML_ASSERT(e >= 0 && (uint32_t) e < nx.n_expert);
-        c.n_la_named[d] += 1;
+        c.n_la_named[db] += 1;
+        const int32_t s_res  = nx.expert_slot[e];
+        const bool    in_mem = nx.vx_held(e) || s_res >= 0;
+        if (!oracle_list) {
+            gg_note_raw(nx, e, d, r, width, shares, in_mem);
+        }
         if (nx.vx_held(e)) {
-            c.n_la_pool[d] += 1;   // in VRAM: never an entry
+            c.n_la_pool[db] += 1;   // in VRAM: never an entry
             continue;
         }
         nx.b0_named_word[e] = w;
         if (ws_adding) {
             nx.ws_named_word[e] = w;   // a word-start guess named it
         }
-        const int32_t s_res = nx.expert_slot[e];
         if (s_res >= 0) {
             dz_ahead(nx, s_res);
         }
-        if (d == 1) {
-            if (s_res >= 0) {
+        if (d == 1 || (has_interleaved_dense && prev == 127)) {
+            if (s_res >= 0 && d == 1) {
                 nx.keep[s_res] = 1;   // the protection of the 1-ahead guess's residents
-                pin_mark(nx);   // the next remap op clears this layer
+                pin_mark(nx);
             }
-            if (r < (int32_t) n_expert_used) {   // the 1-ahead guess's top k already READY
+            if (d == 1 && r < (int32_t) n_expert_used) {
                 c.n_goal_cand  += 1;
                 c.n_goal_ready += s_res >= 0 && nx.slot_state[s_res] == MOE_STREAM_SLOT_READY ? 1 : 0;
             }
@@ -8145,31 +8308,40 @@ void llama_moe_stream::la_guess(llama_moe_stream_layer & nx, int32_t d, const in
         const int32_t old_d = had ? nx.la_d[e] : 0;
         nx.la_word [e] = w;
         nx.la_votes[e] = had ? (uint8_t) std::min<int32_t>(nx.la_votes[e] + 1, 255) : 1;
-        nx.la_d    [e] = (int8_t) d;
+        nx.la_d    [e] = (int8_t) std::min<int32_t>(d, 126);
         nx.la_rank [e] = (int16_t) r;
         if (s_res >= 0) {
-            c.n_la_pool[d] += 1;
+            c.n_la_pool[db] += 1;
             continue;
         }
         if (nx.pl_listed[e]) {
-            c.n_la_vote[d] += 1;
-            c.n_dr_again   += had && old_d != prev ? 1 : 0;   // it was dropped (the previous latest guess did not name it)
+            c.n_la_vote[db] += 1;
+            c.n_dr_again    += had && old_d != prev ? 1 : 0;
             continue;
         }
-        if (d >= 2 && n_new >= guess_pace && !oracle_list) {   // (oracle list: a perfect guess is not paced)
-            c.n_la_pace[d] += 1;
+        if (d >= 2 && n_new >= guess_pace && !oracle_list) {
+            c.n_la_pace[db] += 1;
             continue;
+        }
+        if (gg_on && !oracle_list) {
+            const float p_hat   = (float) nx.gg_p_q15[e] * (1.0f / 32767.0f);
+            const float p_floor = d <= 1 ? 0.06f : 0.19f;
+            if (p_hat < p_floor) {
+                c.n_gg_skip_floor += 1;
+                continue;
+            }
         }
         n_new++;
         const int64_t t_add = ggml_time_us();
         pl_entry en = { nx.il, e, d, r, w, t_add, 0, nx.la_votes[e], 1, pl_seq++ };
-        en.ws = ws_adding ? 1 : 0;
-        c.n_ws_add    += en.ws;
-        c.n_la_new[d] += 1;
-        c.n_pl_add    += 1;
-        c.n_gx_add    += r >= (int32_t) n_expert_used ? 1 : 0;   // an extra rank
+        en.ws    = ws_adding ? 1 : 0;
+        en.p_q15 = nx.gg_p_q15[e];
+        c.n_ws_add     += en.ws;
+        c.n_la_new[db] += 1;
+        c.n_pl_add     += 1;
+        c.n_gx_add     += r >= (int32_t) n_expert_used ? 1 : 0;
         if (rec_ev_on) {
-            rec_emit(rec_ev_buf_cur, 5, 1, nx.il, e, -1, d, r, 0, t_add);   // ADD (lead = the distance that added it)
+            rec_emit(rec_ev_buf_cur, 5, 1, nx.il, e, -1, d, r, 0, t_add);
         }
         (this->*pl_on_add)(nx, en);
     }
@@ -8229,16 +8401,27 @@ void llama_moe_stream::la_guess(llama_moe_stream_layer & nx, int32_t d, const in
 // is the last key, so the order is deterministic. mtx held.
 void llama_moe_stream::la_sort() {
     const int64_t w = n_tok_outer;
+    int32_t n_undefer = 0;
     for (pl_entry & en : pl_list) {
         const llama_moe_stream_layer & nx = *layers[en.il];
         if (nx.la_word[en.e] == w) {
+            const uint8_t prev_v = en.votes;
+            const int32_t prev_d = en.lead;
             en.lead  = nx.la_d[en.e];
             en.rank  = nx.la_rank[en.e];
             en.votes = nx.la_votes[en.e];
             en.live  = nx.la_d[en.e] == nx.la_latest_d ? 1 : 0;
+            en.p_q15 = nx.gg_p_q15[en.e];
+            if (en.gg_defer == 1 && en.live && (en.votes > prev_v || en.lead < prev_d)) {
+                en.gg_defer = 0;   // confirmed at closer distance: wake a reader to re-evaluate
+                n_undefer++;
+            }
         }
     }
     std::sort(pl_list.begin(), pl_list.end(), [this](const pl_entry & a, const pl_entry & b) { return (this->*la_less)(a, b); });
+    for (int32_t k = 0; k < n_undefer; k++) {
+        cv_work.notify_one();
+    }
 }
 
 // TEST ONLY: la_sort + the list printed for the decode words la_dump_word .. +2 (MOE_STREAM_TEST_LIST_DUMP). mtx held.
@@ -8372,7 +8555,7 @@ void llama_moe_stream::la_chk_bind(const pl_entry & en, bool behind) {
     for (const pl_entry & x : pl_list) {
         const la_chk_val vx = la_chk_recompute(x.il, x.e);
         la_chk_fields(x, vx);
-        if (!la_chk_may_bind(vx, behind)) {
+        if (!la_chk_may_bind(vx, behind) || (gg_on && x.gg_defer != 0)) {
             continue;
         }
         v_order   = v_order   || la_chk_before(vx, x, ve, en);
@@ -8427,6 +8610,44 @@ bool llama_moe_stream::la_less_b(const pl_entry & a, const pl_entry & b) const {
         return !xa;
     }
     if (a.il != b.il) {
+        return a.il < b.il;
+    }
+    if (a.votes != b.votes) {
+        return a.votes > b.votes;
+    }
+    if (a.rank != b.rank) {
+        return a.rank < b.rank;
+    }
+    return a.seq < b.seq;
+}
+
+bool llama_moe_stream::la_less_gg(const pl_entry & a, const pl_entry & b) const {
+    if (a.live != b.live) {
+        return a.live > b.live;
+    }
+    const bool da = a.gg_defer != 0, db = b.gg_defer != 0;
+    if (da != db) {
+        return !da;
+    }
+    const bool xa = a.rank >= (int32_t) n_expert_used, xb = b.rank >= (int32_t) n_expert_used;
+    if (xa != xb) {
+        return !xa;
+    }
+    // Integer urgency-weighted score: p_q15 * inv_sqrt_d_q10 (1/sqrt(1)=1024, 1/sqrt(2)=724, 1/sqrt(3)=591, 1/sqrt(4)=512)
+    auto urg_score = [](const pl_entry & x) -> int32_t {
+        static const int32_t inv_sq[9] = { 1024, 1024, 724, 591, 512, 458, 418, 387, 362 };
+        const int32_t d = std::min<int32_t>(std::max<int32_t>(x.lead, 1), 8);
+        return ((int32_t) x.p_q15 * inv_sq[d]) >> 12;   // ~256 discrete levels: high-confidence near targets win cleanly
+    };
+    const int32_t sa = urg_score(a), sb = urg_score(b);
+    if (sa != sb && a.il == b.il) {
+        return sa > sb;
+    }
+    // Across distinct layers, allow a much higher-confidence entry (+0.18) on a 1-step-farther target to overtake a weak near tail
+    if (a.il != b.il) {
+        if (std::abs(a.il - b.il) <= 1 && std::abs(sa - sb) >= 1480) {
+            return sa > sb;
+        }
         return a.il < b.il;
     }
     if (a.votes != b.votes) {
@@ -8537,10 +8758,15 @@ bool llama_moe_stream::la_pop_prefetch(llama_moe_stream_job & job) {
 // does not skip (pl_skip_behind: the same test pl_take_behind applies). mtx held.
 bool llama_moe_stream::la_live_bindable() const {
     const bool behind = behind_now();
+    const int32_t q_act = n_inflight_pref + (int32_t) q_prefetch.size();
     for (const pl_entry & x : pl_list) {
-        if (x.live && !(behind && pl_skip_behind(x))) {
-            return true;
+        if (!x.live || (behind && pl_skip_behind(x))) {
+            continue;
         }
+        if (gg_on && (x.gg_defer == 1 || (x.gg_defer == 2 && q_act > 0))) {
+            continue;
+        }
+        return true;
     }
     return false;
 }
@@ -8659,24 +8885,85 @@ void llama_moe_stream::pl_drop(llama_moe_stream_layer & nx, const pl_entry & en,
 // now, or whose pool has no slot a guess may take, are removed and counted. Returns false when the list ran out. mtx held.
 template <bool CHK>
 bool llama_moe_stream::pl_take(int ith) {
-    while (!pl_list.empty()) {
-        const pl_entry en = pl_list.front();
-        pl_list.erase(pl_list.begin());
+    if (!gg_on || oracle_list) {
+        while (!pl_list.empty()) {
+            const pl_entry en = pl_list.front();
+            pl_list.erase(pl_list.begin());
 
-        llama_moe_stream_layer & nx = *layers[en.il];
-        nx.pl_listed[en.e] = 0;
+            llama_moe_stream_layer & nx = *layers[en.il];
+            nx.pl_listed[en.e] = 0;
 
-        if (nx.expert_slot[en.e] >= 0 || nx.vx_held(en.e)) {
+            if (nx.expert_slot[en.e] >= 0 || nx.vx_held(en.e)) {
+                pl_drop(nx, en, MOE_STREAM_PL_PRESENT, 1 + ith);
+                continue;
+            }
+            const int32_t s = pick_victim(nx, /* cancel = */ false, /* protect = */ false, /* prefetch = */ true);
+            if (s < 0) {
+                pl_drop(nx, en, MOE_STREAM_PL_NOROOM, 1 + ith);
+                continue;
+            }
+            if constexpr (CHK) {
+                la_chk_bind(en, /* behind = */ false);
+            }
+            pl_bind(nx, en, s, 1 + ith);
+            return true;
+        }
+        return false;
+    }
+
+    const int32_t q_act = n_inflight_pref + (int32_t) q_prefetch.size();
+    size_t i = 0;
+    while (i < pl_list.size()) {
+        pl_entry & ref = pl_list[i];
+        if (ref.gg_defer == 1) {
+            i++;
+            continue;
+        }
+        llama_moe_stream_layer & nx = *layers[ref.il];
+        if (nx.expert_slot[ref.e] >= 0 || nx.vx_held(ref.e)) {
+            const pl_entry en = ref;
+            pl_list.erase(pl_list.begin() + (ptrdiff_t) i);
+            nx.pl_listed[en.e] = 0;
             pl_drop(nx, en, MOE_STREAM_PL_PRESENT, 1 + ith);
             continue;
         }
         const int32_t s = pick_victim(nx, /* cancel = */ false, /* protect = */ false, /* prefetch = */ true);
         if (s < 0) {
+            const pl_entry en = ref;
+            pl_list.erase(pl_list.begin() + (ptrdiff_t) i);
+            nx.pl_listed[en.e] = 0;
             pl_drop(nx, en, MOE_STREAM_PL_NOROOM, 1 + ith);
             continue;
         }
+        const float p_hat = (float) ref.p_q15 * (1.0f / 32767.0f);
+        const float tau0  = gg_tau_bind(nx, s, 0, ref.lead, ref.votes);
+        if (p_hat <= tau0) {
+            if (ref.lead <= 1) {
+                const pl_entry en = ref;
+                pl_list.erase(pl_list.begin() + (ptrdiff_t) i);
+                nx.pl_listed[en.e] = 0;
+                nx.dec.n_gg_skip_vic += 1;
+                pl_drop(nx, en, MOE_STREAM_PL_STALE, 1 + ith);
+            } else {
+                ref.gg_defer = 1;
+                nx.dec.n_gg_skip_vic += 1;
+                i++;
+            }
+            continue;
+        }
+        if (q_act > 0 && p_hat <= gg_tau_bind(nx, s, q_act, ref.lead, ref.votes)) {
+            if (ref.gg_defer != 2) {
+                ref.gg_defer = 2;
+                nx.dec.n_gg_defer_q += 1;
+            }
+            i++;
+            continue;
+        }
+        const pl_entry en = ref;
+        pl_list.erase(pl_list.begin() + (ptrdiff_t) i);
+        nx.pl_listed[en.e] = 0;
         if constexpr (CHK) {
-            la_chk_bind(en, /* behind = */ false);   // test only
+            la_chk_bind(en, /* behind = */ false);
         }
         pl_bind(nx, en, s, 1 + ith);
         return true;
@@ -8684,20 +8971,17 @@ bool llama_moe_stream::pl_take(int ith) {
     return false;
 }
 
-// The behind rule: while the drive is behind (>= B reads not finished), the reader binds the first
-// entry ranked R or better (1-based) and leaves every entry ranked above R on the list, in its place (each counted once as
-// skipped); not behind = pl_take. Returns false when nothing was bound (the list ran out, or every entry left is ranked above
-// R). Pieces of reads already started are not touched here (steps 1-2 of the turn, before this). mtx held.
 template <bool CHK>
 bool llama_moe_stream::pl_take_behind(int ith) {
     if (bl_n < bh_B) {
         return pl_take<CHK>(ith);
     }
     bh_note_word();
+    const int32_t q_act = n_inflight_pref + (int32_t) q_prefetch.size();
     size_t i = 0;
     while (i < pl_list.size()) {
         pl_entry & ref = pl_list[i];
-        if (pl_skip_behind(ref)) {   // en.rank is 0-based: rank + 1 > R; lookahead: dropped first (one test, see la_live_bindable)
+        if (pl_skip_behind(ref)) {
             if (!ref.bh_skip) {
                 ref.bh_skip = 1;
                 layers[ref.il]->dec.n_bh_skip += 1;
@@ -8705,23 +8989,57 @@ bool llama_moe_stream::pl_take_behind(int ith) {
             i++;
             continue;
         }
-        const pl_entry en = ref;
-        pl_list.erase(pl_list.begin() + (ptrdiff_t) i);
-
-        llama_moe_stream_layer & nx = *layers[en.il];
-        nx.pl_listed[en.e] = 0;
-
-        if (nx.expert_slot[en.e] >= 0 || nx.vx_held(en.e)) {
+        if (gg_on && !oracle_list && ref.gg_defer == 1) {
+            i++;
+            continue;
+        }
+        llama_moe_stream_layer & nx = *layers[ref.il];
+        if (nx.expert_slot[ref.e] >= 0 || nx.vx_held(ref.e)) {
+            const pl_entry en = ref;
+            pl_list.erase(pl_list.begin() + (ptrdiff_t) i);
+            nx.pl_listed[en.e] = 0;
             pl_drop(nx, en, MOE_STREAM_PL_PRESENT, 1 + ith);
             continue;
         }
         const int32_t s = pick_victim(nx, /* cancel = */ false, /* protect = */ false, /* prefetch = */ true);
         if (s < 0) {
+            const pl_entry en = ref;
+            pl_list.erase(pl_list.begin() + (ptrdiff_t) i);
+            nx.pl_listed[en.e] = 0;
             pl_drop(nx, en, MOE_STREAM_PL_NOROOM, 1 + ith);
             continue;
         }
+        if (gg_on && !oracle_list) {
+            const float p_hat = (float) ref.p_q15 * (1.0f / 32767.0f);
+            const float tau0  = gg_tau_bind(nx, s, 0, ref.lead, ref.votes);
+            if (p_hat <= tau0) {
+                if (ref.lead <= 1) {
+                    const pl_entry en = ref;
+                    pl_list.erase(pl_list.begin() + (ptrdiff_t) i);
+                    nx.pl_listed[en.e] = 0;
+                    nx.dec.n_gg_skip_vic += 1;
+                    pl_drop(nx, en, MOE_STREAM_PL_STALE, 1 + ith);
+                } else {
+                    ref.gg_defer = 1;
+                    nx.dec.n_gg_skip_vic += 1;
+                    i++;
+                }
+                continue;
+            }
+            if (q_act > 0 && p_hat <= gg_tau_bind(nx, s, q_act, ref.lead, ref.votes)) {
+                if (ref.gg_defer != 2) {
+                    ref.gg_defer = 2;
+                    nx.dec.n_gg_defer_q += 1;
+                }
+                i++;
+                continue;
+            }
+        }
+        const pl_entry en = ref;
+        pl_list.erase(pl_list.begin() + (ptrdiff_t) i);
+        nx.pl_listed[en.e] = 0;
         if constexpr (CHK) {
-            la_chk_bind(en, /* behind = */ true);   // test only
+            la_chk_bind(en, /* behind = */ true);
         }
         pl_bind(nx, en, s, 1 + ith);
         return true;
@@ -8760,23 +9078,23 @@ void llama_moe_stream::bl_end(llama_moe_stream_layer & sl, int32_t slot) {
 // The host producer, a host-side stand-in for the GPU copy + "guess done" event (coordination 3.1): the guess ids into
 // the layer's slot, then the call counter (consumed + 1), then the signal. mtx held (the remap op).
 void llama_moe_stream::ne_post(llama_moe_stream_layer & sl, const int32_t * pred, int64_t n_pred) {
-    // With lookahead N > 1 the guess has one column of ne_width ids per la_targets target, and the helper reads exactly
-    // that many (la_targets again), so a graph that built fewer stops the run here
     int32_t ds[LOOKAHEAD_MAX];
-    const int64_t n_want = (int64_t) ne_width*(la_on ? la_targets(sl.il, ds) : 1);
+    const int32_t n_c    = la_on ? la_targets(sl.il, ds) : 1;
+    const int64_t n_want = (int64_t) ne_width*n_c;
     if (n_pred != n_want) {
         moe_stream_fail("guess helper: layer %d posted %lld ids, expected %lld (%d per column x its streamed targets)", sl.il,
                 (long long) n_pred, (long long) n_want, ne_width);
     }
-    // One post per layer per call (decode calls of one token only), and the word-end drain empties the ring before
-    // the next call, so the ring (n_layer places) cannot fill and a layer's slot is never posted twice before the helper took it
-    if (ne_q_n >= ne_q.size() || ne_counter(sl.il) == ne_call_seq) {   // the counter is the call's number
+    if (ne_q_n >= ne_q.size() || ne_counter(sl.il) == ne_call_seq) {
         moe_stream_fail("guess helper: layer %d posted with %zu of %zu ring places taken and call counter %u (this call %u) - "
                 "a second post in one call", sl.il, ne_q_n, ne_q.size(), ne_counter(sl.il), ne_call_seq);
     }
     int32_t * slot = ne_slot(sl.il);
     for (int64_t i = 0; i < n_pred; i++) {
         slot[i] = pred[i];
+    }
+    if (gg_on && gg_shares_mem != nullptr && n_c > 0) {
+        memcpy(ne_shares_of(sl.il, n_c), gg_host_shares_of(sl.il), (size_t) n_want*sizeof(float));
     }
     ne_counter(sl.il) = ne_call_seq;
     sl.ne_post_word   = n_tok_outer;
@@ -9103,6 +9421,7 @@ void llama_moe_stream::ne_gpu_setup(const std::vector<ggml_backend_dev_t> & rout
             }
         }
         (r ? skip_router : skip_guess) = (int32_t) n;
+        ne_test_skip_event = true;
         fprintf(stderr, "%s: MOE_STREAM_TEST_SKIP_EVENT=%s (TEST ONLY): %s %d's %s producer never runs (no write, no \"%s done\" "
                 "event) - the run must stop at the counter check\n", __func__, e, w ? "word-start source" : "layer", (int) n,
                 r ? "router" : "guess", r ? "router" : "guess");
@@ -9119,21 +9438,16 @@ void llama_moe_stream::ne_gpu_setup(const std::vector<ggml_backend_dev_t> & rout
     ggml_backend_buffer_type_t hbt = gpu_dev != nullptr ? ggml_backend_dev_host_buffer_type(gpu_dev) : nullptr;
     const int32_t n_layer_all = (int32_t) (ne_buf.size() / (size_t) ne_stride);
     const size_t  b_guess     = (size_t) n_layer_all*ne_stride*sizeof(int32_t);
-    // a router slot: the router's ids (n_expert_used int32) and the router input (n_embd floats), each at a 16-byte offset (the
-    // packing of moe-mark.cu); the counters one 64-byte line per layer
     const int64_t rd_cap      = (int64_t) GGML_PAD(n_expert_used*sizeof(int32_t), 16) + (int64_t) GGML_PAD((size_t) n_embd*sizeof(float), 16);
     const size_t  o_cell      = GGML_PAD(b_guess, 64);
-    const size_t  o_rd_ctr    = o_cell + 64;                                    // + the call cell (its own cache line)
+    const size_t  o_rd_ctr    = o_cell + 64;
     const size_t  o_rd_slots  = o_rd_ctr + (size_t) n_layer_all*64;
-    // With --moe-stream-prompt-split one shared router slot for a CPU-wave prompt ubatch (every layer's router mark
-    // writes it: layer L+1's router runs only after layer L's CPU split has taken its inputs, so one slot is enough), at the end
     const int64_t ps_rows_in  = p1.prompt_split && gpu_waves > 1 ? (int64_t) gpu_waves - 1 : 0;
     const int64_t ps_cap_b    = llama_moe_stream_ps_cap(ps_rows_in, ne_width, n_embd, n_expert_used);
     const size_t  o_ps_slot   = o_rd_slots + (size_t) n_layer_all*(size_t) rd_cap;
     const size_t  n_bytes     = o_ps_slot + (size_t) ps_cap_b;
-    // The RAM plan and the load count exactly this (llama_moe_stream_ne2_bytes)
     GGML_ASSERT((int64_t) n_bytes == llama_moe_stream_ne2_bytes(n_layer_all, la_on ? (int64_t) lookahead : 1, ne_width, n_embd,
-                                                                  n_expert_used, ps_rows_in));
+                                                                  n_expert_used, ps_rows_in, gg_on));
     if (why == nullptr && (f_reg == nullptr || f_wait == nullptr || f_unreg == nullptr || f_sync == nullptr)) {
         why = "the GPU backend has no guess-mark functions";
     } else if (why == nullptr && hbt == nullptr) {
@@ -9141,8 +9455,6 @@ void llama_moe_stream::ne_gpu_setup(const std::vector<ggml_backend_dev_t> & rout
     }
     if (why == nullptr) {
         ne_pin_buf = ggml_backend_buft_alloc_buffer(hbt, n_bytes);
-        // CUDA's host buffer type falls back to a plain (pageable) CPU buffer when cudaMallocHost fails or GGML_CUDA_NO_PINNED
-        // is set - a kernel must not write through that pointer
         if (ne_pin_buf == nullptr) {
             why = "the pinned slot buffer could not be allocated";
         } else if (ggml_backend_buffer_get_type(ne_pin_buf) != hbt || !ggml_backend_buffer_is_host(ne_pin_buf)) {
@@ -9171,20 +9483,24 @@ void llama_moe_stream::ne_gpu_setup(const std::vector<ggml_backend_dev_t> & rout
         std::vector<int64_t>          caps(n_layer_all, 0);
         std::vector<uint32_t *>       counters(n_layer_all, nullptr);
         std::vector<const uint32_t *> expected(n_layer_all, nullptr);
+        auto guess_slot_cap = [&](int32_t nt) -> int64_t {
+            const size_t b0 = (size_t) ne_width*(size_t) nt*sizeof(int32_t);
+            return gg_on ? (int64_t) (GGML_PAD(b0, 16) + GGML_PAD((size_t) ne_width*(size_t) nt*sizeof(float), 16)) : (int64_t) b0;
+        };
         for (auto & slp : layers) {
-            if (slp && slp->ne_post_on && slp->ne_gpu_ok) {   // GPU-producer layers only
+            if (slp && slp->ne_post_on && slp->ne_gpu_ok) {
                 slots[slp->il]    = ne_slot(slp->il);
-                caps[slp->il]     = (int64_t) ne_width*la_cols_of(slp->il)*(int64_t) sizeof(int32_t);   // its N columns
+                caps[slp->il]     = guess_slot_cap(la_cols_of(slp->il));
                 counters[slp->il] = &ne_counter(slp->il);
                 expected[slp->il] = ne_call_cell;
             }
         }
-        for (int32_t V = ws_first; ws_all && V < ws_S0; V++) {   // the word-start sources' slots
+        for (int32_t V = ws_first; ws_all && V < ws_S0; V++) {
             int32_t ds[LOOKAHEAD_MAX];
             const int32_t n_t = la_targets(V, ds);
             if (n_t > 0) {
                 slots[V]    = ne_slot(V);
-                caps[V]     = (int64_t) ne_width*n_t*(int64_t) sizeof(int32_t);   // its la_targets(V) columns
+                caps[V]     = guess_slot_cap(n_t);
                 counters[V] = &ne_counter(V);
                 expected[V] = ne_call_cell;
             }
@@ -9430,13 +9746,24 @@ bool llama_moe_stream::rd_input_hook(ggml_backend_t split_backend, int n_inputs,
     } else {
         n_rd_event += 1;
         if (!ne_mark_wait(LLAMA_MOE_MARK_ROUTER, il)) {
-            moe_stream_fail("router done: waiting for layer %d's \"router done\" event failed (the reason is on the line above)", il);
+            if (ne_test_skip_event) {
+                moe_stream_fail("router done: waiting for layer %d's \"router done\" event failed (the reason is on the line above)", il);
+            }
+            fprintf(stderr, "llama_moe_stream: router done: event wait failed on layer %d - falling back to plain split input copy\n", il);
+            ne_rd_layer[(size_t) il] = 0;
+            return false;
         }
         const uint32_t c = moe_atomic_load_acquire_u32(ctr);
         if (c != ne_call_seq) {
-            moe_stream_fail("router done: layer %d's router slot has call counter %u, expected %u (this call's number)%s", il, c,
-                    ne_call_seq, c == 0 ? " - its GPU producer never ran: the router did not run on the GPU (its node is not on a "
-                    "CUDA split - check -ot / placement), or MOE_STREAM_TEST_SKIP_EVENT" : "");
+            if (ne_test_skip_event) {
+                moe_stream_fail("router done: layer %d's router slot has call counter %u, expected %u (this call's number)%s", il, c,
+                        ne_call_seq, c == 0 ? " - its GPU producer never ran: the router did not run on the GPU (its node is not on a "
+                        "CUDA split - check -ot / placement), or MOE_STREAM_TEST_SKIP_EVENT" : "");
+            }
+            fprintf(stderr, "llama_moe_stream: router done: layer %d's GPU producer did not write slot (counter %u != %u) - falling back to plain split input copy\n",
+                    il, c, ne_call_seq);
+            ne_rd_layer[(size_t) il] = 0;
+            return false;
         }
     }
     ggml_backend_synchronize(split_backend);   // the split backend finished with the previous copies (on the CPU: nothing to wait)
@@ -9616,10 +9943,22 @@ void llama_moe_stream::ne_loop() {
         }
         if (!layers[il]) {   // a word-start source's slot - the same counter rule, then the word-start adds for that source
             if (ne_counter(il) != ne_call_seq) {
-                moe_stream_fail("guess helper: word-start source layer %d's slot has call counter %u, expected %u (this call's "
-                        "number)%s", il, ne_counter(il), ne_call_seq, ws_bad_counter_set ?
-                        " (MOE_STREAM_TEST_WS_BAD_COUNTER=1: a test, not a bug)" : ws_gpu ? " - its GPU producer did not run in this "
-                        "call: the guess did not run on the GPU (check -ot / placement), or MOE_STREAM_TEST_SKIP_EVENT=w:N" : "");
+                if (ne_test_skip_event || ws_bad_counter_set) {
+                    moe_stream_fail("guess helper: word-start source layer %d's slot has call counter %u, expected %u (this call's "
+                            "number)%s", il, ne_counter(il), ne_call_seq, ws_bad_counter_set ?
+                            " (MOE_STREAM_TEST_WS_BAD_COUNTER=1: a test, not a bug)" : ws_gpu ? " - its GPU producer did not run in this "
+                            "call: the guess did not run on the GPU (check -ot / placement), or MOE_STREAM_TEST_SKIP_EVENT=w:N" : "");
+                }
+                static std::atomic<bool> ws_warned{false};
+                if (!ws_warned.exchange(true)) {
+                    fprintf(stderr, "llama_moe_stream: guess helper: word-start source %d's GPU mark did not run (counter %u != %u) - skipping word-start guess\n",
+                            il, ne_counter(il), ne_call_seq);
+                }
+                ne_pending -= 1;
+                if (ne_pending == 0) {
+                    ne_done_cv.notify_all();
+                }
+                continue;
             }
             ws_on_guess_ready(il);
             ne_pending -= 1;
@@ -9629,13 +9968,23 @@ void llama_moe_stream::ne_loop() {
             continue;
         }
         llama_moe_stream_layer & sl = *layers[il];
-        // the counter rule: the slot is this call's, not an older one (the GPU producer: a GPU-written counter proves it)
-        if (ne_counter(il) != ne_call_seq) {   // this call's number (was: the helper's consumed count + 1)
-            // A slot never written since the start: the guess node did not run on the GPU
-            moe_stream_fail("guess helper: layer %d's slot has call counter %u, expected %u (this call's number)%s", il,
-                    ne_counter(il), ne_call_seq, ne_gpu && ne_counter(il) == 0 ? " - its GPU producer never ran: the guess "
-                    "did not run on the GPU (its node is not on a CUDA split - check -ot / placement), or "
-                    "MOE_STREAM_TEST_SKIP_EVENT" : "");
+        if (ne_counter(il) != ne_call_seq) {
+            if (ne_test_skip_event || ws_bad_counter_set) {
+                moe_stream_fail("guess helper: layer %d's slot has call counter %u, expected %u (this call's number)%s", il,
+                        ne_counter(il), ne_call_seq, ne_gpu && ne_counter(il) == 0 ? " - its GPU producer never ran: the guess "
+                        "did not run on the GPU (its node is not on a CUDA split - check -ot / placement), or "
+                        "MOE_STREAM_TEST_SKIP_EVENT" : "");
+            }
+            static std::atomic<bool> ne_warned{false};
+            if (!ne_warned.exchange(true)) {
+                fprintf(stderr, "llama_moe_stream: guess helper: layer %d's GPU mark did not run (counter %u != %u) - skipping early guess\n",
+                        il, ne_counter(il), ne_call_seq);
+            }
+            ne_pending -= 1;
+            if (ne_pending == 0) {
+                ne_done_cv.notify_all();
+            }
+            continue;
         }
         sl.ne_consumed += 1;
         { moe_trace_span tr_(GGML_TRACE_LANE(6, 0), "guess adds", il); on_guess_ready(il); }
@@ -9646,19 +9995,14 @@ void llama_moe_stream::ne_loop() {
     }
 }
 
-// Under the engine lock, the posted guess of layer il: skipped if its target has already started in this word
-// ("guess too late"), else exactly the plan-1 add code (prefetch_next's keep loop, the lateness counters' named marks, the goal counter,
-// the list adds, one reader wake per entry) - the add code is the same in both stages. mtx held.
 void llama_moe_stream::on_guess_ready(int32_t il) {
     llama_moe_stream_layer & sl = *layers[il];
     if (la_on) {
-        // Exactly the direct path's adds (la_guesses: the entries, votes, live / dropped, pace, sort, mid-way), with the
-        // N columns; a column whose target has started, or that a nearer guess for its target already passed, is skipped there
-        // (counted per distance as too late)
         int32_t ds[LOOKAHEAD_MAX];
+        const int32_t n_t = la_targets(il, ds);
         rec_ev_buf_cur = rec_ev_buf_helper;
         la_from_helper = true;
-        la_guesses(sl, ne_slot(il), ne_width, la_targets(il, ds));
+        la_guesses(sl, ne_slot(il), ne_width, n_t, gg_on ? ne_shares_of(il, n_t) : nullptr);
         la_from_helper = false;
         rec_ev_buf_cur = 0;
         const int64_t d = ggml_time_us() - sl.ne_post_us;
@@ -12052,6 +12396,17 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
     // it from now on ("guess too late")
     if (decode_phase && n_tok == 1 && wave == 0) {
         sl.ne_started_word = n_tok_outer;
+        if (sl.moe_index > 0 && gg_prev_word == n_tok_outer && t_op0 > gg_prev_op_us) {
+            const float dt_us = (float) (t_op0 - gg_prev_op_us);
+            if (dt_us >= 20.0f && dt_us <= 50000.0f) {
+                gg_layer_ewma_us = 0.95f * gg_layer_ewma_us + 0.05f * dt_us;
+            }
+        }
+        gg_prev_op_us = t_op0;
+        gg_prev_word  = n_tok_outer;
+        if (ne_call_one) {
+            gg_settle_word(sl, ids, n);
+        }
         if (pr_check) {
             pr_check_layer(sl);   // test only
         }
@@ -12875,7 +13230,7 @@ void llama_moe_stream::remap_guess(llama_moe_stream_layer & sl, const int32_t * 
             } else if (sl.ne_post_on) {
                 ne_post(sl, pred, (int64_t) width*sl.la_cols);   // the helper makes the adds, all N columns
             } else {
-                la_guesses(sl, pred, (int32_t) width, sl.la_cols);   // the guesses for the layers 1..N ahead, then the sort
+                la_guesses(sl, pred, (int32_t) width, sl.la_cols, gg_on ? gg_host_shares_of(sl.il) : nullptr);   // the guesses for the layers 1..N ahead, then the sort
             }
         } else if (sl.ne_post_on && plan_on && ne_call_one && n_tok == 1 && !correction) {
             if (ne_gpu && sl.ne_guess_marked) {
@@ -12886,7 +13241,7 @@ void llama_moe_stream::remap_guess(llama_moe_stream_layer & sl, const int32_t * 
         } else {
             n_la_direct_ub += la_on && plan_on && decode_phase && n_tok == 1 && !ne_call_one ? 1 : 0;
             prefetch_next(sl, pred, n_tok > 0 ? (int32_t) width : 0, n_tok, sl.pred_il, (int32_t) width,
-                          correction ? 2 : 0);
+                          correction ? 2 : 0, -1);
         }
     }
 
@@ -14726,6 +15081,37 @@ void llama_moe_stream::print_stats() const {
                 s.t_read > 0 ? 1e-3*(double) s.bytes/s.t_read : 0.0);
     }
 
+    {
+        int64_t mr = 0, mw = 0, sr = 0, sw = 0, sf = 0, sv = 0, dq = 0, pns = 0, rb64 = 0, rb64g = 0;
+        for (const auto & slp : layers) {
+            if (!slp) {
+                continue;
+            }
+            const auto & c = slp->dec;
+            mr    += c.n_gg_mem_right;  mw    += c.n_gg_mem_wrong;
+            sr    += c.n_gg_ssd_right;  sw    += c.n_gg_ssd_wrong;
+            sf    += c.n_gg_skip_floor; sv    += c.n_gg_skip_vic;
+            dq    += c.n_gg_defer_q;    pns   += c.n_gg_pn_skip;
+            rb64  += c.n_rb64;          rb64g += c.n_rb64_guess;
+        }
+        const double d_tok = dec.n_tok > 0 && n_streamed > 0 ? (double) (dec.n_tok / n_streamed) : 0.0;
+        if (d_tok > 0.0 && (mr + mw + sr + sw + sf + sv) > 0) {
+            const int64_t m_tot = mr + mw, s_tot = sr + sw, g_tot = m_tot + s_tot;
+            fprintf(stderr, "%s: guesser census [decode, %.0f tok] total %.2f/tok | in-mem: %.2f/tok (right %.2f, wrong %.2f [harmless], prec %.1f%%) "
+                    "| on-SSD: %.2f/tok (right %.2f, wrong %.2f [harmful], prec %.1f%%) | rb64 %.2f/tok (by_guess %" PRId64 " / %" PRId64 ")\n",
+                    __func__, d_tok, g_tot / d_tok,
+                    m_tot / d_tok, mr / d_tok, mw / d_tok, m_tot > 0 ? 100.0 * mr / m_tot : 0.0,
+                    s_tot / d_tok, sr / d_tok, sw / d_tok, s_tot > 0 ? 100.0 * sr / s_tot : 0.0,
+                    rb64 / d_tok, rb64g, rb64);
+            if (gg_on) {
+                fprintf(stderr, "%s: guess-gate [on]: skip_floor %.2f/tok (%" PRId64 "), skip_vic %.2f/tok (%" PRId64 "), "
+                        "defer_q %.2f/tok (%" PRId64 "), pn_skip %.2f/tok (%" PRId64 "); ssd_lat %.0f us, ssd_bw %.2f GB/s, layer %.0f us\n",
+                        __func__, sf / d_tok, sf, sv / d_tok, sv, dq / d_tok, dq, pns / d_tok, pns,
+                        (double) gg_ssd_lat_ewma_us, (double) gg_ssd_bw_ewma_gbps, (double) gg_layer_ewma_us);
+            }
+        }
+    }
+
     // The recorded router input of the layer-ahead guess, for a learned corrector to train on.
     // Four arrays and a json, like the score dump: the vectors, the guess the engine made from them,
     // the real top-k of the layer the guess was for, and the decode word index of each row. The group
@@ -15022,6 +15408,10 @@ void llama_moe_stream::vx_load_list() {
         vx_flags_off("no MoE layer is streamed (every one is a whole VRAM layer), nothing to hold");
         return;
     }
+    if (!vx_compat) {
+        vx_flags_off(vx_incompat_why.empty() ? "incompatible MoE layer layout (e.g. fused gate_up, expert bias, or non-SiLU activation)" : vx_incompat_why.c_str());
+        return;
+    }
     if (sidecar_layout != "plain" || n_repacked_blocks > 0) {
         vx_flags_off(format("the GPU reads the plain layout, this sidecar is '%s'", sidecar_layout.c_str()).c_str());
         return;
@@ -15158,6 +15548,10 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
         return true;
     }
     vx_keep_short = false;
+    if (!vx_compat) {
+        vx_flags_off(vx_incompat_why.empty() ? "incompatible MoE layer layout (e.g. fused gate_up, expert bias, or non-SiLU activation)" : vx_incompat_why.c_str());
+        return false;
+    }
     if (uma_active) {
         vx_flags_off("unified-memory mode (--moe-stream-uma 1) shares physical RAM with the GPU without a duplicate VRAM pool");
         return false;
@@ -24418,4 +24812,346 @@ void llama_moe_stream::np_print() const {
     const double M = 1024.0*1024.0;
     fprintf(stderr, "llama_moe_stream: non-pool memory: planned %.1f MiB (+ the weights in RAM %.1f); measured in replies, peak over %lld samples: %.1f MiB = KV in RAM %.1f + host compute "
             "buffers %.1f + the rest %.1f; slots switched off at the start %u\n", np_planned/M, np_known/M, (long long) np_n, np_peak/M, np_kv/M, np_compute/M, np_rest/M, np_off);
+}
+
+
+// ===== --moe-stream-guess-gate & 2x2 Guesser Census =====
+
+static inline int32_t gg_d_cls(int32_t d) {
+    return d <= 1 ? 0 : d == 2 ? 1 : d <= 4 ? 2 : 3;
+}
+
+int32_t llama_moe_stream::gg_share_bin(float share) const {
+    const float u = std::max(0.0f, share) * std::max(1.0f, (float) n_expert_used);
+    if (u < 0.55f) { return 0; }
+    if (u < 0.72f) { return 1; }
+    if (u < 0.88f) { return 2; }
+    if (u < 1.05f) { return 3; }
+    if (u < 1.25f) { return 4; }
+    if (u < 1.55f) { return 5; }
+    if (u < 2.00f) { return 6; }
+    return 7;
+}
+
+float llama_moe_stream::gg_p_hat(const llama_moe_stream_layer & nx, int32_t d, bool multi_vote, int32_t bin, float share) const {
+    // Cold-start priors for On-SSD (!in_mem) candidates; online Empirical-Bayes converges in < 32 decode words.
+    static const float base_tbl[GG_N_D][GG_N_MV] = {
+        { 0.44f, 0.70f },
+        { 0.25f, 0.54f },
+        { 0.17f, 0.42f },
+        { 0.13f, 0.34f },
+    };
+    static const float bin_mul[GG_N_BIN] = {
+        0.45f, 0.62f, 0.78f, 0.95f, 1.10f, 1.24f, 1.36f, 1.48f
+    };
+    const int32_t dc = gg_d_cls(d);
+    const int32_t mv = multi_vote ? 1 : 0;
+    const int32_t b  = std::min<int32_t>(std::max<int32_t>(bin, 0), GG_N_BIN - 1);
+    const float   p0 = std::min(0.96f, std::max(0.04f, base_tbl[dc][mv] * bin_mul[b]));
+
+    const gg_cell_t & G = gg_global[dc][mv][b];
+    const float p_glob  = (G.hits + 6.0f * p0) / (G.trials + 6.0f);
+
+    float p_post = p_glob;
+    const size_t idx = (((size_t) std::max<int32_t>(nx.moe_index, 0) * GG_N_D + (size_t) dc) * GG_N_MV + (size_t) mv) * GG_N_BIN + (size_t) b;
+    if (idx < gg_cells.size()) {
+        const gg_cell_t & C = gg_cells[idx];
+        p_post = (C.hits + 10.0f * p_glob) / (C.trials + 10.0f);
+    }
+    const float u_nudge = 0.004f * std::min(2.5f, std::max(0.0f, share) * std::max(1.0f, (float) n_expert_used));
+    return std::min(0.99f, std::max(0.01f, p_post + u_nudge));
+}
+
+float llama_moe_stream::gg_slot_rb_prob(const llama_moe_stream_layer & nx, int32_t s) const {
+    if (s < 0 || (uint32_t) s >= nx.n_slots) {
+        return 0.0f;
+    }
+    if (nx.slot_state[s] == MOE_STREAM_SLOT_EMPTY || (!nx.slot_cancel.empty() && nx.slot_cancel[s])) {
+        return 0.0f;
+    }
+    if ((!nx.slot_idle.empty() && nx.slot_idle[s]) || (!nx.slot_ra.empty() && nx.slot_ra[s])) {
+        return 0.02f;
+    }
+    if (nx.slot_prefetch[s] && !nx.slot_covered[s]) {
+        return 0.02f;
+    }
+    if (policy != MOE_STREAM_POLICY_DECAY || nx.p1_dval.empty()) {
+        if (nx.slot_expert[s] < 0 || s >= (int32_t) nx.slot_last_use.size() || nx.slot_last_use[s] == 0) {
+            return 0.0f;
+        }
+        const uint64_t age_st = nx.use_counter >= nx.slot_last_use[s] ? nx.use_counter - nx.slot_last_use[s] : 0;
+        const float    age_w  = (float) age_st / std::max(1.0f, (float) n_expert_used);
+        return std::min(0.85f, std::max(0.0f, 0.32f * std::exp(-age_w * (1.0f / 64.0f))));
+    }
+    const float v = p1_value(nx, s);
+    if (v <= 0.0f) {
+        if (nx.slot_expert[s] >= 0 && !nx.slot_prefetch[s] && n_tok_outer >= 0 && n_tok_outer < 64) {
+            return 0.06f * std::exp(-(float) n_tok_outer * (1.0f / 32.0f));
+        }
+        return 0.0f;
+    }
+    const float H      = std::max(8.0f, p1.evict_halflife);
+    const float lam64  = v * (64.0f * 0.69314718f / H);
+    return std::min(0.95f, std::max(0.0f, 1.0f - std::exp(-lam64)));
+}
+
+float llama_moe_stream::gg_tau_bind(const llama_moe_stream_layer & nx, int32_t s_vic, int32_t q_act, int32_t lead, uint8_t votes) const {
+    const float    p_rb       = gg_slot_rb_prob(nx, s_vic);
+    const float    t_xfer_us  = ((float) nx.block_bytes * 1e-3f) / std::max(0.4f, gg_ssd_bw_ewma_gbps);
+    const float    t_read_us  = std::max(80.0f, gg_ssd_lat_ewma_us + t_xfer_us);
+    const float    rho_ssd    = std::min(2.20f, std::max(0.15f, t_read_us / std::max(250.0f, gg_layer_ewma_us)));
+    const int32_t  n_io       = std::max<int32_t>(1, (int32_t) io_threads.size());
+    const uint32_t g_lim      = gi_G > 0 ? (uint32_t) gi_G
+                                         : (prefetch_inflight > 0 ? prefetch_inflight : (uint32_t) std::max<int32_t>(4, n_io));
+    const float    q_cap      = std::max(3.0f, (float) g_lim * 1.5f);
+    const int32_t  q_spare    = std::max<int32_t>(1, n_io / 2);
+    const float    far_wait   = (lead >= 2 && votes <= 1) ? 0.24f * std::min(1.5f, 0.25f + rho_ssd) : 0.0f;
+    const float    base_idle  = (lead <= 1) ? 0.025f * rho_ssd : 0.08f * rho_ssd;
+    float          q_pen      = 0.0f;
+    if (q_act > 0) {
+        if (q_act < q_spare) {
+            q_pen = 0.04f * rho_ssd * ((float) q_act / (float) q_spare);
+        } else {
+            q_pen = 0.04f * rho_ssd + 0.30f * rho_ssd * ((float) (q_act - q_spare + 1) / q_cap);
+        }
+    }
+    const float    cost_ratio = p_rb + base_idle + far_wait + q_pen;
+    return cost_ratio / (1.0f + cost_ratio);
+}
+
+bool llama_moe_stream::gg_pn_keep_ok(const llama_moe_stream_layer & sl, int32_t e, int64_t w) const {
+    if (e < 0 || (uint32_t) e >= sl.n_expert || sl.gg_raw_word != w || sl.gg_seen_word.empty() || sl.gg_seen_word[e] != w) {
+        return true;
+    }
+    if (sl.gg_raw_d[e] <= 1 || sl.gg_raw_votes[e] >= 2 || sl.gg_raw_bin[e] >= 1) {
+        return true;
+    }
+    const int32_t s = sl.expert_slot[e];
+    if (s >= 0 && gg_slot_rb_prob(sl, s) >= 0.10f) {
+        return true;
+    }
+    return (float) sl.gg_p_q15[e] * (1.0f / 32767.0f) >= 0.22f;
+}
+
+void llama_moe_stream::gg_note_raw(llama_moe_stream_layer & nx, int32_t e, int32_t d, int32_t r, int32_t width,
+                                   const float * shares, bool in_mem) {
+    if (e < 0 || (uint32_t) e >= nx.n_expert || nx.gg_seen_word.empty()) {
+        return;
+    }
+    const int64_t w = n_tok_outer;
+    if (nx.gg_raw_word != w) {
+        nx.gg_raw_list.clear();
+        nx.gg_raw_word = w;
+    }
+    const int32_t k_use = std::max<int32_t>(1, (int32_t) n_expert_used);
+    float sh = 1.0f / (float) k_use;
+    if (shares != nullptr && r >= 0 && r < width) {
+        const float sv = shares[r];
+        if (std::isfinite(sv) && sv >= 0.0f && sv <= 1.0001f) {
+            sh = std::min(1.0f, sv);
+        }
+    } else if (width > 0 && r >= 0) {
+        const float num = std::exp(-0.22f * (float) r);
+        const float den = (1.0f - std::exp(-0.22f * (float) std::max<int32_t>(width, k_use))) / (1.0f - std::exp(-0.22f));
+        sh = std::min(1.0f, (num / std::max(1.0f, den)) * ((float) std::min<int32_t>(width, k_use) / (float) std::max<int32_t>(width, k_use)));
+    }
+    const int32_t bin  = gg_share_bin(sh);
+    const uint8_t d_cl = (uint8_t) std::min<int32_t>(std::max<int32_t>(d, 1), 8);
+
+    if (nx.gg_seen_word[e] != w) {
+        nx.gg_seen_word[e] = w;
+        nx.gg_raw_votes[e] = 1;
+        nx.gg_raw_d[e]     = d_cl;
+        nx.gg_raw_bin[e]   = (uint8_t) bin;
+        nx.gg_raw_inmem[e] = in_mem ? 1 : 0;
+        nx.gg_share_q15[e] = (uint16_t) std::min<int32_t>(32767, (int32_t) std::lround(sh * 32767.0f));
+        nx.gg_raw_list.push_back(e);
+    } else {
+        if (d_cl < nx.gg_raw_d[e]) {
+            nx.gg_raw_votes[e] = (uint8_t) std::min<int32_t>((int32_t) nx.gg_raw_votes[e] + 1, 255);
+            nx.gg_raw_d[e]     = d_cl;
+            nx.gg_raw_bin[e]   = (uint8_t) bin;
+            nx.gg_share_q15[e] = (uint16_t) std::min<int32_t>(32767, (int32_t) std::lround(sh * 32767.0f));
+        } else if (bin > (int32_t) nx.gg_raw_bin[e]) {
+            nx.gg_raw_bin[e]   = (uint8_t) bin;
+            nx.gg_share_q15[e] = (uint16_t) std::min<int32_t>(32767, (int32_t) std::lround(sh * 32767.0f));
+        }
+    }
+
+    const float p_hat = gg_on
+            ? gg_p_hat(nx, (int32_t) nx.gg_raw_d[e], nx.gg_raw_votes[e] >= 2, (int32_t) nx.gg_raw_bin[e],
+                       (float) nx.gg_share_q15[e] * (1.0f / 32767.0f))
+            : 1.0f;
+    nx.gg_p_q15[e] = (uint16_t) std::min<int32_t>(32767, std::max<int32_t>(1, (int32_t) std::lround(p_hat * 32767.0f)));
+
+    if (in_mem) {
+        if (nx.gg_mem_word != w) {
+            nx.gg_mem_list.clear();
+            nx.gg_mem_word = w;
+        }
+        if (nx.gg_adm_mem_word[e] != w) {
+            nx.gg_adm_mem_word[e] = w;
+            nx.gg_mem_list.push_back(e);
+        }
+    }
+}
+
+void llama_moe_stream::gg_note_ssd_issued(llama_moe_stream_layer & nx, int32_t e) {
+    if (e < 0 || (uint32_t) e >= nx.n_expert || nx.gg_ssd_iss_word.empty()) {
+        return;
+    }
+    const int64_t w = n_tok_outer;
+    if (nx.gg_ssd_word != w) {
+        nx.gg_ssd_list.clear();
+        nx.gg_ssd_word = w;
+    }
+    if (nx.gg_ssd_iss_word[e] != w) {
+        nx.gg_ssd_iss_word[e] = w;
+        nx.gg_ssd_list.push_back(e);
+    }
+}
+
+void llama_moe_stream::gg_settle_word(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n) {
+    if (sl.gg_picked_word.empty()) {
+        return;
+    }
+    const int64_t w = n_tok_outer;
+    for (int64_t j = 0; j < n; j++) {
+        const int32_t e = ids[j];
+        if (e >= 0 && (uint32_t) e < sl.n_expert) {
+            sl.gg_picked_word[e] = w;
+        }
+    }
+
+    if (sl.gg_ssd_word == w) {
+        for (const int32_t e : sl.gg_ssd_list) {
+            if (sl.gg_picked_word[e] == w) {
+                sl.dec.n_gg_ssd_right += 1;
+            } else {
+                sl.dec.n_gg_ssd_wrong += 1;
+            }
+        }
+        sl.gg_ssd_list.clear();
+    }
+
+    if (sl.gg_mem_word == w) {
+        for (const int32_t e : sl.gg_mem_list) {
+            if (sl.gg_ssd_iss_word[e] == w) {
+                continue;
+            }
+            if (sl.gg_picked_word[e] == w) {
+                sl.dec.n_gg_mem_right += 1;
+            } else {
+                sl.dec.n_gg_mem_wrong += 1;
+            }
+        }
+        sl.gg_mem_list.clear();
+    }
+
+    if (sl.gg_raw_word == w) {
+        if (gg_on) {
+            for (const int32_t e : sl.gg_raw_list) {
+                if (sl.gg_raw_inmem[e]) {
+                    continue;   // calibrate P(picked | raw guess, On-SSD at guess time) without in-memory Simpson bias
+                }
+                const bool    hit = sl.gg_picked_word[e] == w;
+                const int32_t dc  = gg_d_cls((int32_t) sl.gg_raw_d[e]);
+                const int32_t mv  = sl.gg_raw_votes[e] >= 2 ? 1 : 0;
+                const int32_t bin = (int32_t) (sl.gg_raw_bin[e] & 7);
+
+                gg_cell_t & G = gg_global[dc][mv][bin];
+                if (G.trials > 4096.0f) {
+                    G.trials *= 0.998f;
+                    G.hits   *= 0.998f;
+                }
+                G.trials += 1.0f;
+                G.hits   += hit ? 1.0f : 0.0f;
+
+                const size_t idx = (((size_t) std::max<int32_t>(sl.moe_index, 0) * GG_N_D + (size_t) dc) * GG_N_MV + (size_t) mv) * GG_N_BIN + (size_t) bin;
+                if (idx < gg_cells.size()) {
+                    gg_cell_t & C = gg_cells[idx];
+                    if (C.trials > 256.0f) {
+                        C.trials *= 0.995f;
+                        C.hits   *= 0.995f;
+                    }
+                    C.trials += 1.0f;
+                    C.hits   += hit ? 1.0f : 0.0f;
+                }
+                gg_dirty = true;
+            }
+        }
+        sl.gg_raw_list.clear();
+    }
+}
+
+void llama_moe_stream::gg_load_json() {
+    if (gg_path.empty()) {
+        return;
+    }
+    try {
+        std::ifstream ifs(gg_path);
+        if (!ifs.is_open()) {
+            return;
+        }
+        const json j = json::parse(ifs);
+        if (j.value("format", std::string()) != "tokenwing guesser-calib v1" ||
+            j.value("arch", std::string()) != mplan.arch ||
+            j.value("n_expert", 0u) != n_expert_total ||
+            j.value("n_expert_used", 0u) != n_expert_used ||
+            j.value("n_moe", 0u) != (uint32_t) il_of_moe.size()) {
+            return;
+        }
+        if (j.contains("global") && j["global"].is_array() && j["global"].size() == GG_N_D * GG_N_MV * GG_N_BIN * 2) {
+            size_t q = 0;
+            for (int dc = 0; dc < GG_N_D; dc++) {
+                for (int mv = 0; mv < GG_N_MV; mv++) {
+                    for (int b = 0; b < GG_N_BIN; b++) {
+                        gg_global[dc][mv][b].trials = std::max(0.0f, j["global"][q++].get<float>());
+                        gg_global[dc][mv][b].hits   = std::max(0.0f, j["global"][q++].get<float>());
+                    }
+                }
+            }
+        }
+        if (j.contains("cells") && j["cells"].is_array() && j["cells"].size() == gg_cells.size() * 2) {
+            for (size_t i = 0; i < gg_cells.size(); i++) {
+                gg_cells[i].trials = std::max(0.0f, j["cells"][2*i].get<float>());
+                gg_cells[i].hits   = std::max(0.0f, j["cells"][2*i + 1].get<float>());
+            }
+        }
+    } catch (...) {
+    }
+}
+
+void llama_moe_stream::gg_save_json() {
+    if (!gg_on || !gg_dirty || gg_path.empty()) {
+        return;
+    }
+    try {
+        json j;
+        j["format"]        = "tokenwing guesser-calib v1";
+        j["arch"]          = mplan.arch;
+        j["n_expert"]      = n_expert_total;
+        j["n_expert_used"] = n_expert_used;
+        j["n_moe"]         = (uint32_t) il_of_moe.size();
+        json g = json::array();
+        for (int dc = 0; dc < GG_N_D; dc++) {
+            for (int mv = 0; mv < GG_N_MV; mv++) {
+                for (int b = 0; b < GG_N_BIN; b++) {
+                    g.push_back(gg_global[dc][mv][b].trials);
+                    g.push_back(gg_global[dc][mv][b].hits);
+                }
+            }
+        }
+        j["global"] = std::move(g);
+        json cs = json::array();
+        for (const auto & c : gg_cells) {
+            cs.push_back(c.trials);
+            cs.push_back(c.hits);
+        }
+        j["cells"] = std::move(cs);
+        std::string err;
+        os_write_file_atomic(gg_path, j.dump(), err);
+        gg_dirty = false;
+    } catch (...) {
+    }
 }

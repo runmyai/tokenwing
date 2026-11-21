@@ -1707,7 +1707,7 @@ static int64_t llama_moe_stream_np_bytes(const llama_moe_stream_nonpool & np, co
 
 // the routed expert weights of a MoE layer, which the expert pool replaces
 static bool llama_moe_stream_is_exps(const std::string & name) {
-    for (const char * suffix : { ".ffn_gate_exps.weight", ".ffn_up_exps.weight", ".ffn_down_exps.weight" }) {
+    for (const char * suffix : { ".ffn_gate_exps.weight", ".ffn_up_exps.weight", ".ffn_down_exps.weight", ".ffn_gate_up_exps.weight" }) {
         const size_t len = strlen(suffix);
         if (name.size() >= len && name.compare(name.size() - len, len, suffix) == 0) {
             return true;
@@ -2299,13 +2299,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 const int64_t ne_la = params.moe_stream_lookahead > 1 ? params.moe_stream_lookahead : 1;
                 const int64_t ne_w  = params.moe_stream_guess_top > 0 ? params.moe_stream_guess_top
                                                                       : (params.moe_stream_prefetch_m > 0 ? params.moe_stream_prefetch_m : (int32_t) hparams.n_expert_used());   // 0 = the model's top-k
-                ne_bytes = llama_moe_stream_ne_bytes((int64_t) hparams.n_layer_all, ne_la, ne_w)
+                const bool    gg_sh = params.moe_stream_guess_gate == 1 && params.moe_stream_plan == 1;
+                ne_bytes = llama_moe_stream_ne_bytes((int64_t) hparams.n_layer_all, ne_la, ne_w, gg_sh)
                          // + the GPU producer's pinned buffer (guess slots, call cell, router slots), as the plan counts it
                          + llama_moe_stream_ne2_bytes((int64_t) hparams.n_layer_all, ne_la, ne_w, (int64_t) hparams.n_embd,
                                                       (int64_t) hparams.n_expert_used(),
                                                       // + the prompt split's shared router slot (gpu-waves - 1 rows)
                                                       params.moe_stream_prompt_split == 1 && params.moe_stream_gpu_waves > 1
-                                                          ? (int64_t) params.moe_stream_gpu_waves - 1 : 0);
+                                                          ? (int64_t) params.moe_stream_gpu_waves - 1 : 0,
+                                                      gg_sh);
                 other_bytes += ne_bytes;
             }
             // The wave plan's / slot check's shared tables, at the training context (the plan counts the same)
@@ -2587,6 +2589,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
         p1.hip_mmvq             = params.moe_stream_hip_mmvq == 1;
         p1.hip_sync             = std::max(0, params.moe_stream_hip_sync);
+        p1.guess_gate           = params.moe_stream_guess_gate == 1;
+        p1.ssd_latency_us       = std::max(0, params.moe_stream_ssd_latency_us);
+        p1.ssd_gbps             = std::max(0.0f, params.moe_stream_ssd_gbps);
         p1.elastic              = params.moe_stream_elastic == 1;
         // one leave-free number: --moe-stream-ram-margin, else --moe-stream-ram-free, else the OS default (el_parse_opts) - the start's
         // fill, elastic RAM's floor and the prompt guard all keep the same amount free
@@ -2650,8 +2655,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 params.moe_stream_prefetch_inflight > 0 ? (int32_t) params.moe_stream_prefetch_inflight : 0,
                 params.moe_stream_early_order != 0,                        // force the guess first
                 params.moe_stream_overlap != 0,
-                params.moe_stream_pred_scores,
-                params.moe_stream_pred_input,
+                params.moe_stream_pred_scores ? params.moe_stream_pred_scores : "",
+                params.moe_stream_pred_input ? params.moe_stream_pred_input : "",
                 params.moe_stream_pred_input_every,
                 params.moe_stream_record ? params.moe_stream_record : "",
                 params.moe_stream_record_words,
@@ -3090,6 +3095,44 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (pimpl->moe_stream) {
+        {
+            llama_moe_stream & ms = *pimpl->moe_stream;
+            ms.rt_layers.resize(layers.size());
+            const bool arch_non_silu_vx =
+                    arch == LLM_ARCH_LLAMA4 || arch == LLM_ARCH_OPENAI_MOE || arch == LLM_ARCH_GEMMA4 ||
+                    arch == LLM_ARCH_GROK || arch == LLM_ARCH_KIMI_K3 || arch == LLM_ARCH_MINIMAX_M3 ||
+                    arch == LLM_ARCH_NEMOTRON_H_MOE || arch == LLM_ARCH_SMALLTHINKER;
+            if (arch_non_silu_vx && ms.vx_compat) {
+                ms.vx_compat       = false;
+                ms.vx_incompat_why = format("arch '%s' uses a non-standard MoE activation or pre-down scaling", llm_arch_name(arch));
+            }
+            for (size_t il = 0; il < layers.size(); il++) {
+                const llama_layer & L = layers[il];
+                auto & rl      = ms.rt_layers[il];
+                rl.gate_inp    = L.ffn_gate_inp;
+                rl.gate_inp_b  = L.ffn_gate_inp_b;
+                rl.gate_inp_s  = L.ffn_gate_inp_s;
+                rl.exp_probs_b = L.ffn_exp_probs_b;
+                rl.ffn_norm    = L.ffn_norm_b == nullptr ? (L.ffn_norm ? L.ffn_norm : L.attn_post_norm) : nullptr;
+                rl.has_moe     = L.ffn_gate_inp != nullptr &&
+                                 (L.ffn_gate_exps != nullptr || L.ffn_up_exps != nullptr || L.ffn_gate_up_exps != nullptr);
+                if (ms.has_layer((int32_t) il) && ms.vx_compat) {
+                    if (L.ffn_gate_up_exps != nullptr || L.ffn_gate_exps == nullptr || L.ffn_up_exps == nullptr) {
+                        ms.vx_compat       = false;
+                        ms.vx_incompat_why = format("layer %zu uses fused gate_up or 2-projection experts", il);
+                    } else if (L.ffn_gate_exps_b || L.ffn_up_exps_b || L.ffn_down_exps_b || L.ffn_gate_up_exps_b) {
+                        ms.vx_compat       = false;
+                        ms.vx_incompat_why = format("layer %zu has per-expert bias tensors", il);
+                    } else if (L.ffn_gate_exps_s || L.ffn_up_exps_s || L.ffn_down_exps_s) {
+                        ms.vx_compat       = false;
+                        ms.vx_incompat_why = format("layer %zu has per-expert scale tensors", il);
+                    } else if (L.ffn_latent_down || L.ffn_latent_up) {
+                        ms.vx_compat       = false;
+                        ms.vx_incompat_why = format("layer %zu uses latent MoE projections", il);
+                    }
+                }
+            }
+        }
         // The GPU that runs each layer's router (null: the CPU), for needed-early's marks and the GPU guess's per-device rules
         {
             // A streamed layer L hands its 1-ahead guess to the helper only if the guess runs in
@@ -3193,10 +3236,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     }
                     ggml_backend_buffer_type_t wbt = ggml_backend_buffer_get_type(w->buffer);
                     ok = ok && (bt == nullptr || wbt == bt) && (w0 == nullptr || (w->type == w0->type && ggml_are_same_shape(w, w0)));
+                    ok = ok && L.ffn_gate_inp_b == nullptr && L.ffn_gate_inp_s == nullptr;
                     bt = bt ? bt : wbt;
                     w0 = w0 ? w0 : w;
                     if (ms.pred_shared) {
-                        ok = ok && L.ffn_norm && L.ffn_norm->type == GGML_TYPE_F32 && ggml_nelements(L.ffn_norm) == n_embd_g;
+                        const ggml_tensor * gn = (size_t) (il + ds[t]) < ms.rt_layers.size() ? ms.rt_layers[il + ds[t]].ffn_norm : L.ffn_norm;
+                        ok = ok && gn && gn->type == GGML_TYPE_F32 && ggml_nelements(gn) == n_embd_g;
                     }
                     if (L.ffn_exp_probs_b) {
                         has_b = true;
@@ -3282,10 +3327,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     const int32_t n = ms.la_targets(list[k], ds);
                     for (int32_t t = 0; t < n; t++) {
                         const llama_layer & L = layers[list[k] + ds[t]];
+                        const ggml_tensor * gn = (size_t) (list[k] + ds[t]) < ms.rt_layers.size() ? ms.rt_layers[list[k] + ds[t]].ffn_norm : L.ffn_norm;
                         for (int j = 0; j < 2; j++) {
                             ggml_tensor * dst = j == 0 ? st[k].first : st[k].second;
                             // A corrected pair's gain is folded into its matrix W', so its gain row is the ones
-                            const ggml_tensor * src = j == 0 ? (ms.corr_unit(list[k] + ds[t], ds[t]) ? ms.corr_unit(list[k] + ds[t], ds[t]) : L.ffn_norm)
+                            const ggml_tensor * src = j == 0 ? (ms.corr_unit(list[k] + ds[t], ds[t]) ? ms.corr_unit(list[k] + ds[t], ds[t]) : gn)
                                                              : L.ffn_exp_probs_b;
                             if (dst == nullptr) {
                                 continue;
@@ -3341,7 +3387,7 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         if (llama_moe_stream_is_exps(name) && pimpl->moe_stream->has_layer(tn.bid)) {
             const auto * w = ml.get_weight(name.c_str());
 
-            bool dims_ok = w != nullptr && w->tensor->ne[2] == hparams.n_expert;
+            bool dims_ok = w != nullptr && (w->tensor->ne[2] == hparams.n_expert || w->tensor->ne[2] == pimpl->moe_stream->n_expert_total);
             if (dims_ok) {
                 size_t dim = 0;
                 for (int64_t d : ne) {
@@ -4765,6 +4811,9 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_uma              =*/ 0,      // off (discrete RAM / VRAM pools)
         /*.moe_stream_hip_mmvq         =*/ 0,      // off
         /*.moe_stream_hip_sync         =*/ 0,      // off
+        /*.moe_stream_guess_gate       =*/ 0,      // off
+        /*.moe_stream_ssd_latency_us   =*/ 0,      // auto
+        /*.moe_stream_ssd_gbps         =*/ 0.0f,   // auto
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,

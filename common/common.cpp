@@ -1942,6 +1942,9 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_stream_uma                  = params.moe_stream_uma;
     mparams.moe_stream_hip_mmvq             = params.moe_stream_hip_mmvq;
     mparams.moe_stream_hip_sync             = params.moe_stream_hip_sync;
+    mparams.moe_stream_guess_gate           = params.moe_stream_guess_gate;
+    mparams.moe_stream_ssd_latency_us       = params.moe_stream_ssd_latency_us;
+    mparams.moe_stream_ssd_gbps             = params.moe_stream_ssd_gbps;
     mparams.moe_stream_vram_follow_tick     = params.moe_stream_vram_follow_tick;
     mparams.moe_stream_vram_follow_swaps    = params.moe_stream_vram_follow_swaps;
     mparams.moe_stream_vram_follow_recent   = params.moe_stream_vram_follow_recent;

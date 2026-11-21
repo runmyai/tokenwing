@@ -95,12 +95,21 @@ def upload_blobs(stash, repo, blobs, tag):
     from huggingface_hub import CommitOperationAdd, HfApi
 
     api = HfApi()
+    # the store's .gitattributes sends every file named by a SHA-256 to large-file storage: the Hub refuses binary files
+    # committed as plain git files, and it decides that by the name, not by the contents
+    if "[0-9a-f]* filter=lfs" not in open(api.hf_hub_download(repo, ".gitattributes")).read():
+        sys.exit(f"{repo}: .gitattributes has no '[0-9a-f]* filter=lfs ...' line")
     missing = sorted(blobs - set(api.list_repo_files(repo)))
     print(f"{repo}: {len(blobs) - len(missing)} files already there, {len(missing)} to upload")
-    if missing:
-        ops = [CommitOperationAdd(path_in_repo=d, path_or_fileobj=os.path.join(stash, d)) for d in missing]
+    # in commits of a few hundred files: a failed commit loses only its own files, and the next run uploads what is missing
+    for i in range(0, len(missing), 400):
+        part = missing[i:i + 400]
+        ops = [CommitOperationAdd(path_in_repo=d, path_or_fileobj=os.path.join(stash, d)) for d in part]
         api.create_commit(repo, ops, commit_message=f"engine files of {tag}")
-        print(f"{repo}: uploaded {len(missing)} files")
+        print(f"{repo}: uploaded {i + len(part)} of {len(missing)} files")
+    still = blobs - set(api.list_repo_files(repo))
+    if still:
+        sys.exit(f"{repo}: {len(still)} files are still missing after the upload, e.g. {sorted(still)[0]}")
 
 
 if __name__ == "__main__":

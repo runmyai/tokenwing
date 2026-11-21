@@ -415,7 +415,8 @@ jobs:
             *-*) PRE=true ;;
           esac
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            flags=(--target "${{ github.sha }}" --title "$TAG" --generate-notes)
+            # a draft: users and the app's update check see it only once it is published by hand, with its notes
+            flags=(--target "${{ github.sha }}" --title "$TAG" --generate-notes --draft)
             if [ "$PRE" = "true" ]; then
               flags+=(--prerelease)
             fi

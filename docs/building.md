@@ -1,6 +1,8 @@
 # Building
 
-TokenWing builds with CMake, the same way as llama.cpp. You need CMake, a C++ compiler and Git.
+TokenWing builds with CMake, the same way as llama.cpp. You need CMake, a C++ compiler and Git. For the web chat page that
+`llama-server` shows in the browser you also need Node.js with npm: the build makes the page from `tools/ui` and puts it inside
+the server. Without npm the server is built without a page (`-DLLAMA_BUILD_UI=OFF` skips it on purpose).
 
 ```bash
 git clone https://github.com/runmyai/tokenwing
@@ -17,6 +19,8 @@ cmake --build build -j
 ```
 
 `GGML_NATIVE` is on by default, so the CPU code is built for the machine you build on. Turn it off (`-DGGML_NATIVE=OFF`) only for a binary that has to run on other CPUs; the expert kernels are much slower without AVX-512 or AVX2.
+
+To build one package that runs at full speed on every CPU, build the CPU code once per CPU level, as llama.cpp's releases do: add `-DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_NATIVE=OFF` (with any GPU flags below). The CPU code then lands in one library per level (`libggml-cpu-haswell.so`, `-skylakex`, `-zen4`, ...; `.dll` on Windows) and the program loads the best one for the CPU it runs on at start. Ship every `libggml*` / `libllama*` library next to the programs. `-lv 4` shows which one was loaded (`load_backend: loaded CPU backend from ...`).
 
 ## NVIDIA (CUDA)
 

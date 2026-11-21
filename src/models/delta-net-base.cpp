@@ -3,7 +3,7 @@
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
 #include "llama-moe-stream.h"   // --moe-stream-cpu-state-inplace
-#include "ggml-cpu.h"           // ggml_cpu_gated_delta_net_inplace
+#include "ggml-cpu.h"           // the in-place delta step (through llama_cpu_moe_api)
 
 #include <cstdlib>
 
@@ -527,7 +527,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
 // --moe-stream-cpu-state-inplace: the in-place delta step as a CPU custom op (ggml-cpu's kernel, see ggml-cpu.h)
 static void llama_gdn_inplace_cpu(ggml_tensor * dst, int ith, int nth, void * userdata) {
-    ggml_cpu_gated_delta_net_inplace(dst, ith, nth, (int) (intptr_t) userdata);
+    llama_cpu_moe_api()->gated_delta_net_inplace(dst, ith, nth, (int) (intptr_t) userdata);
 }
 
 bool llm_build_delta_net_base::state_inplace(llm_graph_input_rs * inp, int il, int64_t n_seq_tokens, int64_t n_seqs) const {

@@ -237,7 +237,49 @@ extern "C" {
     // take_early returns that count since the last take and resets it
     GGML_BACKEND_API void    ggml_cpu_moe_slots_set_later(const void * pool, const uint32_t * later);
     GGML_BACKEND_API int64_t ggml_cpu_moe_slots_take_early(const void * pool);
-    GGML_BACKEND_API void ggml_backend_cpu_set_threadpool    (ggml_backend_t backend_cpu, ggml_threadpool_t threadpool);
+
+    // The functions above that the MoE streaming engine calls, as one table. A program reaches it through the CPU registry:
+    // ggml_backend_reg_get_proc_address(ggml_backend_reg_by_name("CPU"), "ggml_cpu_moe_api"), so the same code works when the
+    // CPU backend is linked in and when it is a module loaded at run time (GGML_BACKEND_DL: one module per CPU level).
+    // New entries go at the end; size = sizeof(struct ggml_cpu_moe_api) of the backend that filled it.
+    struct ggml_cpu_moe_api {
+        size_t size;
+        void    (*set_mxfp4_kernel)(int kernel, int prefetch_blocks);
+        void    (*set_moe_fuse)(int on);
+        void    (*set_q8_tiled)(int on);
+        void    (*set_fa_kernel)(int kernel);
+        void    (*set_fuse_small)(int mask);
+        void    (*set_mmid_merge)(int on);
+        void    (*set_iqk)(int min_rows);
+        void    (*set_moe_dispatch)(int on);
+        void    (*set_moe_pieces)(int n);
+        void    (*set_moe_conv1)(int on);
+        void    (*set_track)(int bits);
+        int64_t (*get_mmid_merge_count)(void);
+        void    (*get_iqk_counts)(int64_t * experts, int64_t * experts_other, int64_t * rows, int64_t * not_landed);
+        int64_t (*get_guess_skip_rows)(void);
+        void    (*get_fuse_small_counts)(int64_t * router, int64_t * guess, int64_t * mm);
+        int64_t (*moe_fuse_count)(void);
+        int64_t (*moe_dispatch_count)(void);
+        int     (*m11_report)(char * buf, size_t n);
+        void    (*gated_delta_net_inplace)(struct ggml_tensor * dst, int ith, int nth, int test_skip_write);
+        void    (*moe_slots_register)(const void * pool, size_t bytes, size_t slice_bytes, int n_as,
+                                      const uint32_t * ready, const int32_t * err,
+                                      void (* on_error)(void *, int32_t), void * ctx, const int64_t * ready_us);
+        void    (*moe_slots_unregister)(const void * pool);
+        int64_t (*moe_slots_take_wait)(const void * pool);
+        void    (*moe_slots_set_cb)(const void * pool, const uint8_t * cb, int n);
+        void    (*moe_slots_take_wait_cb)(const void * pool, int64_t * cb_us, int64_t * all_us);
+        void    (*moe_slots_take_handoff)(const void * pool, int64_t * sum_us, int64_t * n, int64_t * max_us);
+        void    (*moe_slots_skip_zero)(const void * pool, int first_zero);
+        void    (*moe_slots_set_later)(const void * pool, const uint32_t * later);
+        int64_t (*moe_slots_take_early)(const void * pool);
+        ggml_backend_buffer_t (*repack_buffer_from_ptr)(void * ptr, size_t size);
+        const struct ggml_type_traits_cpu * (*get_type_traits_cpu)(enum ggml_type type);
+        bool    (*backend_is_cpu)(ggml_backend_t backend);
+    };
+
+    GGML_BACKEND_API void ggml_backend_cpu_set_threadpool   (ggml_backend_t backend_cpu, ggml_threadpool_t threadpool);
     GGML_BACKEND_API void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data);
 
     GGML_BACKEND_API void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref);

@@ -689,6 +689,8 @@ struct common_params {
     bool endpoint_props   = false; // only control POST requests, not GET
     bool endpoint_metrics = false;
 
+    bool usage_stats = true; // llama-server: one anonymous usage record a day
+
     // enable built-in tools
     std::vector<std::string> server_tools;
     std::string server_tools_runtime;
@@ -790,7 +792,7 @@ struct common_params {
     // Both orders are inside it, so the faster one is the default.
     std::string moe_stream_gpu_layers_mode; // "hot" (default) or "last" layer order for the auto-fit
     std::string moe_stream_gpu_layers_list; // explicit layer list, takes precedence over the count
-    int64_t     moe_stream_ram_free = 0;  // bytes of RAM to keep free, 0 = 2.5 GiB, negative = no margin
+    int64_t     moe_stream_ram_free = 0;  // bytes of RAM to keep free, 0 = the OS default (llama_moe_stream_start_ram_free), negative = no margin
     // Compare one filled pool slot per layer (and one GPU whole-layer expert) against the
     // model file at the first token, so wrong weights are named there and not in the output
     int32_t     moe_stream_verify = 1;   // 0 = no read-back check, N>1 = check N layers
@@ -928,7 +930,8 @@ struct common_params {
     int32_t     moe_stream_timing            = 0; // 1 = measure where a call's time goes (host, device, copies, syncs), report it per word
     int32_t     moe_stream_out_check         = 16; // the output's NaN / Inf check: every prompt call + every Nth reply call, 0 = off
     std::string moe_stream_vram_device;           // the GPU that holds the VRAM expert pool, "" = the first GPU
-    std::string moe_stream_gpu_layers_device;     // whole MoE layers per GPU, "DEV=LIST;DEV=LIST" (repeated flags joined with ';')
+    std::string moe_stream_gpu_layers_device;     // whole MoE layers per GPU, "DEV=LIST;DEV=LIST" (repeated flags joined with ';'); LIST may be "auto"
+    std::string moe_stream_vram_free_dev;         // --moe-stream-vram-free per GPU, "DEV=bytes,DEV=bytes"; "" = one value for the pool's GPU
     int64_t     moe_stream_vram_chunk        = 0; // max bytes per VRAM expert pool buffer group (1 = auto <= 2 GiB, 0 = off)
     int32_t     moe_stream_uma               = 0; // unified-memory zero-copy streaming mode (0 = off, 1)
     int32_t     moe_stream_hip_mmvq          = 0; // RDNA2/3/3.5/4 short-row & RDNA3.5 multi-warp MMVQ under ROCm/HIP (0 = off, 1)

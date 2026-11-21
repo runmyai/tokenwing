@@ -551,9 +551,9 @@ extern "C" {
         // A CPU split's output in the GPU's pinned host buffer goes to the next GPU split with an
         // async H2D on that GPU's stream and no host wait (one GPU, no pipeline parallelism); 0 = off (a synchronous copy)
         int32_t      moe_stream_async_h2d;
-        // Elastic RAM - the pools give RAM back on the kernel's memory-pressure signal and take it back at reply
-        // ends / new requests when RAM is free; 0 = off (fixed pools). ram_margin: bytes to leave free when growing (0 = 500 MiB);
-        // elastic_opts: "step=..,growmin=..,cool=..,stall=..,ceiling=.." (NULL = the defaults)
+        // Elastic RAM - the pools give RAM back on memory pressure / low headroom and take it back smoothly when calm;
+        // 0 = off (fixed pools). ram_margin: bytes to leave free (0 = OS default: 1.25 GiB Linux / 1.5 GiB Win & macOS);
+        // elastic_opts: "keep=..,gap=..,again=..,settle=..,refillstep=..,refillms=..,softmin=..,min=.." (NULL = defaults)
         int32_t      moe_stream_elastic;
         int64_t      moe_stream_ram_margin;
         const char * moe_stream_elastic_opts;
@@ -586,7 +586,14 @@ extern "C" {
                                                 //      prompt matmuls of the RAM pools; NULL = the first GPU of the model
         const char * moe_stream_gpu_layers_device; // whole MoE layers per GPU, "DEV=LIST;DEV=LIST" (LIST: layers and ranges a-b): their
                                                 //      experts on DEV whatever device holds the layer; NULL = on the layer's own device.
-                                                //      The layers themselves come from moe_stream_gpu_layers_list (common fills it)
+                                                //      The layers themselves come from moe_stream_gpu_layers_list (common fills it).
+                                                //      LIST "auto": as many of the last streamed layers as fit on DEV (keeping its
+                                                //      moe_stream_vram_free_dev value free), the next "auto" DEV the layers before those;
+                                                //      the engine then places the layers itself (each whole layer on its DEV, the rest
+                                                //      of the GPU layers on the pool's GPU) and the list is left empty
+        const char * moe_stream_vram_free_dev;  // VRAM kept free per GPU, "DEV=bytes,DEV=bytes"; with it every GPU keeps its value free
+                                                //      in the whole-layer fit and the pool's GPU sizes the pool from its own value (a GPU
+                                                //      not named keeps moe_stream_vram_free); NULL = moe_stream_vram_free is the pool's only
         const char * quant_plugin;              // shared library (.so / .dll) registering GGML_TYPE_EXT0..EXT5, NULL = none
         int64_t      moe_stream_vram_chunk;     // max byte size per VRAM expert pool buffer group (1 = auto <= 2 GiB, > 1 = cap in bytes,
                                                 //      0 = off / one group per format)
@@ -2222,6 +2229,13 @@ extern "C" {
         int64_t block_bytes;            // bytes of one expert (the first streamed layer's; layers may differ)
         int64_t kv_bytes;               // the KV cache (and the recurrent state) of the context
         int32_t timing;                 // --moe-stream-timing
+        int32_t elastic_on;             // 1 = --moe-stream-elastic active
+        int32_t elastic_state;          // 0 = normal, 1 = shared, 2 = squeezed_warn, 3 = reclaiming
+        int32_t elastic_slots_min;      // smallest current active share per streamed layer
+        int32_t elastic_slots_soft_min; // soft comfort floor per streamed layer (warning threshold)
+        int64_t elastic_given_bytes;    // net bytes currently lent back below initial pool size (0 when >= start)
+        int64_t elastic_band_bytes;     // bytes currently marked OS-discardable in the cold band
+        int64_t elastic_free_bytes;     // last measured free headroom in bytes (-1 = not sampled yet)
     };
 
     // fill out; returns false when streaming is off
@@ -2289,10 +2303,9 @@ extern "C" {
     // allocation failed (the last picked of all when that device is not known); -1 = none on that device (fewer whole layers cannot help)
     LLAMA_API int32_t llama_moe_stream_gpu_layer_to_drop(const struct llama_model * model);
 
-    // With --moe-stream-elastic 1, no --moe-stream-slots and no --moe-stream-ram-free, the
-    // pools start with all free RAM minus keep-free (opts keep=, else ram_margin, else 500 MiB) minus the freeable part (opts part=,
-    // default 1 GiB; taken back at the first call as slots above the start size) - the RAM to pass as ram_free;
-    // otherwise ram_free unchanged
+    // The RAM to pass as ram_free: ram_free when it is not 0; else the RAM headroom (ram_margin, else opts keep=, else 1280 MiB on
+    // Linux, 1536 MiB on Windows / macOS, 2 GiB with no swap), with --moe-stream-elastic 1 and no --moe-stream-slots plus half the
+    // gap (opts gap=, at most 256 MiB)
     LLAMA_API int64_t llama_moe_stream_start_ram_free(int32_t elastic, int32_t slots, int64_t ram_free, int64_t ram_margin,
                                                       const char * elastic_opts);
 

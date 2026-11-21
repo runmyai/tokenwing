@@ -57,6 +57,10 @@ inline void moe_tt(const char * tag, long long arg = 0) {
 
 bool llama_moe_stream_dev_is_uma(ggml_backend_dev_t dev);
 
+// The CPU backend's MoE entry table (ggml-cpu.h, struct ggml_cpu_moe_api), found once through the "CPU" registry: the engine
+// never links to ggml-cpu, so it also runs when the CPU backend is a module picked at start for the CPU's level
+const ggml_cpu_moe_api * llama_cpu_moe_api();
+
 // SSD streaming of MoE routed expert weights
 //
 // Streamed layers do not materialize their ffn_{gate,up,down}_exps tensors: the routed experts
@@ -252,8 +256,8 @@ struct llama_moe_stream_p1 {
     int32_t     hip_sync             = 0;       // --moe-stream-hip-sync N (1 = auto 400 us, > 1 = us, 0 = off)
     // Elastic RAM and moving slot shares (both off = fixed, equal pools)
     bool        elastic              = false;
-    int64_t     ram_margin           = (int64_t) 500 << 20;
-    bool        ram_margin_set       = false;   // the user set keep-free (else 1.5 GiB on a machine with no swap at all)
+    int64_t     ram_margin           = 0;       // 0 = OS zero-paging default (1.25 GiB Linux / 1.5 GiB Win & macOS)
+    bool        ram_margin_set       = false;   // the user set keep-free
     std::string elastic_opts;
     bool        shares               = false;
     std::string share_file;
@@ -277,6 +281,7 @@ struct llama_moe_stream_p1 {
         int64_t ctx     = 0;   // the KV cache and the recurrent state of the layers there
         int64_t compute = 0;   // the compute buffers' estimate at the physical batch (with the attention mask)
         int64_t prewarm = 0;   // the backend's cuBLAS handle + workspace and its op scratch pool
+        int64_t keep    = 0;   // VRAM kept free on it (a --moe-stream-vram-free list; 0 without one)
         bool    pool    = false;   // the VRAM pool's device
     };
     std::vector<wl_dev>  wl_devs;
@@ -443,7 +448,7 @@ struct llama_moe_stream_layer {
     std::vector<uint8_t>  slot_off;       // [cap + n_zero]
     std::vector<int32_t>  el_drop_e;      // experts a give-back dropped (refill candidates; most recent last)
     std::vector<float>    el_drop_v;      // their keep values when dropped
-    std::vector<uint8_t>  el_refill;      // [cap + n_zero] the slot's read is an idle-time refill (cancelled when a request comes)
+    std::vector<uint8_t>  el_refill;      // [cap + n_zero] the slot's read is a take-back's refill (q_refill, the lowest read priority)
     // A ghost list (the last gh_cap experts evicted in decode words: a needed read of one = one more slot would have saved
     // it) and a victim zone (the zone_n least valuable residents at the last check: a hit on one = one fewer slot would have
     // cost it); both counted per check and averaged over --moe-stream-share-opts half
@@ -785,9 +790,10 @@ constexpr uint64_t MOE_STREAM_LFU_DECAY = 64;
 
 // what the machine must still have free after the pools are allocated
 constexpr int64_t MOE_STREAM_MIN_AVAIL = 4LL*1024*1024*1024;   // the old fixed margin
-// What --moe-stream-ram-free keeps free by default. The user wants 2-3 GB for the desktop;
-// 2.5 GiB is the middle of that, and it is what the pools are sized to leave.
-constexpr int64_t MOE_STREAM_DEFAULT_MIN_AVAIL = (int64_t) (2.5*1024*1024*1024);   // 2.5 GiB
+// With elastic RAM, how long after the fill at start (--moe-stream-idle-load 2) it still gives back only for a swap-out or free RAM under
+// the headroom (no early give-back or trim from its rate estimates: the load's own reads and page faults are not another program); the
+// first request ends it sooner
+constexpr int64_t MOE_STREAM_EL_FILL_SETTLE_US = 10LL*1000*1000;   // 10 s
 // What the pools have to leave for everything else in the process that the model file does not
 // describe: the KV cache, the compute buffers, the ggml context, and the CUDA driver/runtime host
 // allocations - which are made *after* this number is needed, which is why it cannot be measured here.
@@ -941,6 +947,7 @@ struct llama_moe_stream_job {
     bool     pr_down     = false;   // the down request of a needed read split as gate+up, then down
     bool     dz_touch    = false;   // the slot was discardable - write one word per page before the read
     bool     idle        = false;   // an idle-time load (q_idle, the lowest priority; kept out of the call counters)
+    bool     refill      = false;   // a take-back's refill read (q_refill: after every needed and guessed read, a few at a time)
 };
 
 // the userdata of one wave's remapping op: the layer and which wave of the ubatch it loads
@@ -1223,6 +1230,8 @@ struct llama_moe_stream {
     // GPU -> (pinned bounce ->) the slot (no engine lock: the slot is LOADING and only the copy-back writes it), settle it READY
     // (mtx held: the I/O threads' settle), and the keep value an expert leaving VRAM has
     void vf_cb_take(vf_job_t & j);
+    void cb_claim(llama_moe_stream_layer & B, int32_t v, int32_t e, vf_job_t & j);
+    bool tail_copy_back(int32_t g, int32_t p, int32_t il, int32_t e);
     void vf_cb_copy(vf_job_t & j, bool async);
     void vf_cb_settle(vf_job_t & j);
     float vf_keep_value(const llama_moe_stream_layer & sl, int32_t e) const;
@@ -1261,8 +1270,16 @@ struct llama_moe_stream {
     int64_t  tail_onewave_max  = 0;   // the largest such ubatch (vx_setup; the print, el_call_low)
     int64_t  n_onewave_host    = 0;   // graphs built with such a ubatch (llama_context; the exit line)
     static int64_t offload_min1() { return std::max<int64_t>(1, offload_min_batch()); }
-    bool     onewave_host(int64_t u) const { return tail_onewave_host && u >= offload_min1() && n_waves(u) == 1 &&
-                                                    !(ca_one_wave && gpu_waves > 0 && u >= (int64_t) gpu_waves); }   // (those take tail waves)
+    bool     el_win_no_whole_copy(int64_t u) const {
+#ifdef _WIN32
+        return el_win_holes && !tailw_graph(u);
+#else
+        (void) u;
+        return false;
+#endif
+    }
+    bool     onewave_host(int64_t u) const { return (tail_onewave_host || el_win_no_whole_copy(u)) && u >= offload_min1() && n_waves(u) == 1 &&
+                                                    !(ca_one_wave && tailw_graph(u) && gpu_waves > 0 && u >= (int64_t) gpu_waves); }   // (those take tail waves)
     bool tail_hook_ready() const {
         return tail_preset && (size_t) tail_group < vx_groups.size() &&
                vx_groups[(size_t) tail_group].gate_up != nullptr && vx_groups[(size_t) tail_group].down != nullptr;
@@ -1403,6 +1420,8 @@ struct llama_moe_stream {
     std::unordered_map<const ggml_tensor *, int32_t> tail_mm_uses;   // of them, MUL_MAT_IDs that read it as their weights
     int32_t  tail_split_used[3] = { -1, -1, -1 };         // the split that last took projection k's target
     int64_t  tail_n_vac_last = 0, tail_n_vac_max = 0;   // places emptied (the last vacate's range, the largest)
+    int64_t  tail_n_cb = 0, tail_cb_us = 0, tail_cb_noroom = 0;   // held experts copied back to RAM at a vacate, the time, none free
+    bool     vx_keep_short = false;   // the VRAM pool's sizing ended with less than --moe-stream-vram-free free on its GPU
     int64_t  tail_n_vacate = 0, tail_n_vac_places = 0, tail_n_fill_calls = 0, tail_n_fill_jobs = 0, tail_n_fill_noram = 0;
     int64_t  tail_n_taken = 0, tail_n_declined[8] = { 0 }; // the hook: copies given a target / refused, by reason
     int64_t  tail_n_taken_real = 0;                        // of the copies given a target: in graphs that were computed (tail_real)
@@ -1647,17 +1666,36 @@ struct llama_moe_stream {
     int64_t n_psplit_borrowed = 0, n_psplit_borrowed_held = 0, n_psplit_returned = 0, n_psplit_calls = 0;
     // Elastic RAM and moving slot shares - src/llama-moe-elastic.cpp
     bool     el_on = false, sh_on = false;
-    int64_t  el_step = (int64_t) 512 << 20, el_growmin = 0;   // el_growmin = take-again (opts again=; 0 = take back promptly)
-    double   el_cool_s = 20.0;                     // opts settle= (cool=): no take-back until nothing needed RAM for this long (the settle
-                                                   // rule; measured: Chrome opening 10 tabs paused up to 16.1 s between growth bursts)
+    int64_t  el_step = (int64_t) 512 << 20, el_growmin = -1;   // el_growmin = take-again (-1 = auto: keep + 1 GiB deadband)
+    bool     el_growmin_set = false;
+    double   el_cool_s = 30.0;                     // opts settle= (cool=): no take-back until nothing needed RAM for this long
     int32_t  el_stall_us = 100000;
     uint32_t el_ceiling = 0;                       // 0 = what all RAM holds
+    int64_t  el_refill_step = (int64_t) 256 << 20; // opts refillstep=: max bytes reclaimed per paced take-back step
+    int32_t  el_refill_ms = 5000;                  // opts refillms=: min milliseconds between consecutive take-back steps
+    int64_t  el_last_take_step_us = 0;             // mtx: timestamp of last take-back step
+    double   el_soft_min_pct = 25.0;               // opts softmin=: % of n_expert below which squeezed_warn state activates
+    bool     el_soft_min_set = false;
+    int32_t  el_soft_min_layer = 0;                // computed soft comfort floor per streamed layer
+    bool     el_squeezed_warn_said = false;        // mtx: logged once per squeeze excursion below el_soft_min_layer
+    bool     el_win_holes = false;                 // Windows: a layer has decommitted slots below wave_view_slots()
+    std::atomic<int64_t>  el_last_room_bytes{-1};  // lock-free snapshot of free headroom for layout telemetry
+    std::atomic<int64_t>  el_last_room_raw{-1};    // the elastic thread's last room reading (el_room), for a word's take-back
+    std::atomic<int64_t>  el_last_avail{-1};       // its MemAvailable at that look
+    std::atomic<int64_t>  el_last_look_us{0};      // when it looked
+    int64_t  el_word_take_try_us = 0;              // mtx: the last take-back try at a word's end
+    int64_t  el_n_word_take = 0;                   // mtx: take-back steps made at a word's end
+    std::atomic<uint32_t> el_min_share_pub{0};     // lock-free snapshot of smallest active share per streamed layer
+    std::atomic<int64_t>  el_net_given_bytes{0};   // lock-free snapshot of net bytes lent below initial pool size
     double   sh_step_pct = 1.0, sh_gap = 1.5, sh_half = 256.0, sh_floor_pct = 25.0, sh_ceil_pct = 300.0;
     int32_t  sh_every = 64, sh_hits = 32, sh_cool = 512;
     uint32_t sh_min = 24;
     std::atomic<int64_t> el_req{0};                // bytes the pressure alarm asked to give back, not given yet
     std::atomic<int64_t> el_events{0};             // pressure events (real + test)
     bool     el_in_call = false;                   // mtx: a decode() call is between set_decode and end_call
+    bool     el_hold_gives = false;                // mtx: a prompt call with GPU-wave copies (tail waves, copy-ahead) runs - slots are switched
+                                                   // off at its end, not during it (the band still frees RAM at any moment)
+    int64_t  el_n_held_gives = 0;                  // give-backs put off to such a call's end
     int64_t  el_last_give_us = 0;                  // mtx
     int64_t  el_last_big_give_us = 0;              // mtx: the last give-back asked of settlefall or more (the trim waits after it)
     int64_t  el_last_change_word = -1000000;       // mtx: the decode word of the last total change (slot shares wait)
@@ -1685,13 +1723,16 @@ struct llama_moe_stream {
     // Obey the OS - opts fill=0|1, relearn=S, part=SIZE
     // The rule (the default): free RAM = keep-free; give back only (a) under keep-free or (b) on PSI, in
     // proportion; swap-outs of idle memory are logged only (or answered by discarding our band, near keep-free)
-    int64_t  el_gap = 0;                           // opts gap=: a give-back brings free RAM to keep + gap, a take-back stops there (default 0)
-    int64_t  el_psi_floor = (int64_t) 3 << 29;     // opts psifloor=: a PSI event is a need only with less free (1.5 GiB)
+    int64_t  el_gap = (int64_t) 512 << 20;         // opts gap=: a give-back brings free RAM to keep + gap (default 512 MiB deadband)
+    bool     el_gap_set = false;
+    int64_t  el_psi_floor = (int64_t) 2 << 30;     // opts psifloor=: a PSI event is a need only with less free (2.0 GiB)
     // Discardable expert slots
     bool     el_dz_opt = true;                     // opts discard=0|1
+    bool     el_cache_opt = true;                  // opts cache=0|1: old file cache counts as free room (Linux)
     bool     el_dz_ok = false;                     // the OS has them here (the probe; set by el_parse_opts)
     bool     el_dz_on = false;                     // and every pool is fresh (create_pool): the band runs (a give-back takes it last)
     std::atomic<int64_t> el_dz_now{0};             // discardable slots now (changed under mtx; read by el_room before it)
+    std::atomic<int64_t> el_win_cshort{0};         // Windows: el_room's room minus the commit room at its last read (>= 0; el_x_committed)
     int64_t  dz_n_unlock = 0, dz_n_lock_ok = 0, dz_n_lock_fail = 0, dz_n_claim = 0, dz_n_taken = 0, dz_n_relock = 0, dz_n_relock_fail = 0;
     int64_t  n_dz_unlock_fail = 0;                  // the OS refused an unlock (discardable slots off from then on)
     int64_t  n_fb_noslot = 0, n_fb_noslot_freed = 0; // "no free slot" fallbacks (kept sets released, VRAM follow drained) - usually a bug
@@ -1702,6 +1743,13 @@ struct llama_moe_stream {
     int32_t  fb_test_commit_part = 0;               // TEST ONLY (MOE_STREAM_TEST_COMMIT_FAIL_PART=0|1|2): at which projection
     int64_t  n_fb_commit_released = 0;              // projections committed before a refusal and given back
     int64_t  dz_n_probe = 0, dz_n_probe_slots = 0, dz_n_hits = 0, dz_n_falls = 0;
+    // Taking band slots back ahead of use: a guess that names an expert sitting in a band slot queues it here (mtx), a reader takes it back
+    // before the layer's remap op reaches it; the remap op's own take-back stays as the fallback
+    struct dz_ahead_t { llama_moe_stream_layer * sl; int32_t slot, expert; };
+    std::deque<dz_ahead_t> dz_ahead_q;
+    int64_t  dz_n_ahead = 0, dz_n_ahead_lost = 0, dz_n_onpath = 0;   // taken back by a reader (the OS had taken it), by the remap op
+    int64_t  el_band_age = 1024;                   // opts age=: reply words a slot's expert must go unused before it joins the band
+    int64_t  dz_age_used = 0;                      // the age the last upkeep used (in the layer's expert uses; the stats line)
     double   dz_probe_ms_sum = 0.0, dz_probe_ms_max = 0.0, dz_hold_ms_max = 0.0, dz_lock_us_sum = 0.0, dz_unlock_us_sum = 0.0;
     int64_t  el_n_settle_wait = 0;                 // idle looks a take-back waited for the settle rule
     int64_t  el_others_last = -1;                  // the other programs' memory at the last look (the settle rule)
@@ -1752,11 +1800,13 @@ struct llama_moe_stream {
     bool     el_test_discard = false, el_test_discard_nolock = false, el_test_unlock_every = false;   // TEST ONLY
     bool     el_test_thp_always = false, el_test_thp_keep = false, el_test_look_log = false;                                    // TEST ONLY
     bool     dz_unlock(llama_moe_stream_layer & sl, int32_t s);   // mtx: a filled, droppable slot becomes discardable
+    void     dz_ahead(llama_moe_stream_layer & sl, int32_t s);    // mtx: a guess named the expert of slot s - taken back ahead if in the band
+    void     dz_take_ahead(std::unique_lock<std::mutex> & lock);  // a reader, mtx held: the queued take-backs, one lock turn each
     bool     slot_use(llama_moe_stream_layer & sl, int32_t s);    // mtx: about to be READ - lock it (false: the OS took it, it is EMPTY now)
     void     dz_claim(llama_moe_stream_layer & sl, int32_t s);    // mtx: about to be WRITTEN - an ordinary slot again (never O_DIRECT into it)
     void     dz_forget(llama_moe_stream_layer & sl, int32_t s);   // mtx: its discardable state dropped (its pages go back with the caller)
-    int64_t  dz_band(int64_t budget, int64_t * taken = nullptr);  // elastic RAM thread (takes the lock per layer): the OS's takes forgotten, the band's upkeep
-    double   el_band_pct = 25.0;                                  // opts band=: the discardable band, % of each layer's switched-on slots
+    int64_t  dz_band(int64_t budget, int64_t * taken = nullptr, bool reconcile_win = false);  // elastic RAM thread (takes the lock per layer)
+    double   el_band_pct = 20.0;                                  // opts band=: the discardable band, % of each layer's switched-on slots
     int64_t  el_band_pace = 64;                                   // opts bandpace=: the most slots the upkeep marks / unmarks per look
     bool     el_dz_touch = true;                                  // an O_DIRECT read into a claimed slot writes its pages first (Linux < 5.17)
     int64_t  el_psi_base = (int64_t) 128 << 20;    // opts psi=: a PSI event's give-back (doubling while the pressure goes on)
@@ -1766,13 +1816,13 @@ struct llama_moe_stream {
     void     el_ask_r(int64_t bytes, int reason, int64_t allowed);   // mtx held: el_ask with its reason (the checks)
     bool     el_test_give_noreason = false, el_test_give_oversize = false;   // TEST ONLY: the failure tests
     bool     el_test_psi_off = false;   // TEST ONLY: MOE_STREAM_TEST_PSI_OFF - the PSI triggers not armed (identity runs)
-    // Events first: the free-RAM check every lookmax ms (2 s), every idle_look ms (5 s) with no request running; the fast
-    // pace only while free RAM falls faster than fastrate (above the noise measured with nothing running, 25-78 MiB/s)
-    int32_t  el_idle_look_ms = 5000;
+    // Events + lightweight quarter-second headroom check (250 ms active/idle; 25 ms while free RAM falls >= fastrate)
+    int32_t  el_idle_look_ms = 250;
     int64_t  el_fast_rate = (int64_t) 128 << 20;   // bytes/s
     int64_t  el_last_call_end_us = 0;              // mtx: the last call's end (idle = no call for 2 s)
     int64_t  el_n_looks_idle = 0;
     int64_t  el_last_obj_us = 0;                   // mtx: the last need that was no give-back (a PSI need, a fall): a take-back waits el_cool_s
+    std::atomic<int64_t> el_quiet_until_us{0};     // while the fill at start runs and a short settle after it: no give-back or trim from rate estimates
     bool     el_call_known = true;                 // mtx: decode_phase describes the running call (false from el_enter to el_at_call_start)
     void     el_check_wave_need(const char * where) const;   // mtx held: the check - a prompt call's layers keep its wave width
     int32_t  el_test_fake_swap = 0;                // TEST ONLY: MOE_STREAM_TEST_FAKE_SWAP=N
@@ -1785,7 +1835,7 @@ struct llama_moe_stream {
     // --moe-stream-elastic-opts pace / drop / lookmin / lookmax / ratewin: the looks paced by the other programs' rate
     double   el_pace = 2.0;                        // the safety factor on the rate (0 = unpaced: lookmax far, lookmin near)
     int64_t  el_drop = 0;                          // the most free RAM may fall between two looks (0 = step / 2)
-    int32_t  el_look_min_ms = 100, el_look_max_ms = 2000, el_rate_win_ms = 1000;
+    int32_t  el_look_min_ms = 25, el_look_max_ms = 250, el_rate_win_ms = 1000;
     bool     el_test_pace_off = false;             // TEST ONLY: MOE_STREAM_TEST_PACE_OFF (the failure test: unpaced, the check armed)
     int64_t  el_n_early = 0, el_n_fast_looks = 0;  // early give-backs; looks at the fastest pace
     double   el_rate_max = 0.0;                    // the fastest other-program rate seen (bytes/s)
@@ -1816,7 +1866,9 @@ struct llama_moe_stream {
     std::atomic<int64_t> el_fk_t0_us{0}, el_fk_swp{0}, el_fk_swapped{0};
     int64_t  el_fk_a0 = 0, el_fk_given0 = 0, el_fk_taken0 = 0;
     bool     el_quiet_drop = false;                // mtx: the low-only drop (counted on its own line, not as an eviction)
-    int64_t  el_n_refill_seen = 0;                 // mtx: refills already cancelled
+    int32_t  el_refill_io = 2;                     // opts refillio=: refill reads in flight at most (behind every other read)
+    int32_t  n_refill_run = 0;                     // mtx: refill pieces in a reader now
+    void     el_refill_drain(llama_moe_stream_layer * only, int32_t s_lo, int32_t s_hi);   // mtx: queued refill reads taken back
     std::atomic<int64_t> el_n_ignored{0};          // pressure events with more than margin + step free (not a shortage)
     int64_t  el_n_lower = 0, el_n_raise = 0;       // zero-block moves (graph rebuilds)
     bool     el_min_dirty = false;                 // mtx: a prompt's layer op gave back; settled at the call's end
@@ -1827,6 +1879,10 @@ struct llama_moe_stream {
     std::vector<std::string> sh_log;               // one line per move (printed at the end)
     std::thread el_thread;
     int      el_stop_fd = -1;
+    int      el_pipe_fds[2] = { -1, -1 };
+    void *   el_win_stop_ev = nullptr;
+    void *   el_win_mem_ev  = nullptr;
+    void *   el_mac_src     = nullptr;
     // TEST ONLY (read once at start-up): MOE_STREAM_TEST_ELASTIC_CHECK=1 checks every switch-off (eligible slots only) and every
     // share change (floors, ceilings, the sum, each share = its switched-on slots); _SHRINK_INUSE=1 lets the first give-back take
     // an in-use slot (the failure test); MOE_STREAM_TEST_FAKE_ALARM=N a pressure event every N decode words; _IGNORE_ALARM=1 drops the
@@ -1852,6 +1908,7 @@ struct llama_moe_stream {
     el_mem   el_read_mem();
     void     el_take(int mode, const el_mem & m);                                 // mtx, boundary: 0 a request, 1 a reply's end, 3 idle (elastic RAM thread)
     int64_t  el_os_memfree();
+    int64_t  el_old_file_cache();   // Linux: file cache the kernel drops without a write (0 elsewhere)
     void     el_at_call_start(bool decode, int32_t n_tok);                        // set_decode
     void     el_at_call_end(bool complete);                                       // end_call, mtx held
     void     el_at_layer(llama_moe_stream_layer & sl, bool decode, int32_t wave, int64_t n_tok);   // remap_needed, mtx: a prompt's give-back
@@ -2867,6 +2924,7 @@ struct llama_moe_stream {
     std::deque<llama_moe_stream_job> q_demand;
     std::deque<llama_moe_stream_job> q_prefetch;
     std::deque<llama_moe_stream_job> q_idle;   // idle-time loads, taken only when nothing else waits
+    std::deque<llama_moe_stream_job> q_refill; // elastic RAM's refill reads: after every needed and guessed read, el_refill_io at a time
     std::vector<std::thread>    io_threads;
     bool                        io_stop = false;
     int32_t                     n_inflight = 0;      // reads in flight right now
@@ -3119,7 +3177,7 @@ struct llama_moe_stream {
     // Milestone 3, 2(a): never a one-wave ubatch the tail rule keeps on the host (onewave_host; false in every run before 2(a), whose
     // tail was refused there) - else a --moe-stream-gpu-waves at or under its rows would offload it with the whole pool
     bool waves_on_gpu(int64_t n_tok) const {
-        return gpu_waves > 0 && n_tok >= (int64_t) gpu_waves && !cpu_repack_on.load() && !onewave_host(n_tok);
+        return gpu_waves > 0 && n_tok >= (int64_t) gpu_waves && !cpu_repack_on.load() && !onewave_host(n_tok) && !el_win_no_whole_copy(n_tok);
     }
     // THE rule "this remap op's expert matmul runs on the CPU". It reads llama_context's own
     // decision for the graph being computed (graph_op_offload = op offload && (no wave flag || waves_on_gpu), set before every compute,
@@ -3145,7 +3203,7 @@ struct llama_moe_stream {
     // x / 2^n gives the same integers and a block scale 2^n smaller, all exact, and the output times 2^n is the same float - the scale
     // is exactly 2^n while expf(n ln2) is (n <= 12 with glibc: every row's max |x| <= 2^22). A q8_0 down (fp16 block scale) keeps it.
     bool down_scale_skip(ggml_type down_type, int64_t n_rows, bool gpu_wave, bool op_offload) const {
-        if (uma_gpu_pool || !p1.cpu_down_scale || ggml_get_type_traits_cpu(down_type)->vec_dot_type != GGML_TYPE_Q8_K) {
+        if (uma_gpu_pool || !p1.cpu_down_scale || llama_cpu_moe_api()->get_type_traits_cpu(down_type)->vec_dot_type != GGML_TYPE_Q8_K) {
             return false;
         }
         if (!el_has_gpu) {
@@ -3269,7 +3327,7 @@ struct llama_moe_stream {
     // Lead / rank / extra flags describe a guess for the event recorder (lead = layers ahead of the layer that
     // issued it, rank = position in its guess list); they change nothing in the read
     void   enqueue(llama_moe_stream_layer & sl, int32_t expert, int32_t slot, bool prefetch,
-                   int32_t lead = 0, int32_t rank = -1, uint8_t rflags = 0, bool pr_split_ok = false, bool idle = false);
+                   int32_t lead = 0, int32_t rank = -1, uint8_t rflags = 0, bool pr_split_ok = false, bool idle = false, bool refill = false);
     // A remap call's split needed reads queue their gate+up job at once and hold the down job here; the call
     // queues the held downs after its last needed read (or before it releases the lock to wait), so every gate+up of the call
     // is ahead of its downs. mtx held.

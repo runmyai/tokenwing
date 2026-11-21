@@ -657,6 +657,17 @@ llama_context::llama_context(
             }
             ms->vx_report(gdev);
             llama_memory_note_alloc_failure(false);   // (the pool sizing's trial reserves fail on purpose; they are not the context's failure)
+            // The whole-layer fit leaves the pool's GPU's --moe-stream-vram-free to the pool. When the pool could not keep it (whole layers
+            // took too much) and that GPU holds a whole layer, this context fails as a device allocation does: common loads the model again
+            // with one whole layer fewer, until the keep-free fits or no whole layer is left there (then the run keeps less free, as before)
+            if (ms->vx_keep_short && ms->whole_layer_to_drop(ms->pool_dev) >= 0 && !model.no_alloc()) {
+                size_t f = 0, t = 0;
+                ggml_backend_dev_memory(ms->pool_dev, &f, &t);
+                fprintf(stderr, "%s: --moe-stream-vram-free: %.0f MiB free on %s next to the whole GPU MoE layers, under the %.0f MiB to keep "
+                        "free - one whole layer fewer\n", __func__, f/1048576.0, ggml_backend_dev_name(ms->pool_dev), ms->p1.vram_free/1048576.0);
+                llama_memory_note_alloc_failure(true, ms->pool_dev);
+                throw std::runtime_error("the VRAM pool cannot keep --moe-stream-vram-free free next to the whole GPU MoE layers");
+            }
             if (ms->lend_on && ms->lend_owner == this) {   // the final reserve's decision
                 const auto U = ms->lend_places_at((int64_t) cparams.n_ctx);
                 int64_t nU = 0;
@@ -7288,6 +7299,19 @@ bool llama_moe_stream_get_layout(const llama_context * ctx, llama_moe_stream_lay
                 out->block_bytes = (int64_t) slp->block_bytes;
             }
         }
+    }
+    if (mstream->el_on) {
+        const uint32_t mn = mstream->el_min_share_pub.load(std::memory_order_relaxed);
+        const uint32_t eff_mn = mn > 0 ? mn : mstream->n_slots;
+        out->elastic_on             = 1;
+        out->elastic_slots_min      = (int32_t) eff_mn;
+        out->elastic_slots_soft_min = mstream->el_soft_min_layer;
+        out->elastic_given_bytes    = mstream->el_net_given_bytes.load(std::memory_order_relaxed);
+        out->elastic_band_bytes     = mstream->el_dz_now.load(std::memory_order_relaxed) * out->block_bytes;
+        out->elastic_free_bytes     = mstream->el_last_room_bytes.load(std::memory_order_relaxed);
+        out->elastic_state          = (mstream->el_soft_min_layer > 0 && (int32_t) eff_mn < mstream->el_soft_min_layer) ? 2
+                                    : mstream->el_taking ? 3
+                                    : (eff_mn < mstream->n_slots || out->elastic_given_bytes > 0) ? 1 : 0;
     }
     return true;
 }

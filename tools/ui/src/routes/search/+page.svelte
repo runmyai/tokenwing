@@ -3,7 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { SearchInput, SidebarNavigationSearchResults } from '$lib/components/app';
-	import { ROUTES } from '$lib/constants';
+	import { APP_NAME, ROUTES } from '$lib/constants';
 	import { RouterService } from '$lib/services/router.service';
 	import { chatStore, conversationsStore, deviceStore } from '$lib/stores';
 
@@ -72,7 +72,7 @@
 </script>
 
 <svelte:head>
-	<title>Search · llama.cpp</title>
+	<title>Search · {APP_NAME}</title>
 </svelte:head>
 
 <div class="fixed top-0 z-10 left-0 right-0 p-2">

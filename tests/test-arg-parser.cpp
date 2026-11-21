@@ -259,6 +259,57 @@ static void test(void) {
     assert(params.n_predict == 6789);
     assert(params.n_batch == 9090);
 
+    // --moe-stream-vram-free: one size (the pool's GPU) or a list per GPU; --moe-stream-gpu-layers-device with "auto"
+    {
+        common_params p;
+        argv = {"binary_name", "-m", "m.gguf", "--moe-stream-vram-free", "200MiB"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), p, LLAMA_EXAMPLE_COMMON));
+        assert(p.moe_stream_vram_free == 200ll << 20 && p.moe_stream_vram_free_dev.empty());
+    }
+    {
+        common_params p;
+        argv = {"binary_name", "-m", "m.gguf", "--moe-stream-vram-free", "CUDA0=1GiB,CUDA1=512MiB"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), p, LLAMA_EXAMPLE_COMMON));
+        assert(p.moe_stream_vram_free_dev == "CUDA0=1073741824,CUDA1=536870912");
+        assert(p.moe_stream_vram_free == 1ll << 30);   // no default: the largest named
+    }
+    {
+        common_params p;
+        argv = {"binary_name", "-m", "m.gguf", "--moe-stream-vram-free", "CUDA1=0,256MiB"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), p, LLAMA_EXAMPLE_COMMON));
+        assert(p.moe_stream_vram_free_dev == "CUDA1=0" && p.moe_stream_vram_free == 256ll << 20);
+    }
+    {
+        common_params p;
+        argv = {"binary_name", "-m", "m.gguf", "--moe-stream-vram-free", "CUDA0=0"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), p, LLAMA_EXAMPLE_COMMON));
+        assert(p.moe_stream_vram_free == 1);   // a list keeps the pool on
+    }
+    for (const char * bad : {"CUDA0=", "=1GiB", "1GiB,2GiB", "CUDA0=1XB"}) {
+        common_params p;
+        argv = {"binary_name", "-m", "m.gguf", "--moe-stream-vram-free", bad};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), p, LLAMA_EXAMPLE_COMMON));
+    }
+    {
+        common_params p;
+        argv = {"binary_name", "-m", "m.gguf", "--moe-stream-gpu-layers-device", "CUDA1=30-32", "--moe-stream-gpu-layers-device", "CUDA2=5"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), p, LLAMA_EXAMPLE_COMMON));
+        assert(p.moe_stream_gpu_layers_list == "30,31,32,5");
+    }
+    {
+        common_params p;
+        argv = {"binary_name", "-m", "m.gguf", "--moe-stream-gpu-layers-device", "CUDA1=auto;CUDA2=auto"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), p, LLAMA_EXAMPLE_COMMON));
+        assert(p.moe_stream_gpu_layers_device == "CUDA1=auto;CUDA2=auto" && p.moe_stream_gpu_layers_list.empty());
+    }
+    {
+        common_params p;
+        argv = {"binary_name", "-m", "m.gguf", "--moe-stream-gpu-layers-device", "CUDA1=auto"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), p, LLAMA_EXAMPLE_COMMON));
+        argv = {"binary_name", "-m", "m.gguf", "--moe-stream-gpu-layers-device", "CUDA1=autox"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), p, LLAMA_EXAMPLE_COMMON));
+    }
+
     // --draft cannot be used outside llama-speculative
     argv = {"binary_name", "--spec-draft-n-max", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));

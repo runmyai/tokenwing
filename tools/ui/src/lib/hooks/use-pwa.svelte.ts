@@ -19,6 +19,13 @@ export function usePwa() {
 		needRefresh: pwaNeedRefresh,
 		updateServiceWorker
 	} = useRegisterSW({
+		// A newer page (after an engine update) found while the page is just opening is taken at once, before anyone types;
+		// one found later waits until the page is opened again. Nothing is announced either way.
+		onNeedRefresh() {
+			if (performance.now() < SW_CONFIG.APPLY_AT_OPEN_MS) {
+				updateServiceWorker(true);
+			}
+		},
 		onRegisteredSW(swUrl: string, r: ServiceWorkerRegistration | undefined) {
 			if (swCheckInterval) {
 				clearInterval(swCheckInterval);

@@ -757,6 +757,135 @@ static std::vector<size_t> unicode_regex_split_custom_qwen35(const std::string &
     return bpe_offsets;
 }
 
+// Flint's word split, as unicode_regex_split runs it through std::regex: there \p{Lu}, \p{Ll}, \p{Lt}, \p{Lm} and \p{Lo} all collapse
+// to "letter", so the pattern means [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+(?:'s|'t|'re|'ve|'m|'ll|'d)? (ASCII, either case)
+// | ?[\p{P}\p{S}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+, and characters that no branch matches stay together as one piece.
+// Written out because MSVC's std::regex gives up on long input with this pattern (regex_error(error_complexity)).
+static std::vector<size_t> unicode_regex_split_custom_flint(const std::string & text, const std::vector<size_t> & offsets) {
+    std::vector<size_t> bpe_offsets;
+    bpe_offsets.reserve(offsets.size());
+
+    const auto cpts = unicode_cpts_from_utf8(text);
+
+    // each codepoint's class as the collapsed text shows it: ASCII as itself, any other whitespace as \v, the rest by category
+    enum : uint8_t { C_OTHER, C_WS, C_LETTER, C_NUMBER, C_MARK, C_PUNCT_SYM, C_END };
+    std::vector<uint8_t> cls(cpts.size());
+    for (size_t i = 0; i < cpts.size(); i++) {
+        const uint32_t c = cpts[i];
+        if (c < 128) {
+            cls[i] = c == ' ' || (c >= '\t' && c <= '\r')    ? C_WS
+                   : (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ? C_LETTER
+                   : c >= '0' && c <= '9'                      ? C_NUMBER
+                   : c >= 0x21 && c <= 0x7e                    ? C_PUNCT_SYM   // every other printable ASCII is \p{P} or \p{S}
+                   :                                             C_OTHER;
+            continue;
+        }
+        const auto f = unicode_cpt_flags_from_cpt(c);
+        cls[i] = f.is_whitespace ? C_WS : f.is_letter ? C_LETTER : f.is_number ? C_NUMBER : f.is_accent_mark ? C_MARK
+               : f.is_punctuation || f.is_symbol ? C_PUNCT_SYM : C_OTHER;
+    }
+    const auto lower = [](uint32_t c) -> uint32_t { return c >= 'A' && c <= 'Z' ? c + 32 : c; };
+    const auto is_rn = [](uint32_t c) { return c == '\r' || c == '\n'; };
+
+    size_t start = 0;
+    for (auto offset : offsets) {
+        const size_t ini = start, end = start + offset;
+        assert(end <= cpts.size());
+        start = end;
+
+        const auto at = [&](size_t p) -> uint8_t { return p < end ? cls[p] : C_END; };
+        const auto lm = [&](size_t p) { return at(p) == C_LETTER || at(p) == C_MARK; };
+
+        size_t prev = ini;
+        const auto emit = [&](size_t e) {
+            if (e > prev) {
+                bpe_offsets.push_back(e - prev);
+            }
+            prev = e;
+        };
+
+        for (size_t pos = ini; pos < end; ) {
+            const uint32_t c = cpts[pos];
+            size_t m = 0;   // where the match that starts here ends; 0 = none starts here (the character joins the unmatched piece)
+
+            if ((!is_rn(c) && at(pos) != C_LETTER && at(pos) != C_NUMBER && lm(pos + 1)) || lm(pos)) {
+                // [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?
+                size_t e = pos + 1;
+                while (lm(e)) {
+                    e++;
+                }
+                if (e + 1 < end && cpts[e] == '\'') {
+                    const uint32_t a = lower(cpts[e + 1]);
+                    if (a == 's' || a == 't' || a == 'm' || a == 'd') {
+                        e += 2;
+                    } else if (e + 2 < end) {
+                        const uint32_t b = lower(cpts[e + 2]);
+                        if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l')) {
+                            e += 3;
+                        }
+                    }
+                }
+                m = e;
+            } else if (at(pos + (c == ' ' && at(pos + 1) == C_PUNCT_SYM)) == C_PUNCT_SYM) {
+                // <space>?[\p{P}\p{S}]+[\r\n]*
+                size_t e = pos + (c == ' ');
+                while (at(e) == C_PUNCT_SYM) {
+                    e++;
+                }
+                while (e < end && is_rn(cpts[e])) {
+                    e++;
+                }
+                m = e;
+            } else if (at(pos) == C_WS) {
+                size_t e = pos, last_rn = 0;
+                while (at(e) == C_WS) {
+                    if (is_rn(cpts[e])) {
+                        last_rn = e + 1;
+                    }
+                    e++;
+                }
+                m = last_rn > 0              ? last_rn   // \s*[\r\n]+
+                  : e - pos > 1 && e < end   ? e - 1     // \s+(?!\S)
+                  :                            e;        // \s+
+            }
+
+            if (m == 0) {
+                pos++;
+                continue;
+            }
+            emit(pos);   // the unmatched piece before it, if any
+            emit(m);
+            pos = m;
+        }
+        emit(end);
+    }
+
+    return bpe_offsets;
+}
+
+// A regex can fail to match on some implementations: MSVC's std::regex enforces a backtracking
+// complexity limit that the Unicode word-splitter exceeds on long, punctuation-heavy input
+// (regex_error(error_complexity)). Split that segment on whitespace instead of failing the whole
+// request: every codepoint is kept, so BPE still sees the text, only the word boundaries differ.
+template <typename CharT>
+static void unicode_regex_split_ws_segment(const std::basic_string<CharT> & text, size_t start, size_t offset, std::vector<size_t> & out) {
+    const auto is_ws = [](CharT c) -> bool {
+        return c == (CharT) ' '  || c == (CharT) '\t' || c == (CharT) '\n' ||
+               c == (CharT) '\r' || c == (CharT) '\f' || c == (CharT) 0x0B;
+    };
+    const size_t end = start + offset;
+    size_t i = start;
+    while (i < end) {
+        const bool ws = is_ws(text[i]);
+        size_t j = i + 1;
+        while (j < end && is_ws(text[j]) == ws) {
+            ++j;
+        }
+        out.emplace_back(j - i);
+        i = j;
+    }
+}
+
 template <typename CharT>
 static std::vector<size_t> unicode_regex_split_stl(const std::basic_string<CharT> & text, const std::basic_string<CharT> & regex, const std::vector<size_t> & offsets) {
     using BidirIt = typename std::basic_string<CharT>::const_iterator;
@@ -766,27 +895,46 @@ static std::vector<size_t> unicode_regex_split_stl(const std::basic_string<CharT
 #else
     constexpr auto regex_flags = std::regex_constants::optimize | std::regex_constants::nosubs;
 #endif
-    std::basic_regex<CharT> expr(regex, regex_flags);
+    std::basic_regex<CharT> expr;
+    bool regex_ok = true;
+    try {
+        expr.assign(regex, regex_flags);
+    } catch (const std::regex_error &) {
+        regex_ok = false;
+    }
+
     std::vector<size_t> bpe_offsets; // store the offset of each word
     bpe_offsets.reserve(offsets.size()); // Reserve memory for the approximate size
     size_t start = 0;
     for (auto offset : offsets) {
-        std::regex_iterator<BidirIt> it(text.begin() + start, text.begin() + start + offset, expr);
-        std::regex_iterator<BidirIt> end;
+        const size_t seg_begin = bpe_offsets.size();
+        bool seg_ok = regex_ok;
+        if (seg_ok) {
+            try {
+                std::regex_iterator<BidirIt> it(text.begin() + start, text.begin() + start + offset, expr);
+                std::regex_iterator<BidirIt> end;
 
-        int64_t start_idx = 0;
-        while (it != end) {
-            std::match_results<BidirIt> match = *it;
-            if (match.position() > start_idx) {
-                bpe_offsets.emplace_back(match.position() - start_idx);
+                int64_t start_idx = 0;
+                while (it != end) {
+                    std::match_results<BidirIt> match = *it;
+                    if (match.position() > start_idx) {
+                        bpe_offsets.emplace_back(match.position() - start_idx);
+                    }
+                    bpe_offsets.emplace_back(match.length());
+                    start_idx = match.position() + match.length();
+                    ++it;
+                }
+
+                if (start_idx < (int64_t) offset) {
+                    bpe_offsets.emplace_back(offset - start_idx);
+                }
+            } catch (const std::regex_error &) {
+                seg_ok = false;
             }
-            bpe_offsets.emplace_back(match.length());
-            start_idx = match.position() + match.length();
-            ++it;
         }
-
-        if (start_idx < (int64_t) offset) {
-            bpe_offsets.emplace_back(offset - start_idx);
+        if (!seg_ok) {
+            bpe_offsets.resize(seg_begin);
+            unicode_regex_split_ws_segment(text, start, offset, bpe_offsets);
         }
         start += offset;
     }
@@ -1084,6 +1232,8 @@ static std::vector<size_t> unicode_regex_split_custom(const std::string & text, 
     } else if (
            regex_expr == "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
         bpe_offsets = unicode_regex_split_custom_qwen35(text, offsets);
+    } else if (regex_expr == "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?| ?[\\p{P}\\p{S}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
+        bpe_offsets = unicode_regex_split_custom_flint(text, offsets);
     } else if (regex_expr == "\\p{Han}+") {
         // K2's first pattern - handle all K2 patterns together
         bpe_offsets = unicode_regex_split_custom_kimi_k2(text, offsets);

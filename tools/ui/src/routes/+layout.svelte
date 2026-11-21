@@ -5,7 +5,7 @@
 	import { base } from '$app/paths';
 	import { page } from '$app/state';
 	import { SidebarNavigation } from '$lib/components/app';
-	import { PwaMetaTags, PwaRefreshAlert } from '$lib/components/pwa';
+	import { PwaMetaTags } from '$lib/components/pwa';
 	import * as Tooltip from '$lib/components/ui/tooltip';
 	import {
 		FAVICON_PATHS,
@@ -56,9 +56,9 @@
 		settingsStore.config[SETTINGS_KEYS.SHOW_BUILD_VERSION] as boolean
 	);
 
-	// Keep the hook object intact: destructuring needRefreshByStorage reads the getter once and freezes it
-	const pwa = usePwa();
-	const { needRefresh, updateServiceWorker } = pwa;
+	// Registers the service worker. A newer page after an engine update is not announced: the browser takes it the next
+	// time the page is opened (people who run the engine by hand find engine updates themselves).
+	usePwa();
 
 	function updateFavicon() {
 		const dark = deviceStore.systemTheme.isDark;
@@ -338,15 +338,9 @@
 	<Toaster closeButton richColors />
 </Tooltip.Provider>
 
-<!-- PWA update prompt + version -->
+<!-- build version -->
 <div class="fixed right-4 bottom-4 z-9999 flex flex-col items-end gap-1">
 	{#if showBuildVersion && versionStore.build}
 		<span class="text-[10px] tabular-nums text-muted-foreground">{versionStore.build}</span>
 	{/if}
-
-	<PwaRefreshAlert
-		forceReload={pwa.needRefreshByStorage}
-		needRefresh={$needRefresh || pwa.needRefreshByStorage}
-		{updateServiceWorker}
-	/>
 </div>

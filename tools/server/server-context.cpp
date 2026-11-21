@@ -1666,6 +1666,15 @@ public:
                 { "ram_pool_mib",           (double) lay.ram_pool_bytes*mib },
                 { "vram_pool_mib",          (double) lay.vram_pool_bytes*mib },
                 { "kv_cache_mib",           (double) lay.kv_bytes*mib },
+                { "elastic", {
+                    { "enabled",              lay.elastic_on != 0 },
+                    { "state",                lay.elastic_state == 2 ? "squeezed_warn" : lay.elastic_state == 3 ? "reclaiming" : lay.elastic_state == 1 ? "shared" : "normal" },
+                    { "slots_min_per_layer",  lay.elastic_slots_min },
+                    { "slots_soft_min",       lay.elastic_slots_soft_min },
+                    { "given_mib",            (double) lay.elastic_given_bytes*mib },
+                    { "discardable_band_mib", (double) lay.elastic_band_bytes*mib },
+                    { "os_free_room_mib",     lay.elastic_free_bytes >= 0 ? (double) lay.elastic_free_bytes*mib : -1.0 },
+                } },
             } },
         };
     }

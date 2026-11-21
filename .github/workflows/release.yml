@@ -23,6 +23,10 @@ on:
         description: Reuse the 13 packages of this earlier run (its id) instead of building them again
         required: false
         default: ''
+      variants:
+        description: With from_run, build only these packages again (names separated by spaces, e.g. tokenwing-linux-x64-rocm)
+        required: false
+        default: ''
 
 concurrency:
   group: release-${{ github.ref }}
@@ -36,9 +40,61 @@ env:
   SMOKE_MODEL_URL: https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf
 
 jobs:
+  plan:
+    name: packages to build
+    runs-on: ubuntu-22.04
+    outputs:
+      linux: ${{ steps.pick.outputs.linux }}
+      windows: ${{ steps.pick.outputs.windows }}
+      any: ${{ steps.pick.outputs.any }}
+    steps:
+      - name: Pick the packages
+        id: pick
+        env:
+          FROM_RUN: ${{ inputs.from_run }}
+          VARIANTS: ${{ inputs.variants }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          linux, windows = json.loads(os.environ["LINUX"]), json.loads(os.environ["WINDOWS"])
+          known = {m["variant"] for m in linux + windows}
+          want = os.environ["VARIANTS"].replace(",", " ").split()
+          if want and not os.environ["FROM_RUN"]:
+              sys.exit("variants needs from_run: the other packages come from that run")
+          if set(want) - known:
+              sys.exit(f"unknown packages: {sorted(set(want) - known)}")
+          if os.environ["FROM_RUN"]:
+              linux = [m for m in linux if m["variant"] in want]
+              windows = [m for m in windows if m["variant"] in want]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"linux={json.dumps(linux)}\nwindows={json.dumps(windows)}\nany={str(bool(linux or windows)).lower()}\n")
+          print("build:", [m["variant"] for m in linux + windows] or "nothing (all from run " + os.environ["FROM_RUN"] + ")")
+          PY
+    env:
+      LINUX: >-
+        [
+        {"variant": "tokenwing-linux-x64-cpu", "os": "ubuntu-22.04", "backend": "cpu", "image": "", "smoke": "--smoke"},
+        {"variant": "tokenwing-linux-x64-cuda12", "os": "ubuntu-22.04", "backend": "cuda", "image": "nvidia/cuda:12.8.1-devel-ubuntu22.04", "smoke": "--smoke"},
+        {"variant": "tokenwing-linux-x64-cuda13", "os": "ubuntu-22.04", "backend": "cuda", "image": "nvidia/cuda:13.4.1-devel-ubuntu22.04", "smoke": "--smoke"},
+        {"variant": "tokenwing-linux-x64-rocm", "os": "ubuntu-22.04", "backend": "rocm", "image": "rocm/dev-ubuntu-22.04:7.2.1", "smoke": "--smoke"},
+        {"variant": "tokenwing-linux-x64-vulkan", "os": "ubuntu-22.04", "backend": "vulkan", "image": "", "smoke": "--smoke"},
+        {"variant": "tokenwing-linux-arm64-cpu", "os": "ubuntu-22.04-arm", "backend": "cpu", "image": "", "smoke": "--smoke"},
+        {"variant": "tokenwing-linux-arm64-cuda13", "os": "ubuntu-22.04-arm", "backend": "cuda", "image": "nvidia/cuda:13.4.1-devel-ubuntu22.04", "smoke": "--smoke"}
+        ]
+      WINDOWS: >-
+        [
+        {"variant": "tokenwing-windows-x64-cpu", "backend": "cpu", "cuda_version": "", "smoke": "--smoke"},
+        {"variant": "tokenwing-windows-x64-cuda12", "backend": "cuda12", "cuda_version": "12.8.1", "smoke": "--smoke"},
+        {"variant": "tokenwing-windows-x64-cuda13", "backend": "cuda13", "cuda_version": "13.4.1", "smoke": "--smoke"},
+        {"variant": "tokenwing-windows-x64-vulkan", "backend": "vulkan", "cuda_version": "", "smoke": "--smoke"},
+        {"variant": "tokenwing-windows-x64-hip", "backend": "hip", "cuda_version": "", "smoke": "--smoke"},
+        {"variant": "tokenwing-windows-arm64-cpu", "backend": "arm64-cpu", "cuda_version": "", "smoke": ""}
+        ]
+
   ui:
     name: web page
-    if: ${{ !inputs.from_run }}
+    needs: plan
+    if: ${{ needs.plan.outputs.any == 'true' }}
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
@@ -66,47 +122,13 @@ jobs:
 
   build-linux:
     name: ${{ matrix.variant }}
-    needs: ui
+    needs: [plan, ui]
+    if: ${{ needs.plan.outputs.linux != '[]' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - variant: tokenwing-linux-x64-cpu
-            os: ubuntu-22.04
-            backend: cpu
-            image: ''
-            smoke: '--smoke'
-          - variant: tokenwing-linux-x64-cuda12
-            os: ubuntu-22.04
-            backend: cuda
-            image: nvidia/cuda:12.8.1-devel-ubuntu22.04
-            smoke: '--smoke'
-          - variant: tokenwing-linux-x64-cuda13
-            os: ubuntu-22.04
-            backend: cuda
-            image: nvidia/cuda:13.4.1-devel-ubuntu22.04
-            smoke: '--smoke'
-          - variant: tokenwing-linux-x64-rocm
-            os: ubuntu-22.04
-            backend: rocm
-            image: rocm/dev-ubuntu-22.04:7.2.1
-            smoke: '--smoke'
-          - variant: tokenwing-linux-x64-vulkan
-            os: ubuntu-22.04
-            backend: vulkan
-            image: ''
-            smoke: '--smoke'
-          - variant: tokenwing-linux-arm64-cpu
-            os: ubuntu-22.04-arm
-            backend: cpu
-            image: ''
-            smoke: '--smoke'
-          - variant: tokenwing-linux-arm64-cuda13
-            os: ubuntu-22.04-arm
-            backend: cuda
-            image: nvidia/cuda:13.4.1-devel-ubuntu22.04
-            smoke: '--smoke'
+        include: ${{ fromJSON(needs.plan.outputs.linux) }}
 
     steps:
       - name: Checkout repository
@@ -190,36 +212,13 @@ jobs:
 
   build-windows:
     name: ${{ matrix.variant }}
-    needs: ui
+    needs: [plan, ui]
+    if: ${{ needs.plan.outputs.windows != '[]' }}
     runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - variant: tokenwing-windows-x64-cpu
-            backend: cpu
-            cuda_version: ''
-            smoke: '--smoke'
-          - variant: tokenwing-windows-x64-cuda12
-            backend: cuda12
-            cuda_version: '12.8.1'
-            smoke: '--smoke'
-          - variant: tokenwing-windows-x64-cuda13
-            backend: cuda13
-            cuda_version: '13.4.1'
-            smoke: '--smoke'
-          - variant: tokenwing-windows-x64-vulkan
-            backend: vulkan
-            cuda_version: ''
-            smoke: '--smoke'
-          - variant: tokenwing-windows-x64-hip
-            backend: hip
-            cuda_version: ''
-            smoke: '--smoke'
-          - variant: tokenwing-windows-arm64-cpu
-            backend: arm64-cpu
-            cuda_version: ''
-            smoke: ''
+        include: ${{ fromJSON(needs.plan.outputs.windows) }}
 
     steps:
       - name: Checkout repository
@@ -320,9 +319,9 @@ jobs:
 
   release:
     name: Verify 13/13 assets and publish release
-    needs: [build-linux, build-windows]
-    # with from_run the builds are skipped and their packages come from that run
-    if: ${{ always() && (inputs.from_run || (needs.build-linux.result == 'success' && needs.build-windows.result == 'success')) }}
+    needs: [plan, ui, build-linux, build-windows]
+    # with from_run the packages not built again come from that run; every build that ran must have passed
+    if: ${{ always() && needs.plan.result == 'success' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && (inputs.from_run || (needs.build-linux.result == 'success' && needs.build-windows.result == 'success')) }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -332,14 +331,30 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download all 13 release artifacts
+      - name: Download the packages of the earlier run
+        if: ${{ inputs.from_run }}
         uses: actions/download-artifact@v4
         with:
           pattern: dist-tokenwing-*
           merge-multiple: true
           path: release-assets
-          run-id: ${{ inputs.from_run || github.run_id }}
+          run-id: ${{ inputs.from_run }}
           github-token: ${{ github.token }}
+
+      - name: Leave out the earlier run's copies of the packages built again
+        if: ${{ inputs.from_run && needs.plan.outputs.any == 'true' }}
+        env:
+          VARIANTS: ${{ inputs.variants }}
+        run: |
+          for v in ${VARIANTS//,/ }; do rm -fv "release-assets/$v.tar.gz" "release-assets/$v.zip"; done
+
+      - name: Download the packages built in this run
+        if: ${{ needs.plan.outputs.any == 'true' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-tokenwing-*
+          merge-multiple: true
+          path: release-assets
 
       - name: Verify all 13 packages and generate SHA256SUMS
         run: |
@@ -375,7 +390,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           INPUT_TAG: ${{ inputs.tag }}
         run: |
-          python3 -m pip install --no-cache-dir huggingface_hub
+          python3 -m pip install --no-cache-dir huggingface_hub==2.4.0
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then TAG="${GITHUB_REF_NAME}"; else TAG="${INPUT_TAG:-trial-${GITHUB_SHA::9}}"; fi
           # the files are uploaded for a real release and for the trial branch (they are named by their SHA-256, so an
           # upload never changes a file another release uses)
@@ -418,7 +433,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
-          # this job has no checkout, so gh is told the repository
+          # gh is told the repository (it needs no checkout for this)
           GH_REPO: ${{ github.repository }}
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_PRE: ${{ inputs.prerelease }}

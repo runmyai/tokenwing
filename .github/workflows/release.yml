@@ -19,6 +19,10 @@ on:
         required: false
         type: boolean
         default: true
+      from_run:
+        description: Reuse the 13 packages of this earlier run (its id) instead of building them again
+        required: false
+        default: ''
 
 concurrency:
   group: release-${{ github.ref }}
@@ -34,6 +38,7 @@ env:
 jobs:
   ui:
     name: web page
+    if: ${{ !inputs.from_run }}
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
@@ -316,14 +321,25 @@ jobs:
   release:
     name: Verify 13/13 assets and publish release
     needs: [build-linux, build-windows]
+    # with from_run the builds are skipped and their packages come from that run
+    if: ${{ always() && (inputs.from_run || (needs.build-linux.result == 'success' && needs.build-windows.result == 'success')) }}
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      actions: read
     steps:
+      # the file list step runs a script from the repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Download all 13 release artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: dist-tokenwing-*
           merge-multiple: true
           path: release-assets
+          run-id: ${{ inputs.from_run || github.run_id }}
+          github-token: ${{ github.token }}
 
       - name: Verify all 13 packages and generate SHA256SUMS
         run: |

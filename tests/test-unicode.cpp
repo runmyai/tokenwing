@@ -93,8 +93,8 @@ int main() {
         };
         std::vector<std::string> texts = {
             "", "Hello, world!  foo_bar\t123\nend. (x) [y] {z} 's 'll  mixedCASE caf\xc3\xa9 \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\n",
-            "don't won'T we're THEY'VE i'm we'll he'd it'x 'tis", "  \n\n  x  \r\n\t y\t\t", "a\xcc\x81b\xcc\x81 \xcc\x81\xcc\x81 x",
-            " !!\n\n x ,, \xe2\x80\x9cq\xe2\x80\x9d\r\r", "\x01\x01a \x7f\x7f \xee\x80\x80\xee\x80\x80b 12 345",
+            "don't won'T we're THEY'VE i'm we'll he'd it'x 'tis", "  \n\n  x  \r\n\t y\t\t", "a\xcc\x81" "b\xcc\x81 \xcc\x81\xcc\x81 x",
+            " !!\n\n x ,, \xe2\x80\x9cq\xe2\x80\x9d\r\r", "\x01\x01" "a \x7f\x7f \xee\x80\x80\xee\x80\x80" "b 12 345",
         };
         uint32_t seed = 12345;
         const auto rnd = [&seed]() { seed = seed * 1103515245u + 12345u; return (seed >> 16) & 0x7fff; };

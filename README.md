@@ -64,8 +64,8 @@ You could technically run even a trillion-parameter model, if the math checks ou
 | Model | What it is | File |
 |---|---|---|
 | [Flint 40B](https://huggingface.co/runmyai/Flint-40B-TokenWing) | Coding model by Recursive. 40B total, about 2.5B active per token. | Q4_K_XL, about 25 GB |
-| [Ling 3.0 Flash](https://huggingface.co/runmyai/Ling-3.0-Flash-TokenWing) | 124B total, 5.1B active per token. 262k context. | MXFP4, about 70 GB |
-| [Qwen 3.8 Flash Next](https://huggingface.co/runmyai/Qwen3.8-Flash-Next-TokenWing) | By Qwen. | 3.5 bpw by Grawnch, about 84 GB with its n-gram table |
+| [Ling 3.0 Flash](https://huggingface.co/runmyai/Ling-3.0-Flash-TokenWing) | 124B total, 5.1B active per token, 262k context, by Ant Group | MXFP4, about 70 GB |
+| [Qwen 3.8 Flash Next](https://huggingface.co/runmyai/Qwen3.8-Flash-Next-TokenWing) | 180B total, 6B active per token. 262k context, by Alibaba | 3.5 bpw by Grawnch, about 84 GB with its n-gram table |
 
 ## Features
 

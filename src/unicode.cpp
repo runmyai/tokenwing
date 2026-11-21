@@ -757,6 +757,29 @@ static std::vector<size_t> unicode_regex_split_custom_qwen35(const std::string &
     return bpe_offsets;
 }
 
+// A regex can fail to match on some implementations: MSVC's std::regex enforces a backtracking
+// complexity limit that the Unicode word-splitter exceeds on long, punctuation-heavy input
+// (regex_error(error_complexity)). Split that segment on whitespace instead of failing the whole
+// request: every codepoint is kept, so BPE still sees the text, only the word boundaries differ.
+template <typename CharT>
+static void unicode_regex_split_ws_segment(const std::basic_string<CharT> & text, size_t start, size_t offset, std::vector<size_t> & out) {
+    const auto is_ws = [](CharT c) -> bool {
+        return c == (CharT) ' '  || c == (CharT) '\t' || c == (CharT) '\n' ||
+               c == (CharT) '\r' || c == (CharT) '\f' || c == (CharT) 0x0B;
+    };
+    const size_t end = start + offset;
+    size_t i = start;
+    while (i < end) {
+        const bool ws = is_ws(text[i]);
+        size_t j = i + 1;
+        while (j < end && is_ws(text[j]) == ws) {
+            ++j;
+        }
+        out.emplace_back(j - i);
+        i = j;
+    }
+}
+
 template <typename CharT>
 static std::vector<size_t> unicode_regex_split_stl(const std::basic_string<CharT> & text, const std::basic_string<CharT> & regex, const std::vector<size_t> & offsets) {
     using BidirIt = typename std::basic_string<CharT>::const_iterator;
@@ -766,27 +789,46 @@ static std::vector<size_t> unicode_regex_split_stl(const std::basic_string<CharT
 #else
     constexpr auto regex_flags = std::regex_constants::optimize | std::regex_constants::nosubs;
 #endif
-    std::basic_regex<CharT> expr(regex, regex_flags);
+    std::basic_regex<CharT> expr;
+    bool regex_ok = true;
+    try {
+        expr.assign(regex, regex_flags);
+    } catch (const std::regex_error &) {
+        regex_ok = false;
+    }
+
     std::vector<size_t> bpe_offsets; // store the offset of each word
     bpe_offsets.reserve(offsets.size()); // Reserve memory for the approximate size
     size_t start = 0;
     for (auto offset : offsets) {
-        std::regex_iterator<BidirIt> it(text.begin() + start, text.begin() + start + offset, expr);
-        std::regex_iterator<BidirIt> end;
+        const size_t seg_begin = bpe_offsets.size();
+        bool seg_ok = regex_ok;
+        if (seg_ok) {
+            try {
+                std::regex_iterator<BidirIt> it(text.begin() + start, text.begin() + start + offset, expr);
+                std::regex_iterator<BidirIt> end;
 
-        int64_t start_idx = 0;
-        while (it != end) {
-            std::match_results<BidirIt> match = *it;
-            if (match.position() > start_idx) {
-                bpe_offsets.emplace_back(match.position() - start_idx);
+                int64_t start_idx = 0;
+                while (it != end) {
+                    std::match_results<BidirIt> match = *it;
+                    if (match.position() > start_idx) {
+                        bpe_offsets.emplace_back(match.position() - start_idx);
+                    }
+                    bpe_offsets.emplace_back(match.length());
+                    start_idx = match.position() + match.length();
+                    ++it;
+                }
+
+                if (start_idx < (int64_t) offset) {
+                    bpe_offsets.emplace_back(offset - start_idx);
+                }
+            } catch (const std::regex_error &) {
+                seg_ok = false;
             }
-            bpe_offsets.emplace_back(match.length());
-            start_idx = match.position() + match.length();
-            ++it;
         }
-
-        if (start_idx < (int64_t) offset) {
-            bpe_offsets.emplace_back(offset - start_idx);
+        if (!seg_ok) {
+            bpe_offsets.resize(seg_begin);
+            unicode_regex_split_ws_segment(text, start, offset, bpe_offsets);
         }
         start += offset;
     }

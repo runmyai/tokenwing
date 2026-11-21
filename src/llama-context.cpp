@@ -4286,6 +4286,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_HY_V4 ||
         // The MoE expert streaming adds nodes to every streamed layer's graph (the remap op, the pool views, the guess, the
         // waves) whatever the architecture: Flint's graph ran out of the 8-per-tensor budget below at its first prompt
+        model.arch == LLM_ARCH_FLINT ||
         ctx_moe_stream() != nullptr) {
         res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
@@ -4297,6 +4298,15 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         for (const auto & lora : model.loras) {
             res += lora->get_n_nodes();
         }
+    }
+
+    if (ctx_moe_stream() != nullptr) {
+        const uint32_t n_exp     = std::max<uint32_t>(1u, model.hparams.n_expert);
+        const uint32_t min_slots = std::max<uint32_t>(4u, 2u * std::max<uint32_t>(1u, model.hparams.n_expert_used_max()));
+        const uint32_t max_waves = (n_exp + min_slots - 1u) / min_slots;
+        const uint32_t stream_floor = 64u * model.n_tensors()
+            + model.hparams.n_layer() * (128u + 32u * max_waves);
+        res = std::max<uint32_t>(res, stream_floor);
     }
 
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
@@ -7489,6 +7499,14 @@ bool llama_moe_stream_get_stats(const llama_context * ctx, llama_moe_stream_stat
             d->n_pr_gap       += c.n_pr_gap;
             d->t_pr_gap_us    += c.t_pr_gap_us;
             d->n_pr_split     += c.n_pr_split;
+            d->n_gg_mem_right  += c.n_gg_mem_right;
+            d->n_gg_mem_wrong  += c.n_gg_mem_wrong;
+            d->n_gg_ssd_right  += c.n_gg_ssd_right;
+            d->n_gg_ssd_wrong  += c.n_gg_ssd_wrong;
+            d->n_gg_skip_floor += c.n_gg_skip_floor;
+            d->n_gg_skip_vic   += c.n_gg_skip_vic;
+            d->n_gg_defer_q    += c.n_gg_defer_q;
+            d->n_gg_pn_skip    += c.n_gg_pn_skip;
         }
         res.n_calls       += slp->pre.n_calls + slp->dec.n_calls;
         res.n_tokens      += slp->pre.n_tok + slp->dec.n_tok;

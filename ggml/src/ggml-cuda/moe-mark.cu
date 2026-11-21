@@ -331,12 +331,15 @@ void ggml_cuda_moe_mark_after(const ggml_cgraph * cgraph, int i0, int i1, cudaSt
                 GGML_ABORT("%s: node %s (layer %d) runs on CUDA%d, but its needed-early event belongs to CUDA%d", __func__, node->name,
                         il, device, e.device);
             }
-            // the sources: the node itself; a router mark also copies its src[1..] (the other inputs of the layer's CPU split)
+            // the sources: the node itself; a router mark also copies its src[1..] (the other inputs of the layer's CPU split);
+            // a CONT guess mark also copies an attached src[1] (normalized top-k shares for --moe-stream-guess-gate)
             moe_mark_srcs s = {};
             int64_t off = 0;
             for (int j = 0; j < MOE_MARK_MAX_SRC; j++) {
                 const ggml_tensor * t = k == GGML_CUDA_MOE_MARK_DONE ? nullptr :   // a "done" mark copies nothing
-                                        j == 0 ? node : k == GGML_CUDA_MOE_MARK_ROUTER ? node->src[j] : nullptr;
+                                        j == 0 ? node :
+                                        k == GGML_CUDA_MOE_MARK_ROUTER ? node->src[j] :
+                                        (k == GGML_CUDA_MOE_MARK_GUESS && j == 1 && node->op == GGML_OP_CONT) ? node->src[1] : nullptr;
                 if (t == nullptr) {
                     break;
                 }

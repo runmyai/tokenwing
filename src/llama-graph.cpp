@@ -1569,10 +1569,118 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
         lm_chunk = params.lm_chunk;
     }
 
+static llama_expert_gating_func_type effective_moe_gating_func(llm_arch arch, uint32_t raw_gating) {
+    if (raw_gating != LLAMA_EXPERT_GATING_FUNC_TYPE_NONE) {
+        return (llama_expert_gating_func_type) raw_gating;
+    }
+    switch (arch) {
+        case LLM_ARCH_LLAMA4:
+        case LLM_ARCH_MIMO2:
+        case LLM_ARCH_NEMOTRON_H:
+        case LLM_ARCH_NEMOTRON_H_MOE:
+            return LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID;
+        case LLM_ARCH_OPENAI_MOE:
+            return LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT;
+        default:
+            return LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX;
+    }
+}
+
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     if (cb_func) {
         cb_func(ubatch, cur, name, il);
     }
+    if (!ws_bespoke && mstream && name && cur && n_tokens == 1 && lm_phase == 0 && mstream->ws_on() && mstream->prefetch_on()) {
+        if (strcmp(name, "ffn_norm") == 0 || strcmp(name, "attn_post_norm") == 0) {
+            if (cur->ne[0] == n_embd && cur->ne[1] == 1) {
+                ws_last_ffn_in = cur;
+                ws_last_ffn_il = il;
+            }
+        } else if (strcmp(name, "l_out") == 0 && mstream->ws_src(il) && cur->ne[0] == n_embd && cur->ne[1] == 1) {
+            if (ws_auto_next < 0) {
+                ws_auto_st.graph = true;
+                ws_auto_st.s2g   = mstream->ws_gpu && mstream->ne_gpu_graph() && il == mstream->ws_first;
+                ws_auto_next     = il;
+            } else if (il != ws_auto_next) {
+                ws_auto_st.s2g = false;
+            }
+            ws_auto_next = il + 1;
+
+            llm_graph_rec_leads ws_leads;
+            bool ws_ok = true;
+            int32_t ds_chk[llama_moe_stream::LOOKAHEAD_MAX];
+            const int32_t nt_chk = mstream->la_targets(il, ds_chk);
+            for (int32_t t = 0; t < nt_chk; t++) {
+                const int d = ds_chk[t];
+                const int X = il + d;
+                if (d < 1 || d > llm_graph_rec_leads::MAX_D || X < 0 || (size_t) X >= mstream->rt_layers.size()) {
+                    ws_ok = false;
+                    break;
+                }
+                const auto & rl = mstream->rt_layers[(size_t) X];
+                if (!rl.gate_inp || rl.gate_inp->ne[0] != n_embd || rl.gate_inp->ne[1] != n_expert || rl.gate_inp_s != nullptr) {
+                    ws_ok = false;
+                    break;
+                }
+                ws_leads.gate   [d] = mstream->corr_gate(X, d) ? mstream->corr_gate(X, d) : rl.gate_inp;
+                ws_leads.gate_b [d] = mstream->corr_gate(X, d) ? nullptr : rl.gate_inp_b;
+                ws_leads.norm   [d] = mstream->corr_unit(X, d) ? mstream->corr_unit(X, d) : rl.ffn_norm;
+                ws_leads.probs_b[d] = rl.exp_probs_b;
+                if (mstream->pred_shared && ws_leads.norm[d] == nullptr) {
+                    ws_ok = false;
+                    break;
+                }
+            }
+            if (ws_ok && nt_chk > 0) {
+                ggml_tensor * cin = (ws_last_ffn_il == il && ws_last_ffn_in) ? ws_last_ffn_in : cur;
+                ggml_tensor * ws_sh = nullptr;
+                ggml_tensor * cols = build_ws_guess(il, mstream->pred_shared ? cur : nullptr, cin, ws_leads,
+                        effective_moe_gating_func(arch, hparams.expert_gating_func), n_expert,
+                        mstream->gg_on ? &ws_sh : nullptr);
+                if (cols && ws_auto_st.s2g) {
+                    cols = ggml_cont(ctx0, cols);
+                    if (ws_sh) {
+                        cols->src[1] = ws_sh;
+                        moe_pin(ws_sh, mstream->ne_guess_dev(il));
+                    }
+                    mstream->ws_mark_node(il, cols);
+                    moe_pin(cols, mstream->ne_guess_dev(il));
+                    ggml_build_forward_expand(gf, cols);
+                } else if (cols) {
+                    if (ws_sh && mstream->gg_shares_tensor()) {
+                        ggml_tensor * sh_dst = ggml_view_2d(ctx0, mstream->gg_shares_tensor(),
+                                ws_sh->ne[0], ws_sh->ne[1], ws_sh->ne[0]*sizeof(float),
+                                mstream->gg_shares_offset(il)*sizeof(float));
+                        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ws_sh, sh_dst));
+                    }
+                    ws_auto_st.cols = ws_auto_st.cols ? ggml_concat(ctx0, ws_auto_st.cols, cols, 1) : cols;
+                }
+                if (il == mstream->ws_S0 - 1 && ws_auto_st.cols) {
+                    ggml_tensor * op = ggml_map_custom1(ctx0, ws_auto_st.cols, llama_moe_stream_wordstart, 1, mstream);
+                    ggml_format_name(op, "moe_wordstart");
+                    ggml_build_forward_expand(gf, op);
+                }
+            }
+        }
+    }
+}
+
+ggml_tensor * llm_graph_context::build_gg_shares(
+        ggml_tensor * probs_2d,
+        ggml_tensor * ids_2d,
+        llama_expert_gating_func_type gating_op) const {
+    if (!probs_2d || !ids_2d) {
+        return nullptr;
+    }
+    const int64_t width  = ids_2d->ne[0];
+    const int64_t n_cols = ids_2d->ne[1];
+    ggml_tensor * p3 = ggml_reshape_3d(ctx0, probs_2d, 1, probs_2d->ne[0], n_cols);
+    ggml_tensor * w2 = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, p3, ids_2d), width, n_cols);
+    if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
+        return ggml_cont(ctx0, ggml_soft_max(ctx0, w2));
+    }
+    ggml_tensor * sm = ggml_clamp(ctx0, ggml_sum_rows(ctx0, w2), 1e-12f, INFINITY);
+    return ggml_cont(ctx0, ggml_div(ctx0, w2, sm));
 }
 
 ggml_backend_t llm_graph_context::moe_backend_of(ggml_backend_dev_t dev) const {
@@ -2395,7 +2503,7 @@ llm_graph_moe_guess llm_graph_context::moe_guess_routers(const llama_model & mod
     if (!mstream) {
         return g;
     }
-    const auto moe_at = [&](int j) { return j < (int) model.layers.size() && (uint32_t) j >= hparams.n_layer_dense_lead; };
+    const auto moe_at = [&](int j) { return j >= 0 && j < (int) model.layers.size() && model.layers[j].ffn_gate_inp != nullptr; };
     // the router of the next MoE layer, for the layer-ahead expert prefetch
     if (moe_at(il + 1)) {
         g.gate_inp_next = model.layers[il + 1].ffn_gate_inp;
@@ -2451,13 +2559,15 @@ void llm_graph_context::moe_guess_finish_in(const llama_model & model, int il, g
         g.rec.base = g.pred_base;
         const int d_max = std::max(4, (int) mstream->lookahead);
         for (int d = 1; d <= d_max && d <= llm_graph_rec_leads::MAX_D; d++) {
-            if (il + d < (int) model.layers.size() && (uint32_t) (il + d) >= hparams.n_layer_dense_lead) {
+            if (il + d < (int) model.layers.size() && model.layers[il + d].ffn_gate_inp != nullptr) {
                 g.rec.gate   [d] = model.layers[il + d].ffn_gate_inp;
+                g.rec.gate_b [d] = model.layers[il + d].ffn_gate_inp_b;
                 g.rec.norm   [d] = model.layers[il + d].ffn_norm;
                 g.rec.probs_b[d] = model.layers[il + d].ffn_exp_probs_b;
                 if (mstream->corr_gate(il + d, d)) {   // the corrected matrix (gain folded in) and the ones
-                    g.rec.gate[d] = mstream->corr_gate(il + d, d);
-                    g.rec.norm[d] = mstream->corr_unit(il + d, d);
+                    g.rec.gate  [d] = mstream->corr_gate(il + d, d);
+                    g.rec.gate_b[d] = nullptr;
+                    g.rec.norm  [d] = mstream->corr_unit(il + d, d);
                 }
                 // The model's own guess input for this target, only where a one-token graph reads it (the far guesses up to
                 // --moe-stream-lookahead, the recorder's leads): each is a few ops, and unused ones would only fill the graph's context
@@ -2478,6 +2588,7 @@ void llm_graph_context::moe_guess_finish_in(const llama_model & model, int il, g
 // layers) build their guesses for the streamed layers 1..N ahead (build_ws_guess); one CPU op after the last of them hands them all
 // to the waiting list (llama_moe_stream_wordstart). With D 0 the graph is unchanged
 llm_graph_moe_ws llm_graph_context::moe_ws_begin() const {
+    ws_bespoke = true;
     llm_graph_moe_ws st;
     st.graph = mstream && mstream->ws_on() && mstream->prefetch_on() && n_tokens == 1;
     // With the GPU producer on every source, each source's guess is marked (the GPU writes it into the source's slot) and
@@ -2491,34 +2602,48 @@ void llm_graph_context::moe_ws_layer(const llama_model & model, int il, ggml_ten
     if (!st.graph || !mstream->ws_src(il)) {
         return;
     }
-    if ((uint32_t) il < hparams.n_layer_dense_lead) {
+    if ((uint32_t) il < hparams.n_layer_dense_lead || model.layers[il].ffn_gate_inp == nullptr) {
         ws_base = out;   // a dense layer's base: the residual + its FFN output, the layer's output
     }
     llm_graph_rec_leads ws_leads;
     for (int d = 1; d <= (int) mstream->lookahead && d <= llm_graph_rec_leads::MAX_D; d++) {
-        if (il + d < (int) model.layers.size() && (uint32_t) (il + d) >= hparams.n_layer_dense_lead) {
+        if (il + d < (int) model.layers.size() && model.layers[il + d].ffn_gate_inp != nullptr) {
             ws_leads.gate   [d] = model.layers[il + d].ffn_gate_inp;
+            ws_leads.gate_b [d] = model.layers[il + d].ffn_gate_inp_b;
             ws_leads.norm   [d] = model.layers[il + d].ffn_norm;
             ws_leads.probs_b[d] = model.layers[il + d].ffn_exp_probs_b;
             if (mstream->corr_gate(il + d, d)) {   // a word-start source is in the correction file only if the trained pair has that source layer
-                ws_leads.gate[d] = mstream->corr_gate(il + d, d);
-                ws_leads.norm[d] = mstream->corr_unit(il + d, d);
+                ws_leads.gate  [d] = mstream->corr_gate(il + d, d);
+                ws_leads.gate_b[d] = nullptr;
+                ws_leads.norm  [d] = mstream->corr_unit(il + d, d);
             }
             if (guess_in && mstream->pred_shared && ws_base) {   // the model's own guess input (from its base)
                 ws_leads.in[d] = guess_in(il + d);
             }
         }
     }
+    ggml_tensor * ws_sh = nullptr;
     ggml_tensor * cols = build_ws_guess(il, mstream->pred_shared ? ws_base : nullptr, ffn_in_n, ws_leads,
-            (llama_expert_gating_func_type) hparams.expert_gating_func, n_expert);
+            effective_moe_gating_func(model.arch, hparams.expert_gating_func), n_expert,
+            mstream->gg_on ? &ws_sh : nullptr);
     if (cols && st.s2g) {   // the mark, in this source's launch
-        if (cols->view_src != nullptr || !ggml_is_contiguous(cols)) {
+        if (cols->view_src != nullptr || !ggml_is_contiguous(cols) || ws_sh != nullptr) {
             cols = ggml_cont(ctx0, cols);
+        }
+        if (ws_sh) {
+            cols->src[1] = ws_sh;
+            moe_pin(ws_sh, mstream->ne_guess_dev(il));
         }
         mstream->ws_mark_node(il, cols);
         moe_pin(cols, mstream->ne_guess_dev(il));   // (the GPU of its targets' routers: its event is there)
         ggml_build_forward_expand(gf, cols);
     } else if (cols) {
+        if (ws_sh && mstream->gg_shares_tensor()) {
+            ggml_tensor * sh_dst = ggml_view_2d(ctx0, mstream->gg_shares_tensor(),
+                    ws_sh->ne[0], ws_sh->ne[1], ws_sh->ne[0]*sizeof(float),
+                    mstream->gg_shares_offset(il)*sizeof(float));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ws_sh, sh_dst));
+        }
         st.cols = st.cols ? ggml_concat(ctx0, st.cols, cols, 1) : cols;
     }
     if (il == mstream->ws_S0 - 1 && st.cols) {   // the last source: the one CPU op of the word
@@ -2534,7 +2659,8 @@ ggml_tensor * llm_graph_context::build_ws_guess(
              ggml_tensor * cur_in,
              const llm_graph_rec_leads & rec,
             llama_expert_gating_func_type gating_op,
-                 int64_t   n_expert) const {
+                 int64_t   n_expert,
+             ggml_tensor ** out_shares) const {
     int32_t ds[llama_moe_stream::LOOKAHEAD_MAX];
     const int32_t n_t = mstream->la_targets(il, ds);
     if (n_t == 0) {
@@ -2542,27 +2668,33 @@ ggml_tensor * llm_graph_context::build_ws_guess(
     }
     const uint32_t width = mstream->guess_width(1);
     for (int32_t t = 0; t < n_t; t++) {
-        GGML_ASSERT(ds[t] <= llm_graph_rec_leads::MAX_D && rec.gate[ds[t]] != nullptr);
-        GGML_ASSERT(!mstream->pred_shared || rec.in[ds[t]] != nullptr || (base != nullptr && rec.norm[ds[t]] != nullptr));
+        if (ds[t] > llm_graph_rec_leads::MAX_D || rec.gate[ds[t]] == nullptr) {
+            return nullptr;
+        }
     }
     ggml_tensor * lg_d[llm_graph_rec_leads::MAX_D + 1] = { nullptr };   // the logits per distance (the recorder's leads)
 
     // the separate ops (build_far's), without the combined step or for its bit check
-    const bool comb_on = mstream->la_comb && mstream->ws_comb(il) && n_t >= 2;
+    const bool comb_on = mstream->la_comb && mstream->ws_comb(il) && n_t >= 2 &&
+                         (!mstream->pred_shared || (base != nullptr && mstream->ws_gain(il) != nullptr));
     const bool sep_on  = !comb_on || mstream->la_gchk != 0;
     ggml_tensor * sep_lg[llm_graph_rec_leads::MAX_D + 1] = { nullptr };
     ggml_tensor * sep_pr[llm_graph_rec_leads::MAX_D + 1] = { nullptr };
     ggml_tensor * sep_id[llm_graph_rec_leads::MAX_D + 1] = { nullptr };
-    ggml_tensor * cols = nullptr;
+    ggml_tensor * cols   = nullptr;
+    ggml_tensor * shares = nullptr;
     if (sep_on) {
         for (int32_t t = 0; t < n_t; t++) {
             const int d = ds[t];
             const int X = il + d;
             ggml_tensor * rin = cur_in;
             if (mstream->pred_shared) {
-                rin = rec.in[d] ? rec.in[d] : build_norm(base, rec.norm[d], nullptr, LLM_NORM_RMS, X);
+                rin = rec.in[d] ? rec.in[d] : (base && rec.norm[d] ? build_norm(base, rec.norm[d], nullptr, LLM_NORM_RMS, X) : cur_in);
             }
             ggml_tensor * lg = build_lora_mm(rec.gate[d], rin);   // [n_expert, 1]
+            if (rec.gate_b[d]) {
+                lg = ggml_add(ctx0, lg, rec.gate_b[d]);
+            }
             if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
                 ggml_prec_set_acc(lg, GGML_PREC_F32);
             }
@@ -2577,6 +2709,13 @@ ggml_tensor * llm_graph_context::build_ws_guess(
             sep_id[d] = f_top;
             lg_d[d]   = lg;
             cols = cols ? ggml_concat(ctx0, cols, f_top, 1) : f_top;
+            if (out_shares && !comb_on) {
+                ggml_tensor * f_sh = build_gg_shares(f_probs, f_top, gating_op);
+                shares = shares ? ggml_concat(ctx0, shares, f_sh, 1) : f_sh;
+            }
+        }
+        if (shares && !ggml_is_contiguous(shares)) {
+            shares = ggml_cont(ctx0, shares);
         }
     }
 
@@ -2628,6 +2767,13 @@ ggml_tensor * llm_graph_context::build_ws_guess(
             }
         }
         cols = comb_id;
+        if (out_shares) {
+            shares = build_gg_shares(comb_pr, comb_id, gating_op);
+        }
+    }
+
+    if (out_shares) {
+        *out_shares = shares;
     }
 
     // --moe-stream-record: the logits of each guess into the source's lead slot (lead d = the router of il + d)
@@ -3303,9 +3449,73 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (mstream) {
         if (auto * msl = mstream->layer(il)) {
+            llm_graph_rec_leads auto_rec;
+            ggml_tensor * gate_inp_next_b = nullptr;
+            if (msl->pred_il >= 0 && (size_t) msl->pred_il < mstream->rt_layers.size()) {
+                const int32_t pil = msl->pred_il;
+                const auto &  rl  = mstream->rt_layers[(size_t) pil];
+                const bool    c1  = mstream->corr_gate(pil, pil - il) != nullptr;
+                gate_inp_next_b = c1 ? nullptr : rl.gate_inp_b;
+                if (gate_inp_next == nullptr && rl.gate_inp && rl.gate_inp->ne[0] == n_embd &&
+                        rl.gate_inp->ne[1] == n_expert && rl.gate_inp_s == nullptr) {
+                    gate_inp_next    = c1 ? mstream->corr_gate(pil, pil - il) : rl.gate_inp;
+                    exp_probs_b_next = rl.exp_probs_b;
+                }
+            }
+            if (gate_inp_next && (gate_inp_next->ne[0] != n_embd || gate_inp_next->ne[1] != n_expert ||
+                    (msl->pred_il >= 0 && (size_t) msl->pred_il < mstream->rt_layers.size() &&
+                     mstream->rt_layers[(size_t) msl->pred_il].gate_inp_s != nullptr))) {
+                gate_inp_next = nullptr;
+            }
+            if (gate_inp_next2 == nullptr && msl->pred_il2 >= 0 && (size_t) msl->pred_il2 < mstream->rt_layers.size()) {
+                const auto & rl2 = mstream->rt_layers[(size_t) msl->pred_il2];
+                if (rl2.gate_inp && rl2.gate_inp->ne[0] == n_embd && rl2.gate_inp->ne[1] == n_expert && rl2.gate_inp_s == nullptr) {
+                    gate_inp_next2    = rl2.gate_inp;
+                    exp_probs_b_next2 = rl2.exp_probs_b;
+                }
+            }
+            if (gate_inp_next3 == nullptr && msl->pred_il3 >= 0 && (size_t) msl->pred_il3 < mstream->rt_layers.size()) {
+                const auto & rl3 = mstream->rt_layers[(size_t) msl->pred_il3];
+                if (rl3.gate_inp && rl3.gate_inp->ne[0] == n_embd && rl3.gate_inp->ne[1] == n_expert && rl3.gate_inp_s == nullptr) {
+                    gate_inp_next3    = rl3.gate_inp;
+                    exp_probs_b_next3 = rl3.exp_probs_b;
+                }
+            }
+            if (rec == nullptr && (mstream->lookahead > 1 || mstream->rec_on())) {
+                int32_t ds_tmp[llama_moe_stream::LOOKAHEAD_MAX];
+                const int32_t nt_tmp = mstream->la_targets(il, ds_tmp);
+                for (int32_t t = 0; t < nt_tmp; t++) {
+                    const int d = ds_tmp[t];
+                    const int X = il + d;
+                    if (d >= 1 && d <= llm_graph_rec_leads::MAX_D && X >= 0 && (size_t) X < mstream->rt_layers.size()) {
+                        const auto & rl = mstream->rt_layers[(size_t) X];
+                        if (rl.gate_inp && rl.gate_inp->ne[0] == n_embd && rl.gate_inp->ne[1] == n_expert && rl.gate_inp_s == nullptr) {
+                            const bool cx = mstream->corr_gate(X, d) != nullptr;
+                            auto_rec.gate   [d] = cx ? mstream->corr_gate(X, d) : rl.gate_inp;
+                            auto_rec.gate_b [d] = cx ? nullptr : rl.gate_inp_b;
+                            auto_rec.norm   [d] = mstream->corr_unit(X, d) ? mstream->corr_unit(X, d) : rl.ffn_norm;
+                            auto_rec.probs_b[d] = rl.exp_probs_b;
+                        }
+                    }
+                }
+                for (int d = 1; d <= llama_moe_stream::REC_LEADS && d <= llm_graph_rec_leads::MAX_D; d++) {
+                    const int X = il + d;
+                    if (auto_rec.gate[d] == nullptr && X >= 0 && (size_t) X < mstream->rt_layers.size()) {
+                        const auto & rl = mstream->rt_layers[(size_t) X];
+                        if (rl.gate_inp && rl.gate_inp->ne[0] == n_embd && rl.gate_inp->ne[1] == n_expert && rl.gate_inp_s == nullptr) {
+                            auto_rec.gate   [d] = rl.gate_inp;
+                            auto_rec.gate_b [d] = rl.gate_inp_b;
+                            auto_rec.norm   [d] = rl.ffn_norm;
+                            auto_rec.probs_b[d] = rl.exp_probs_b;
+                        }
+                    }
+                }
+                rec = &auto_rec;
+            }
             // layer-ahead prefetch: the router of the next MoE layer on this layer's router input,
             // so that the experts it picks can be read while this layer computes
             ggml_tensor * pred    = nullptr;
+            ggml_tensor * pred_sh = nullptr;   // normalized top-k router shares [width, cols] for --moe-stream-guess-gate 1
             ggml_tensor * pred_tr = nullptr;   // the guessed top-8 of layer pred_il, for the counter
             ggml_tensor * pred_p  = nullptr;   // the sigmoid scores of the guess's top 16 (decode, chance table)
             ggml_tensor * pred_lg = nullptr;   // the router logits that guess is made from
@@ -3339,27 +3549,30 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * sep_lg[llm_graph_rec_leads::MAX_D + 1] = { nullptr };
             ggml_tensor * sep_pr[llm_graph_rec_leads::MAX_D + 1] = { nullptr };
             ggml_tensor * sep_id[llm_graph_rec_leads::MAX_D + 1] = { nullptr };
-            auto build_far = [&](ggml_tensor * cols, uint32_t width) {
+            const bool need_gg_sh = mstream->gg_on && n_tokens == 1 && !mstream->chance_on() && mstream->prefetch_lead < 2;
+            const int  d0_1ahead  = msl->pred_il > il ? (msl->pred_il - il) : 0;
+            auto build_far = [&](ggml_tensor * cols, ggml_tensor *& sh_cols, uint32_t width) {
                 for (int32_t t = 0; t < la_nt; t++) {
                     const int d = la_ds[t];
-                    if (d < 2) {
+                    if (d < 2 || d <= d0_1ahead) {
                         continue;   // the 1-ahead guess is built by its own block
                     }
                     const int X = il + d;
-                    if (rec->gate[d] == nullptr) {
+                    if (d > llm_graph_rec_leads::MAX_D || rec->gate[d] == nullptr) {
                         break;
                     }
                     ggml_tensor * rin = cur;
                     if (mstream->pred_shared) {
                         if (rec->in[d]) {   // the model's own guess input
                             rin = rec->in[d];
-                        } else if (!rec->base || !rec->norm[d]) {
-                            break;
-                        } else {
+                        } else if (rec->base && rec->norm[d]) {
                             rin = build_norm(rec->base, rec->norm[d], nullptr, LLM_NORM_RMS, X);
                         }
                     }
                     ggml_tensor * lg = build_lora_mm(rec->gate[d], rin);   // [n_expert, 1]
+                    if (rec->gate_b[d]) {
+                        lg = ggml_add(ctx0, lg, rec->gate_b[d]);
+                    }
                     if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
                         ggml_prec_set_acc(lg, GGML_PREC_F32);
                     }
@@ -3375,6 +3588,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     sep_id[d] = f_top;
                     // [width, columns]; a graph whose next layer is not streamed starts with its first far column
                     cols = cols ? ggml_concat(ctx0, cols, f_top, 1) : f_top;
+                    if (need_gg_sh) {
+                        ggml_tensor * f_sh = build_gg_shares(f_probs, f_top, gating_op);
+                        sh_cols = sh_cols ? ggml_concat(ctx0, sh_cols, f_sh, 1) : f_sh;
+                    }
                 }
                 return cols;
             };
@@ -3391,7 +3608,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // router input for every row, as the separate guesses'. Only the plain decode guess (not with the chance table or a
             // two-layer lead), a layer with 2+ targets whose stacks were built (llama_model::load_tensors)
             const bool comb_on = far_on && mstream->la_comb && msl->la_comb_ok && la_nt >= 2 && !mstream->chance_on() &&
-                                 mstream->prefetch_lead < 2;
+                                 mstream->prefetch_lead < 2 &&
+                                 (!mstream->pred_shared || (rec->base != nullptr && msl->la_gain_stack != nullptr));
             const bool sep_on  = !comb_on || mstream->la_gchk != 0;   // the separate ops: without the step, or for the bit check
             ggml_tensor * comb_lg = nullptr;   // [n_expert, la_nt]
             ggml_tensor * comb_pr = nullptr;
@@ -3517,15 +3735,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 // that ratio as 1.04 +- 0.04 on average, i.e. that part is worth almost nothing here).
                 ggml_tensor * pred_cur = pred_in ? pred_in : cur;
                 ggml_tensor * pred_probs = nullptr;
+                const int d1_eff = msl->pred_il > il ? std::min<int>(msl->pred_il - il, llm_graph_rec_leads::MAX_D) : 1;
                 if (sep_on) {
-                    pred_probs = build_moe_probs(pred_cur, gate_inp_next, /* gate_inp_b = */ nullptr,
+                    pred_probs = build_moe_probs(pred_cur, gate_inp_next, gate_inp_next_b,
                             /* logits_in = */ nullptr, gating_op, msl->pred_il, &pred_logits,
                             /* name_tag = */ "pred");
-                    sep_lg[1] = pred_logits;
-                    sep_pr[1] = pred_probs;
+                    sep_lg[d1_eff] = pred_logits;
+                    sep_pr[d1_eff] = pred_probs;
                 }
-                if (comb_on) {   // row 0 of the combined step is this guess (la_targets starts with distance 1 here)
-                    GGML_ASSERT(la_ds[0] == 1);
+                if (comb_on) {   // row 0 of the combined step is this guess (la_targets starts with distance d1_eff here)
+                    GGML_ASSERT(la_ds[0] == d1_eff);
                     pred_logits = ggml_view_2d(ctx0, comb_lg, n_expert, 1, comb_lg->nb[1], 0);
                     pred_probs  = ggml_view_2d(ctx0, comb_pr, n_expert, 1, comb_pr->nb[1], 0);
                 }
@@ -3542,9 +3761,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                         : mstream->prefetch_lead >= 2 && mstream->prefetch_m2 > 0
                         ? mstream->prefetch_m2 : mstream->guess_width(n_tokens);
                 if (sep_on) {
-                    pred = ggml_cont(ctx0, build_moe_topk(sep_pr[1], sep_lg[1], exp_probs_b_next,
+                    pred = ggml_cont(ctx0, build_moe_topk(sep_pr[d1_eff], sep_lg[d1_eff], exp_probs_b_next,
                                 n_expert, width, msl->pred_il, /* name_tag = */ "pred"));
-                    sep_id[1] = pred;
+                    sep_id[d1_eff] = pred;
+                    if (need_gg_sh && !comb_on) {
+                        pred_sh = build_gg_shares(sep_pr[d1_eff], pred, gating_op);
+                    }
                     if (chance16) {
                         pred_p = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, pred_probs, 1, n_expert, n_tokens), pred);   // [1, 16, 1]
                     }
@@ -3552,7 +3774,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     // --moe-stream-lookahead N (a graph of one token): the far guesses for the layers il+2 .. il+N
                     // (build_far, above)
                     if (far_on) {
-                        pred = build_far(pred, width);
+                        ggml_tensor * sh_acc = !comb_on ? pred_sh : nullptr;
+                        pred = build_far(pred, sh_acc, width);
+                        if (!comb_on) {
+                            pred_sh = sh_acc;
+                        }
                     }
                 }
                 if (comb_on) {   // the combined step's ids are the guess input (and the recorder's leads its rows)
@@ -3563,20 +3789,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                         far_lg[la_ds[t]] = ggml_view_2d(ctx0, comb_lg, n_expert, 1, comb_lg->nb[1], (size_t) t*comb_lg->nb[1]);
                     }
                     pred = comb_id;
-                }
-                // The GPU producer of --moe-stream-needed-early - in a one-token graph, the guess of a
-                // layer that posts to the helper is marked: the GPU backend writes it into the layer's pinned slot, then the call
-                // counter, then records the layer's "guess done" event, right after this node (the remap op's input is unchanged)
-                // (only in the graph of a one-token decode call with the GPU producer; graph reuse keys on it, llama-context)
-                // (on the FINAL guess tensor - the 1-ahead top-k, plus the far columns or the combined step's ids -
-                // of N columns x the slot's width; only a layer whose targets' routers are all on the producer's GPU)
-                if (mstream->ne_gpu_graph() && n_tokens == 1 && msl->ne_post_on && msl->ne_gpu_ok && !chance16 &&
-                        !(mstream->prefetch_lead >= 2) &&
-                        (int64_t) mstream->ne_width*mstream->la_cols_of(il) == ggml_nelements(pred) &&
-                        pred->type == GGML_TYPE_I32 && ggml_is_contiguous(pred)) {   // what the producer copies
-                    pred->flags |= (int32_t) LLAMA_MOE_STREAM_TENSOR_GUESS_MARK;
-                    pred->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = il;
-                    moe_pin(pred, mstream->ne_guess_dev(il));   // its event's GPU (with several GPUs the scheduler could move it)
+                    if (need_gg_sh) {
+                        pred_sh = build_gg_shares(comb_pr, comb_id, gating_op);
+                    }
                 }
 
                 // Measurement only (MOE_STREAM_LEAD2_COST=1): the 2-ahead guess that 2-ahead reads would need - the
@@ -3658,7 +3873,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 }
             } else if (far_only) {
                 if (sep_on) {
-                    pred = build_far(nullptr, mstream->guess_width(n_tokens));   // the far guesses alone
+                    ggml_tensor * sh_acc = nullptr;
+                    pred = build_far(nullptr, sh_acc, mstream->guess_width(n_tokens));   // the far guesses alone
+                    if (!comb_on) {
+                        pred_sh = sh_acc;
+                    }
                 }
                 if (comb_on) {   // the combined step (its rows are the far targets only here)
                     if (mstream->la_gchk != 0) {
@@ -3668,6 +3887,33 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                         far_lg[la_ds[t]] = ggml_view_2d(ctx0, comb_lg, n_expert, 1, comb_lg->nb[1], (size_t) t*comb_lg->nb[1]);
                     }
                     pred = comb_id;
+                    if (need_gg_sh) {
+                        pred_sh = build_gg_shares(comb_pr, comb_id, gating_op);
+                    }
+                }
+            }
+            if (pred && n_tokens == 1 && !(mstream->chance_on() && n_tokens == 1) && !(mstream->prefetch_lead >= 2)) {
+                if (pred_sh && !ggml_is_contiguous(pred_sh)) {
+                    pred_sh = ggml_cont(ctx0, pred_sh);
+                }
+                const bool can_mark = mstream->ne_gpu_graph() && msl->ne_post_on && msl->ne_gpu_ok &&
+                        (int64_t) mstream->ne_width*mstream->la_cols_of(il) == ggml_nelements(pred) &&
+                        pred->type == GGML_TYPE_I32 && ggml_is_contiguous(pred);
+                if (can_mark) {
+                    if (pred_sh) {
+                        // Always wrap in a fresh CONT node *after* pred_sh so pred_sh (which reads pred) never forms a cycle.
+                        pred = ggml_cont(ctx0, pred);
+                        pred->src[1] = pred_sh;
+                        moe_pin(pred_sh, mstream->ne_guess_dev(il));
+                    }
+                    pred->flags |= (int32_t) LLAMA_MOE_STREAM_TENSOR_GUESS_MARK;
+                    pred->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = il;
+                    moe_pin(pred, mstream->ne_guess_dev(il));   // its event's GPU (with several GPUs the scheduler could move it)
+                } else if (pred_sh && mstream->gg_shares_tensor()) {
+                    ggml_tensor * sh_dst = ggml_view_2d(ctx0, mstream->gg_shares_tensor(),
+                            pred_sh->ne[0], pred_sh->ne[1], pred_sh->ne[0]*sizeof(float),
+                            mstream->gg_shares_offset(il)*sizeof(float));
+                    rec_copies.emplace_back(pred_sh, sh_dst);
                 }
             }
 
@@ -3843,29 +4089,30 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const bool vx_ok = !weight_before_ffn && !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps &&
                                        gate_exps && up_exps && type_op == LLM_FFN_SILU && !up_exps_s && !gate_exps_s &&
                                        !down_exps_s && !gate_up_exps_b;
-                    if (!vx_ok) {
-                        GGML_ABORT("--moe-stream-vram-parallel: layer %d's MoE has no device pass (see --moe-stream-vram-experts)", il);
+                    if (vx_ok) {
+                        size_t        off = 0;
+                        ggml_tensor * tab = mstream->vp_table_of(il, off);
+                        tab = ggml_view_2d(ctx0, tab, tab->ne[0], tab->ne[1], tab->nb[1], off);    // this layer's [k, n_expert]
+                        ggml_tensor * rows = ggml_get_rows(ctx0, tab, ids_cont);                    // [k, k]: row j = table[ids[j]]
+                        GGML_ASSERT(rows->ne[0] >= rows->ne[1] && "vram-parallel: the id table is narrower than the layer's k");
+                        cb(rows, "ffn_moe_vp_rows", il);
+                        ggml_tensor * diag = ggml_view_2d(ctx0, rows, 1, rows->ne[1], (rows->ne[0] + 1)*ggml_element_size(rows), 0);
+                        diag = ggml_cont(ctx0, diag);
+                        if (mstream->ne_router_dev(il) != mstream->pool_dev) {   // several GPUs: the pass on the pool's GPU, the ids copied there
+                            moe_pin(rows, mstream->pool_dev);
+                            moe_pin(diag, mstream->pool_dev);
+                        }
+                        diag = ggml_reshape_2d(ctx0, diag, rows->ne[1], 1);       // [k, 1]: pair j's device id
+                        cb(diag, "ffn_moe_topk_vram", il);
+                        vram_out_early = build_vram_chain(diag, nullptr, nullptr, true);   // (absolute places)
+                        ggml_build_forward_expand(gf, vram_out_early);
                     }
-                    size_t        off = 0;
-                    ggml_tensor * tab = mstream->vp_table_of(il, off);
-                    tab = ggml_view_2d(ctx0, tab, tab->ne[0], tab->ne[1], tab->nb[1], off);    // this layer's [k, n_expert]
-                    ggml_tensor * rows = ggml_get_rows(ctx0, tab, ids_cont);                    // [k, k]: row j = table[ids[j]]
-                    GGML_ASSERT(rows->ne[0] >= rows->ne[1] && "vram-parallel: the id table is narrower than the layer's k");
-                    cb(rows, "ffn_moe_vp_rows", il);
-                    ggml_tensor * diag = ggml_view_2d(ctx0, rows, 1, rows->ne[1], (rows->ne[0] + 1)*ggml_element_size(rows), 0);
-                    diag = ggml_cont(ctx0, diag);
-                    if (mstream->ne_router_dev(il) != mstream->pool_dev) {   // several GPUs: the pass on the pool's GPU, the ids copied there
-                        moe_pin(rows, mstream->pool_dev);
-                        moe_pin(diag, mstream->pool_dev);
-                    }
-                    diag = ggml_reshape_2d(ctx0, diag, rows->ne[1], 1);       // [k, 1]: pair j's device id
-                    cb(diag, "ffn_moe_topk_vram", il);
-                    vram_out_early = build_vram_chain(diag, nullptr, nullptr, true);   // (absolute places)
-                    ggml_build_forward_expand(gf, vram_out_early);
                 }
                 run_moe_window();   // the builder's window nodes, last
             } else if (lm_phase != 2 && mstream->ps_wants(n_tokens) && mstream->vp_in_launch(il) && !pred_p && mstream->vram_serves(il) &&
                     (pred == nullptr || !(pred->flags & (int32_t) LLAMA_MOE_STREAM_TENSOR_GUESS_MARK)) &&
+                    !weight_before_ffn && !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps &&
+                    gate_exps && up_exps && type_op == LLM_FFN_SILU && !up_exps_s && !gate_exps_s && !down_exps_s && !gate_up_exps_b &&
                     mstream->ps_fits(il, ids_cont, cur_in, pred, weights)) {
                 // --moe-stream-prompt-split 1: a CPU-wave prompt ubatch - the router mark hands the CPU split
                 // the router's ids, its input and the guess through the shared slot (the scheduler's input hook), so the CPU split starts
@@ -3879,12 +4126,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 moe_pin(ids_cont, mstream->ne_router_dev(il));   // its guess source may come from the next layer's GPU: copied here, not moved there
                 ggml_build_forward_expand(gf, ids_cont);
                 weights_expanded = true;   // (a source of the mark: computed before it)
-                const bool vx_ok = !weight_before_ffn && !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps &&
-                                   gate_exps && up_exps && type_op == LLM_FFN_SILU && !up_exps_s && !gate_exps_s &&
-                                   !down_exps_s && !gate_up_exps_b;
-                if (!vx_ok) {
-                    GGML_ABORT("--moe-stream-prompt-split: layer %d's MoE has no device pass (see --moe-stream-vram-experts)", il);
-                }
                 size_t        off = 0;
                 ggml_tensor * tab = mstream->vp_table_of(il, off);
                 tab = ggml_view_2d(ctx0, tab, tab->ne[0], tab->ne[1], tab->nb[1], off);    // this layer's [k, n_expert]
@@ -4050,20 +4291,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 if (w == 0 && mstream->vram_serves(il) && vram_out_early == nullptr) {
                     const bool vx_ok = can_wave && !gate_up_exps && gate_exps && up_exps && type_op == LLM_FFN_SILU &&
                                        !up_exps_s && !gate_exps_s && !down_exps_s && !gate_up_exps_b;
-                    if (!vx_ok) {
-                        GGML_ABORT("--moe-stream-vram-experts: layer %d's MoE (merged gate_up %d, gate %d, op %d, scales %d/%d/%d, "
-                                "biases or weights before the FFN %d) has no device pass; the VRAM expert pool supports a gated "
-                                "SiLU MoE with separate gate and up tensors and no per-expert scale or bias", il,
-                                gate_up_exps != nullptr, gate_exps != nullptr, (int) type_op, up_exps_s != nullptr,
-                                gate_exps_s != nullptr, down_exps_s != nullptr, (int) !can_wave);
-                    }
-                    ggml_build_forward_expand(gf, ids_gemm);
+                    if (vx_ok) {
+                        ggml_build_forward_expand(gf, ids_gemm);
 
-                    ggml_tensor * ids_vram = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap_vram, 1,
-                            mstream->wave_ctx_of(il, 0));
-                    cb(ids_vram, "ffn_moe_topk_vram", il);
-                    ggml_build_forward_expand(gf, ids_vram);
-                    vram_ids = ids_vram;
+                        ggml_tensor * ids_vram = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap_vram, 1,
+                                mstream->wave_ctx_of(il, 0));
+                        cb(ids_vram, "ffn_moe_topk_vram", il);
+                        ggml_build_forward_expand(gf, ids_vram);
+                        vram_ids = ids_vram;
+                    }
                 }
 
                 if (lm_phase == 2) {   // this wave's chunks, all before the next wave's remap op

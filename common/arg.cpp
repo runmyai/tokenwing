@@ -965,6 +965,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     }
     // Protect named keeps the experts the guesses (the waiting list's) named
     if (params.moe_stream_protect_named == 1 && !plan) { off("--moe-stream-protect-named 1", "--moe-stream-plan 1"); params.moe_stream_protect_named = 0; }
+    if (params.moe_stream_guess_gate == 1 && !plan) { off("--moe-stream-guess-gate 1", "--moe-stream-plan 1"); params.moe_stream_guess_gate = 0; }
     // The word-start guesses go on the waiting list, through the streamed layers' add code (drop stale)
     if (params.moe_stream_wordstart > 0 && (!plan || params.moe_stream_drop_stale != 1)) {
         off(string_format("--moe-stream-wordstart %d", params.moe_stream_wordstart).c_str(), "--moe-stream-plan 1 and --moe-stream-drop-stale 1");
@@ -4630,6 +4631,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 value = 0;
             }
             params.moe_stream_hip_sync = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-guess-gate"}, "0|1",
+        "with --moe-stream-plan 1: calibrate each guessed expert's hit probability online from normalized top-k router "
+        "shares and multi-distance votes, protect named residents only when d = 1 or p_hat >= 0.35, and gate each SSD "
+        "prefetch bind against the candidate victim slot's reuse probability plus live I/O queue congestion; bit-exact "
+        "output, zero offline sidecar required (default: 0 = off)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-guess-gate must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_guess_gate = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-ssd-latency-us"}, "US",
+        "with --moe-stream-guess-gate 1: single-read SSD latency in microseconds measured by autotuner (0 = derived "
+        "online from the reader threads' own pread times)",
+        [](common_params & params, int value) {
+            params.moe_stream_ssd_latency_us = std::max(0, value);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-ssd-gbps"}, "GBPS",
+        "with --moe-stream-guess-gate 1: SSD read bandwidth in GB/s measured by autotuner (0 = derived online)",
+        [](common_params & params, const std::string & value) {
+            const float v = (float) std::atof(value.c_str());
+            params.moe_stream_ssd_gbps = v > 0.0f ? v : 0.0f;
         }
     ));
     add_opt(common_arg(

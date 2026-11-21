@@ -603,6 +603,10 @@ extern "C" {
                                                 //      under ROCm/HIP, 0 = off
         int32_t      moe_stream_hip_sync;       // ROCm/HIP CPU-GPU handoff spin-poll before kernel wait (1 = auto 400 us, > 1 = spin window
                                                 //      in us, 0 = off)
+        int32_t      moe_stream_guess_gate;     // 1 = bind-time victim- & queue-priced guesser gate (online empirical-Bayes p_hat +
+                                                //      normalized top-k router share, needs --moe-stream-plan 1), 0 = off
+        int32_t      moe_stream_ssd_latency_us; // single-read SSD latency in microseconds for the guesser congestion model (0 = auto)
+        float        moe_stream_ssd_gbps;       // sequential/chunk SSD read bandwidth in GB/s for the guesser congestion model (0 = auto)
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
@@ -2139,6 +2143,9 @@ extern "C" {
             // With --moe-stream-timing 1: calls of this kind (prompt or decode), their wall time and where it went - host backend compute (it
             // includes the engine's wait for reads), device kernels (CUDA events), cross-backend copies, backend syncs (microseconds)
             int64_t n_tm_calls, t_tm_wall_us, t_tm_host_us, t_tm_dev_us, t_tm_copy_us, t_tm_sync_us;
+            // Unique guessed experts per decode word against real picks and pool residency when first named, plus --moe-stream-guess-gate skips
+            int64_t n_gg_mem_right, n_gg_mem_wrong, n_gg_ssd_right, n_gg_ssd_wrong;
+            int64_t n_gg_skip_floor, n_gg_skip_vic, n_gg_defer_q, n_gg_pn_skip;
         } pre, dec;
         int64_t n_wave_ubatches; // ubatches that did not fit into one wave per layer
         int64_t n_wave_experts;  // distinct experts those ubatches needed, summed over the layers

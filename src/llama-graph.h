@@ -1059,9 +1059,10 @@ struct llm_graph_qkv {
 // --moe-stream-lookahead N: the same tensors for distances up to 8 (the far guesses are built exactly like the
 // recorder's lead d), plus probs_b[d] = layer il + d's selection bias for their top-k.
 struct llm_graph_rec_leads {
-    static constexpr int MAX_D = 8;
+    static constexpr int MAX_D = 32;
     ggml_tensor * base    = nullptr;
     ggml_tensor * gate   [MAX_D + 1] = { nullptr };
+    ggml_tensor * gate_b [MAX_D + 1] = { nullptr };
     ggml_tensor * norm   [MAX_D + 1] = { nullptr };
     ggml_tensor * probs_b[MAX_D + 1] = { nullptr };
     // the guess input for layer il + d, built by the model (a model whose routers do not read "base normed with ffn_norm", e.g.
@@ -1182,6 +1183,18 @@ struct llm_graph_context {
     // filled by build_moe_ffn in lm_phase 2: each chunk's last copy into lm_moe (or lm_hid without it); a model builder with
     // lm_moe set continues from these nodes (shared expert + combine)
     mutable std::vector<ggml_tensor *> lm_moe_chunks;
+
+    // Auto word-start tracking for non-bespoke MoE architectures (skipped when moe_ws_begin() is called explicitly):
+    mutable bool             ws_bespoke     = false;
+    mutable llm_graph_moe_ws ws_auto_st;
+    mutable int32_t          ws_auto_next   = -1;
+    mutable ggml_tensor *    ws_last_ffn_in = nullptr;
+    mutable int32_t          ws_last_ffn_il = -1;
+
+    ggml_tensor * build_gg_shares(
+             ggml_tensor * probs_2d,
+             ggml_tensor * ids_2d,
+            llama_expert_gating_func_type gating_op) const;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
@@ -1330,7 +1343,8 @@ struct llm_graph_context {
              ggml_tensor * cur_in,
              const llm_graph_rec_leads & rec,
             llama_expert_gating_func_type gating_op,
-                 int64_t   n_expert) const;
+                 int64_t   n_expert,
+             ggml_tensor ** out_shares = nullptr) const;
 
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(

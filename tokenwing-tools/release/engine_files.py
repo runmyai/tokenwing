@@ -54,8 +54,9 @@ def main():
     folder, tag = sys.argv[1], sys.argv[2]
     upload = sys.argv[sys.argv.index("--upload") + 1] if "--upload" in sys.argv else None
     builds, blobs = {}, set()
-    # each distinct file once, named by its SHA-256, for the upload
+    # each distinct file the store does not have yet, once, named by its SHA-256, for the upload
     stash = tempfile.TemporaryDirectory(dir=folder) if upload else None
+    stored = stored_files(upload) if upload else set()
     for pkg in sorted(os.listdir(folder)):
         if not pkg.startswith("tokenwing-") or not pkg.endswith((".tar.gz", ".zip")):
             continue
@@ -66,7 +67,7 @@ def main():
                 files.append({"path": name, "link": data})
                 continue
             digest = sha256(data)
-            if stash and digest not in blobs:
+            if stash and digest not in blobs and digest not in stored:
                 with open(os.path.join(stash.name, digest), "wb") as f:
                     f.write(data)
             blobs.add(digest)
@@ -89,6 +90,12 @@ def main():
     if upload:
         with stash:
             upload_blobs(stash.name, upload, blobs, tag)
+
+
+def stored_files(repo):
+    from huggingface_hub import HfApi
+
+    return set(HfApi().list_repo_files(repo))
 
 
 def upload_blobs(stash, repo, blobs, tag):

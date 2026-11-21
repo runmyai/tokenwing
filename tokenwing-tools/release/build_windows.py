@@ -27,12 +27,13 @@ VC_CRT_DLLS = (
     "vcruntime140_1.dll",
 )
 ROCM_ARCH_DEFAULT = "gfx1030;gfx1100;gfx1101;gfx1102;gfx1151;gfx1150;gfx1200;gfx1201"
+# what the AMD library and the ROCm libraries it loads need from the ROCm SDK; none of them loads LLVM's OpenMP runtime
+# (libomp140): OpenMP comes only through ggml-base.dll of the main MSVC build, which uses vcomp140.dll (staged with the VC runtime)
 ROCM_RUNTIME_DLLS = (
     "amd_comgr.dll",
     "amdhip64_7.dll",
     "hipblas.dll",
     "libhipblaslt.dll",
-    "libomp140.x86_64.dll",
     "origami.dll",
     "rocblas.dll",
     "rocm_kpack.dll",

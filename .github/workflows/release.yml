@@ -183,7 +183,7 @@ jobs:
       - name: Build containerized Linux release archive
         if: matrix.image != ''
         env:
-          EXTRA_APT: ${{ matrix.backend == 'rocm' && 'rocblas-dev hipblas-dev' || '' }}
+          EXTRA_APT: ${{ matrix.backend == 'rocm' && 'rocblas-dev hipblas-dev patchelf binutils' || '' }}
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/src" \
@@ -383,6 +383,14 @@ jobs:
               names = zf.namelist()
           assert any(n.startswith("tokenwing/rocblas/library/") for n in names), "Missing rocblas/library in Windows HIP zip"
           assert any(n.startswith("tokenwing/hipblaslt/library/gfx1201/") for n in names), "Missing hipblaslt/library/gfx1201 in Windows HIP zip"
+          import tarfile
+          with tarfile.open("tokenwing-linux-x64-rocm.tar.gz") as tf:
+              names = set(tf.getnames())
+          for lib in ("libamdhip64.so.7", "libhsa-runtime64.so.1", "libamd_comgr.so.3", "libhipblas.so.3", "librocblas.so.5", "libhipblaslt.so.1", "librocsolver.so.0"):
+              assert "tokenwing/" + lib in names, f"Missing {lib} in Linux ROCm archive"
+          for gfx in ("gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201"):
+              assert any(n.startswith("tokenwing/rocblas/library/") and gfx in n for n in names), f"Missing rocblas/library {gfx} in Linux ROCm archive"
+              assert gfx == "gfx1030" or any(n.startswith("tokenwing/hipblaslt/library/") and gfx in n for n in names), f"Missing hipblaslt/library {gfx} in Linux ROCm archive"
           '
 
       - name: Engine file list, and the files Hugging Face does not have yet

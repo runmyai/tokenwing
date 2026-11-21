@@ -40,7 +40,9 @@ else
 fi
 trap '[ "$CLEAN_WORK" -eq 1 ] && rm -rf "$WORK_DIR"' EXIT
 
-ROCM_ARCH="${AMDGPU_TARGETS:-gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101;gfx1102;gfx1151;gfx1150;gfx1200;gfx1201}"
+# the desktop and laptop GPU types (as the Windows package): the ROCm runtime is bundled, and the datacenter types' rocBLAS /
+# hipBLASLt kernels alone would take the archive past GitHub's 2 GiB per release file
+ROCM_ARCH="${AMDGPU_TARGETS:-gfx1030;gfx1100;gfx1101;gfx1102;gfx1150;gfx1151;gfx1200;gfx1201}"
 
 CMAKE_ARGS=(
   -S "$REPO_DIR"
@@ -107,7 +109,61 @@ if [ "$BACKEND" = cuda ]; then
   CUDA_LIB="${CUDA_HOME:-/usr/local/cuda}/lib64"
   cp -a "$CUDA_LIB"/libcudart.so* "$CUDA_LIB"/libcublas.so* "$CUDA_LIB"/libcublasLt.so* "$STAGE/"
 fi
+if [ "$BACKEND" = rocm ]; then
+  # the ROCm runtime the AMD module needs, so a user needs only the kernel's amdgpu driver: every library ldd finds under the
+  # ROCm folder, plus comgr and the HSA runtime (HIP may open them by name), plus libnuma and libelf (not on every desktop)
+  ROCM_REAL="$(readlink -f "$HIP_PATH")"
+  ROCM_LIB="$ROCM_REAL/lib"
+  seeds=("$STAGE/libggml-hip.so")
+  rocm_libs=()
+  for n in libamd_comgr.so.3 libhsa-runtime64.so.1; do
+    [ -e "$ROCM_LIB/$n" ] || { echo "No $n in $ROCM_LIB" >&2; exit 1; }
+    seeds+=("$ROCM_LIB/$n")
+    rocm_libs+=("$n")
+    cp -L "$ROCM_LIB/$n" "$STAGE/$n"
+  done
+  while read -r soname path; do
+    case "$(readlink -f "$path")" in
+      "$ROCM_REAL"/*) cp -L "$path" "$STAGE/$soname"; rocm_libs+=("$soname") ;;
+      *) case "$soname" in libnuma.so.1|libelf.so.1) cp -L "$path" "$STAGE/$soname" ;; esac ;;
+    esac
+  done < <(ldd "${seeds[@]}" | awk '$2 == "=>" && $3 ~ /^\// {print $1, $3}' | sort -u)
+  # each ROCm library looks for the others next to itself: one whose search path has no plain $ORIGIN (librocroller has only
+  # $ORIGIN/../lib) would look in the system's ROCm
+  for n in $(printf '%s\n' "${rocm_libs[@]}" | sort -u); do
+    readelf -d "$STAGE/$n" | grep -E 'R(UN)?PATH' | grep -qE '\[(.*:)?\$ORIGIN(:.*)?\]' || patchelf --set-rpath '$ORIGIN' "$STAGE/$n"
+  done
+  # rocBLAS and hipBLASLt read their kernels from rocblas/library and hipblaslt/library next to their library: only the built
+  # GPU types (and the files of no GPU type) are taken
+  targets=" ${ROCM_ARCH//;/ } "
+  for sub in rocblas hipblaslt; do
+    mkdir -p "$STAGE/$sub/library"
+    for f in "$ROCM_LIB/$sub/library"/*; do
+      [ -f "$f" ] || continue
+      keep=1
+      for a in $(basename "$f" | grep -oE 'gfx[0-9a-z]+' | sort -u); do keep=0; [[ "$targets" == *" $a "* ]] && { keep=1; break; }; done
+      [ "$keep" = 1 ] && cp -L "$f" "$STAGE/$sub/library/"
+    done
+  done
+  for a in $targets; do
+    ls "$STAGE/rocblas/library/"*"$a"* >/dev/null 2>&1 || { echo "No rocBLAS kernels for $a" >&2; exit 1; }
+    case "$a" in gfx11*|gfx12*)
+      ls "$STAGE/hipblaslt/library/"*"$a"* >/dev/null 2>&1 || { echo "No hipBLASLt kernels for $a" >&2; exit 1; } ;;
+    esac
+  done
+  # every library of the package finds what it needs, and nothing in the system's ROCm
+  missing="$(ldd "$STAGE"/*.so* 2>&1 | grep 'not found' || true)"
+  [ -z "$missing" ] || { echo "Libraries not found:" >&2; echo "$missing" >&2; exit 1; }
+  for p in $(ldd "$STAGE"/*.so* | awk '$2 == "=>" && $3 ~ /^\// {print $3}' | sort -u); do
+    case "$(readlink -f "$p")" in "$ROCM_REAL"/*) echo "Taken from the system's ROCm, not the package: $p" >&2; exit 1 ;; esac
+  done
+  echo "=== ROCm runtime in the archive ==="
+  ls -l "$STAGE"/lib*.so* | grep -vE 'libggml|libllama|libmtmd'
+  du -sh "$STAGE/rocblas" "$STAGE/hipblaslt"
+fi
 chmod +x "$STAGE/llama-server" "$STAGE/autotuner"
+# the build folder is not needed any more: its room goes to the archive (the ROCm one is over 1 GB)
+[ "$CLEAN_WORK" -eq 1 ] && rm -rf "$WORK_DIR/build"
 ls "$STAGE"/libggml-cpu*.so >/dev/null || { echo "No CPU module in the archive" >&2; exit 1; }
 
 echo "=== Binary inspection ($VARIANT) ==="

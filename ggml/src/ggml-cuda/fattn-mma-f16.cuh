@@ -1928,13 +1928,18 @@ static __global__ void flash_attn_ext_f16(
 
         const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
+        const int kb0_orig = kb0_start;
         if (use_sparse) {
             kb0_stop = min(kb0_stop, (KV_max[(sequence % ne33)*iter_j + jt] + nbatch_fa - 1) / nbatch_fa);
         } else if (KV_max) {
-            kb0_stop = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
+            const int64_t kv_idx = int64_t(sequence)*iter_j + jt;
+            kb0_stop = min(kb0_stop, KV_max[kv_idx] / nbatch_fa);
+            if (kb0_orig == 0 && kb0_stop > 0) {
+                kb0_start = min(kb0_stop - 1, max(kb0_start, KV_max[int64_t(ne03)*iter_j + kv_idx] / nbatch_fa));
+            }
         }
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
-        if (kb0_start == 0) {
+        if (kb0_orig == 0) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
                 (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,

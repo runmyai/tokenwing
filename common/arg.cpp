@@ -4146,8 +4146,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-stream-wave-victim"}, "0|1",
         "1 = in a ubatch that runs in waves, a slot keeps its wave mark until the call's last wave, so a later wave takes the "
-        "experts an earlier wave of the call already used as victims first (by default the marks are cleared at every wave, so that "
-        "rule never fires). 0 = off (default: 0)",
+        "experts an earlier wave of the call already used as victims first. 0 = off (default: auto on with --moe-stream-prefill-fast 1, else 0)",
         [](common_params & params, int value) {
             if (value != 0 && value != 1) {   // clamped with a warning
                 const int v0 = value;

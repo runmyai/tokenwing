@@ -769,7 +769,8 @@ struct llama_moe_stream_layer {
     std::vector<uint8_t> b0_cls;          // [n_expert_used]
     // A call of this layer left a wait to ggml's mul_mat_id (--moe-stream-overlap), whose time is still in the CPU
     // backend's registry; take_overlap_waits() collects it
-    bool                 ovl_pending = false;
+    bool                 ovl_pending   = false;
+    bool                 in_remap_fill = false;   // active only during remap_needed's fill loop (Belady touched[] valid)
 
     counters & c() { return decode_phase ? dec : pre; }
     const counters & c() const { return decode_phase ? dec : pre; }
@@ -1206,6 +1207,11 @@ struct llama_moe_stream {
     ggml_backend_t             vf_be = nullptr;       // a second backend instance of the GPU: the uploader's own stream
     ggml_backend_buffer_t      vf_bounce_buf = nullptr;
     uint8_t *                  vf_bounce = nullptr;   // one expert block, pinned (--moe-stream-vram-follow-pinned 1)
+    static constexpr int       VAC_D2H_HALF = 8;      // double-buffered pipelined vacate D2H (8 experts/half = 16 total)
+    ggml_backend_buffer_t      vac_d2h_buf = nullptr;
+    uint8_t *                  vac_d2h_ptr = nullptr;
+    size_t                     vac_d2h_cap = 0;
+    ggml_backend_event_t       vac_d2h_ev[2] = {};
     std::atomic<bool>          vf_in_call{false};     // a call is between set_decode and end_call (the idle line)
     // The tick's wait on the GPU, not on the host. At a tick the engine records vf_ev on the calling context's
     // GPU stream (vf_ctx_be, set by llama-context every call) after the word's graph; every copy INTO a place waits for it (the
@@ -1249,6 +1255,7 @@ struct llama_moe_stream {
     // (mtx held: the I/O threads' settle), and the keep value an expert leaving VRAM has
     void vf_cb_take(vf_job_t & j);
     void cb_claim(llama_moe_stream_layer & B, int32_t v, int32_t e, vf_job_t & j);
+    bool tail_claim_cb_slot(int32_t g, int32_t p, int32_t il, int32_t e, vf_job_t & out_j);
     bool tail_copy_back(int32_t g, int32_t p, int32_t il, int32_t e);
     void vf_cb_copy(vf_job_t & j, bool async);
     void vf_cb_settle(vf_job_t & j);
@@ -1950,6 +1957,10 @@ struct llama_moe_stream {
     void     el_start();                           // the first call: the pressure thread
     void     el_stop();
     void     el_loop();                            // the pressure thread
+    bool     slot_is_leased(const llama_moe_stream_layer & sl, int32_t s) const {
+        return sl.keep[s] || sl.vf_mark[s] || (sl.slot_cb[s] & 1) != 0 ||
+               sl.slot_pending[s] != 0 || sl.pl_bound_word[s] >= 0;
+    }
     bool     el_droppable(const llama_moe_stream_layer & sl, int32_t s) const;   // mtx
     int32_t  el_floor(const llama_moe_stream_layer & sl) const;
     int32_t  el_ceil (const llama_moe_stream_layer & sl) const;

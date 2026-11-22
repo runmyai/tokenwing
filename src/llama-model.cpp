@@ -2522,7 +2522,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.fused_route         = params.moe_stream_fused_route == 1;
         p1.slot_check          = params.moe_stream_slot_check != 0;
         p1.wave_plan           = params.moe_stream_wave_plan == 1;
-        p1.wave_victim         = params.moe_stream_wave_victim == 1;
+        p1.wave_victim         = params.moe_stream_wave_victim > 0 || (params.moe_stream_wave_victim < 0 && params.moe_stream_prefill_fast == 1);
         p1.conv_silu           = params.moe_stream_conv_silu == 1;
         p1.hc_share            = params.moe_stream_hc_share == 1;
         p1.rs_window           = params.moe_stream_rs_window == 1;
@@ -4713,7 +4713,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_fused_route      =*/ 0,   // the argsort chain, as before
         /*.moe_stream_slot_check       =*/ 1,   // on
         /*.moe_stream_wave_plan        =*/ 0,   // off
-        /*.moe_stream_wave_victim      =*/ 0,   // off (the plain marks, cleared at every remap op)
+        /*.moe_stream_wave_victim      =*/ -1,  // auto (on with prefill_fast)
         /*.moe_stream_conv_silu        =*/ 0,   // SiLU after the reshape, as before
         /*.moe_stream_hc_share         =*/ 0,   // every combine computes its own weights, as before
         /*.moe_stream_rs_window        =*/ 0,   // the state fetch and the conv-state write where the layer needs them, as before

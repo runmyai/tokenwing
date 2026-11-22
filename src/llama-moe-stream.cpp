@@ -7517,6 +7517,35 @@ void llama_moe_stream::note_use(llama_moe_stream_layer & sl, int32_t s, bool dem
 
 // is `a` a better victim than `b` under the layer's policy?
 bool llama_moe_stream::worse_than(const llama_moe_stream_layer & sl, int32_t a, int32_t b) const {
+    if (!decode_phase && p1.prefill_fast) {
+        const int32_t ea = sl.slot_expert[a];
+        const int32_t eb = sl.slot_expert[b];
+        if (ea >= 0 && eb >= 0) {
+            // Belady farthest-next-use during remap_needed: evict experts unused in this call (or used in a farther wave) first
+            if (sl.in_remap_fill) {
+                const bool need_a = (size_t) ea < sl.touched.size() && sl.touched[ea] != 0;
+                const bool need_b = (size_t) eb < sl.touched.size() && sl.touched[eb] != 0;
+                if (need_a != need_b) {
+                    return !need_a;
+                }
+                if (need_a && need_b && wp_tab_il == sl.il &&
+                        (size_t) ea < wp_tab.w_first.size() && (size_t) eb < wp_tab.w_first.size()) {
+                    const int32_t wa = wp_tab.w_first[ea];
+                    const int32_t wb = wp_tab.w_first[eb];
+                    if (wa != wb) {
+                        return wa > wb;
+                    }
+                }
+            }
+            // S3-FIFO decode scan shield: keep decode-hot experts (p1_dval > 0) over cold prefill transients
+            const bool hot_a = !sl.p1_dval.empty() && sl.p1_dval[ea] > 0.0f;
+            const bool hot_b = !sl.p1_dval.empty() && sl.p1_dval[eb] > 0.0f;
+            if (hot_a != hot_b) {
+                return !hot_a;
+            }
+        }
+    }
+
     if (policy == MOE_STREAM_POLICY_DECAY && decode_phase) {
         const float va = p1_value(sl, a);
         const float vb = p1_value(sl, b);
@@ -12731,6 +12760,11 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
     }
 
     // fill this wave
+    struct remap_fill_guard {
+        bool & flag;
+        explicit remap_fill_guard(bool & f) : flag(f) { flag = true; }
+        ~remap_fill_guard() { flag = false; }
+    } fill_guard(sl.in_remap_fill);
     for (size_t r = 0; r < sl.uniq.size(); r++) {
         const int32_t e = sl.uniq[r];
         const bool mine = in_wave(r);
@@ -17359,8 +17393,7 @@ void llama_moe_stream::vf_cb_copy(vf_job_t & j, bool async) {
     const bool stale = vf_test_cb_stale > 0 && vf_cb_seen.fetch_add(1) + 1 == vf_test_cb_stale;   // TEST ONLY: the failure test
     wait_slot_h2d_done(B, s);
     if (async && vf_bounce) {
-        ggml_backend_tensor_get_async(vf_be, G.gate_up, vf_bounce,          o_g, nb_g);
-        ggml_backend_tensor_get_async(vf_be, G.gate_up, vf_bounce + nb_g,   o_u, nb_g);
+        ggml_backend_tensor_get_async(vf_be, G.gate_up, vf_bounce,          o_g, 2 * nb_g);
         ggml_backend_tensor_get_async(vf_be, G.down,    vf_bounce + 2*nb_g, o_d, nb_d);
         ggml_backend_synchronize(vf_be);   // the copy's event: the bytes are in the bounce
         if (!stale) {
@@ -18147,6 +18180,7 @@ void llama_moe_stream::tail_vacate_t(std::unique_lock<std::mutex> & lock, int32_
     const int64_t t_cb0 = ggml_time_us();
     // TEST ONLY: the held experts without a RAM copy leave the tail without being copied back (the old behaviour, for the A/B)
     static const bool tail_cb_off = getenv("MOE_STREAM_TEST_NO_TAIL_COPYBACK") && atoi(getenv("MOE_STREAM_TEST_NO_TAIL_COPYBACK")) != 0;
+    std::deque<vf_job_t> cb_jobs;
     for (int32_t p = tail_first; p < tail_first + n_places; p++) {
         const int32_t il = vf_place_il[g][p], e = vf_place_e[g][p];
         if (il < 0) {
@@ -18163,8 +18197,87 @@ void llama_moe_stream::tail_vacate_t(std::unique_lock<std::mutex> & lock, int32_
         vf_place_e [g][p] = -1;
         n++;
         if (sl.expert_slot[e] < 0 && !tail_cb_off) {   // no RAM copy (elastic RAM drops them): the place's bytes are still there
-            n_cb += tail_copy_back(g, p, il, e) ? 1 : 0;
+            cb_jobs.emplace_back();
+            if (!tail_claim_cb_slot(g, p, il, e, cb_jobs.back())) {
+                cb_jobs.pop_back();
+            }
         }
+    }
+    if (!cb_jobs.empty()) {
+        const auto & G    = vx_groups[(size_t) g];
+        const size_t nb_g = ggml_row_size(G.t_gate, G.ne_gate[0]) * G.ne_gate[1];
+        const size_t nb_d = ggml_row_size(G.t_down, G.ne_down[0]) * G.ne_down[1];
+        const size_t stride = GGML_PAD(2 * nb_g + nb_d, 256);
+        const size_t need_cap = 2 * (size_t) VAC_D2H_HALF * stride;
+        bool use_pipe = cb_jobs.size() >= 2 && vf_be != nullptr && !vf_verify_on && vf_test_cb_stale == 0;
+        if (use_pipe && vac_d2h_cap < need_cap) {
+            if (vac_d2h_buf) {
+                ggml_backend_buffer_free(vac_d2h_buf);
+                vac_d2h_buf = nullptr;
+                vac_d2h_ptr = nullptr;
+                vac_d2h_cap = 0;
+            }
+            ggml_backend_buffer_type_t hbt = ggml_backend_dev_host_buffer_type(vf_dev);
+            ggml_backend_buffer_t b = hbt ? ggml_backend_buft_alloc_buffer(hbt, need_cap) : nullptr;
+            if (b && ggml_backend_buffer_get_type(b) == hbt && ggml_backend_buffer_is_host(b)) {
+                vac_d2h_buf = b;
+                vac_d2h_ptr = (uint8_t *) ggml_backend_buffer_get_base(b);
+                vac_d2h_cap = need_cap;
+                for (int h = 0; h < 2; ++h) {
+                    if (!vac_d2h_ev[h]) {
+                        vac_d2h_ev[h] = ggml_backend_event_new(vf_dev);
+                    }
+                }
+            } else if (b) {
+                ggml_backend_buffer_free(b);
+            }
+        }
+        if (use_pipe && vac_d2h_ptr != nullptr && vac_d2h_cap >= need_cap && vac_d2h_ev[0] && vac_d2h_ev[1]) {
+            const size_t nb_chunks = (cb_jobs.size() + (size_t) VAC_D2H_HALF - 1) / (size_t) VAC_D2H_HALF;
+            const auto issue_chunk = [&](size_t c) {
+                const size_t h  = c & 1;
+                const size_t i0 = c * (size_t) VAC_D2H_HALF;
+                const size_t i1 = std::min(i0 + (size_t) VAC_D2H_HALF, cb_jobs.size());
+                for (size_t i = i0; i < i1; ++i) {
+                    const vf_job_t & j = cb_jobs[i];
+                    const size_t o_g = (size_t) j.place * 2 * nb_g;
+                    const size_t o_d = (size_t) j.place * nb_d;
+                    uint8_t * dst_pin = vac_d2h_ptr + (h * (size_t) VAC_D2H_HALF + (i - i0)) * stride;
+                    ggml_backend_tensor_get_async(vf_be, G.gate_up, dst_pin,            o_g, 2 * nb_g);
+                    ggml_backend_tensor_get_async(vf_be, G.down,    dst_pin + 2 * nb_g, o_d, nb_d);
+                }
+                ggml_backend_event_record(vac_d2h_ev[h], vf_be);
+            };
+            issue_chunk(0);
+            for (size_t c = 0; c < nb_chunks; ++c) {
+                if (c + 1 < nb_chunks) {
+                    issue_chunk(c + 1);
+                }
+                const size_t h  = c & 1;
+                const size_t i0 = c * (size_t) VAC_D2H_HALF;
+                const size_t i1 = std::min(i0 + (size_t) VAC_D2H_HALF, cb_jobs.size());
+                ggml_backend_event_synchronize(vac_d2h_ev[h]);
+                for (size_t i = i0; i < i1; ++i) {
+                    vf_job_t & j = cb_jobs[i];
+                    auto &     B = *layers[j.leave_il];
+                    const int32_t s = j.cb_slot;
+                    const uint8_t * src_pin = vac_d2h_ptr + (h * (size_t) VAC_D2H_HALF + (i - i0)) * stride;
+                    uint8_t * d0 = (uint8_t *) B.weights[0].pool->data + (size_t) s * B.weights[0].size;
+                    uint8_t * d1 = (uint8_t *) B.weights[1].pool->data + (size_t) s * B.weights[1].size;
+                    uint8_t * d2 = (uint8_t *) B.weights[2].pool->data + (size_t) s * B.weights[2].size;
+                    std::memcpy(d0, src_pin,            nb_g);
+                    std::memcpy(d1, src_pin + nb_g,     nb_g);
+                    std::memcpy(d2, src_pin + 2 * nb_g, nb_d);
+                    vf_cb_settle(j);
+                }
+            }
+        } else {
+            for (vf_job_t & j : cb_jobs) {
+                vf_cb_copy(j, vf_be != nullptr);
+                vf_cb_settle(j);
+            }
+        }
+        n_cb += (int32_t) cb_jobs.size();
     }
     tail_vacated    = true;
     tail_vac_n      = n_places;
@@ -18185,11 +18298,7 @@ void llama_moe_stream::tail_vacate_t(std::unique_lock<std::mutex> & lock, int32_
     }
 }
 
-// Mtx held, in tail_vacate_t, right after expert e of layer il left tail place p of group g: it has no RAM copy (VRAM-held experts drop
-// theirs while elastic RAM may give slots back), so the prompt that borrows the place would read it from the SSD again. Its bytes are
-// still in the place: copy them into an EMPTY RAM slot of the layer that a prompt may read (the first n_slots; never a slot elastic RAM
-// switched off, never an eviction). No such slot: false, and the expert is read from the SSD when it is needed, as without this
-bool llama_moe_stream::tail_copy_back(int32_t g, int32_t p, int32_t il, int32_t e) {
+bool llama_moe_stream::tail_claim_cb_slot(int32_t g, int32_t p, int32_t il, int32_t e, vf_job_t & out_j) {
     auto & B = *layers[il];
     int32_t v = -1;
     const uint32_t n = std::min<uint32_t>(B.n_slots, n_slots);
@@ -18202,9 +18311,21 @@ bool llama_moe_stream::tail_copy_back(int32_t g, int32_t p, int32_t il, int32_t 
         tail_cb_noroom += 1;
         return false;
     }
+    out_j.group = g; out_j.place = p; out_j.leave_il = il; out_j.leave_e = e;
+    cb_claim(B, v, e, out_j);
+    wait_slot_h2d_done(B, v);
+    return true;
+}
+
+// Mtx held, in tail_vacate_t, right after expert e of layer il left tail place p of group g: it has no RAM copy (VRAM-held experts drop
+// theirs while elastic RAM may give slots back), so the prompt that borrows the place would read it from the SSD again. Its bytes are
+// still in the place: copy them into an EMPTY RAM slot of the layer that a prompt may read (the first n_slots; never a slot elastic RAM
+// switched off, never an eviction). No such slot: false, and the expert is read from the SSD when it is needed, as without this
+bool llama_moe_stream::tail_copy_back(int32_t g, int32_t p, int32_t il, int32_t e) {
     vf_job_t j;
-    j.group = g; j.place = p; j.leave_il = il; j.leave_e = e;
-    cb_claim(B, v, e, j);
+    if (!tail_claim_cb_slot(g, p, il, e, j)) {
+        return false;
+    }
     vf_cb_copy(j, vf_be != nullptr);   // (the uploader's stream and pinned bounce when VRAM follow runs, else a plain synchronous read)
     vf_cb_settle(j);
     return true;
@@ -20527,6 +20648,18 @@ void llama_moe_stream::vf_stop_uploader() {
         vf_cv.notify_all();
         vf_thread.join();
     }
+    for (int h = 0; h < 2; ++h) {
+        if (vac_d2h_ev[h]) {
+            ggml_backend_event_free(vac_d2h_ev[h]);
+            vac_d2h_ev[h] = nullptr;
+        }
+    }
+    if (vac_d2h_buf) {
+        ggml_backend_buffer_free(vac_d2h_buf);
+        vac_d2h_buf = nullptr;
+        vac_d2h_ptr = nullptr;
+        vac_d2h_cap = 0;
+    }
     if (vf_bounce_buf) {
         ggml_backend_buffer_free(vf_bounce_buf);
         vf_bounce_buf = nullptr;
@@ -21889,10 +22022,8 @@ bool llama_moe_stream::el_givable_any() const {
 // source, not a copy-back in flight (bit 1; bit 2 = copied back and not picked again is bookkeeping drop_slot counts), not a list
 // entry's slot
 bool llama_moe_stream::el_droppable(const llama_moe_stream_layer & sl, int32_t s) const {
-    return s >= 0 && s < (int32_t) sl.n_slots && !sl.slot_off[s] && sl.slot_state[s] != MOE_STREAM_SLOT_LOADING && !sl.keep[s] &&
-           !sl.vf_mark[s] && (sl.slot_cb[s] & 1) == 0 && sl.slot_pending[s] == 0 &&
-           !(sl.slot_cancel[s] && sl.slot_state[s] == MOE_STREAM_SLOT_LOADING) && sl.pl_bound_word[s] < 0;   // (a cancel that
-                                                                                                             // lost the race to a landing)
+    return s >= 0 && s < (int32_t) sl.n_slots && !sl.slot_off[s] && sl.slot_state[s] != MOE_STREAM_SLOT_LOADING &&
+           !slot_is_leased(sl, s) && !(sl.slot_cancel[s] && sl.slot_state[s] == MOE_STREAM_SLOT_LOADING);
 }
 
 // mtx held: switch off up to n of this layer's slots - the empty ones first, then the least valuable (the keep rule) - never below the

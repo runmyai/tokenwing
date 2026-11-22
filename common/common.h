@@ -861,7 +861,7 @@ struct common_params {
     int32_t     moe_stream_fused_route = 0;       // 1 = grouped expert selection as one op (router + guesses)
     int32_t     moe_stream_slot_check  = 1;       // 1 = a pair with no RAM slot stops the run, 0 = off (emergency only)
     int32_t     moe_stream_wave_plan   = 0;       // 1 = a multi-wave ubatch's waves from a plan built at wave 0
-    int32_t     moe_stream_wave_victim = 0;       // 1 = wave marks last the call (earlier-wave victims first)
+    int32_t     moe_stream_wave_victim = -1;      // -1 = auto (on with prefill_fast), 0 = off, 1 = wave marks last the call
     int32_t     moe_stream_conv_silu   = 0;       // 1 = KDA conv + SiLU fused on CUDA (same bits)
     int32_t     moe_stream_hc_share    = 0;       // 1 = an FFN hyper-connection combine's weights computed once (same bits)
     int32_t     moe_stream_rs_window   = 0;       // 1 = delta-net state fetch / conv-state write in the GPU window (same bits)

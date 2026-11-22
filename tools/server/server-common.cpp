@@ -1188,7 +1188,10 @@ static void oaicompat_content_load_media(json & content, const server_chat_param
         std::string type = json_value(p, "type", std::string());
         if (type == "image_url") {
             if (!opt.allow_image) {
-                throw std::runtime_error("image input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
+                p["type"] = "text";
+                p["text"] = "[image omitted: text-only model]";
+                p.erase("image_url");
+                continue;
             }
 
             json image_url = json_value(p, "image_url", json::object());
@@ -1201,7 +1204,10 @@ static void oaicompat_content_load_media(json & content, const server_chat_param
 
         } else if (type == "input_audio") {
             if (!opt.allow_audio) {
-                throw std::runtime_error("audio input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
+                p["type"] = "text";
+                p["text"] = "[audio omitted: text-only model]";
+                p.erase("input_audio");
+                continue;
             }
 
             // note: don't need to validate "format", it's redundant
@@ -1216,7 +1222,11 @@ static void oaicompat_content_load_media(json & content, const server_chat_param
 
         } else if (type == "input_video" || type == "video_url") {
             if (!opt.allow_video) {
-                throw std::runtime_error("video input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
+                p["type"] = "text";
+                p["text"] = "[video omitted: text-only model]";
+                p.erase("input_video");
+                p.erase("video_url");
+                continue;
             }
 
             // accept the OpenAI-style "video_url" key as an alias of "input_video"

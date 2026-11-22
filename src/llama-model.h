@@ -655,6 +655,8 @@ struct llama_prec_policy {
 // The last weight buffer that could not be made was a host (RAM) buffer - fewer whole GPU layers cannot help then
 bool llama_model_last_alloc_failed_on_host();
 int32_t llama_model_last_alloc_drop_layer();   // the whole GPU MoE layer to give up after that failure (-1 none on that device, -2 not known)
+const std::string & llama_model_last_auto_gl_list();
+void llama_model_set_wl_retry(bool v);
 
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;

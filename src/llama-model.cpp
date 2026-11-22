@@ -1311,11 +1311,16 @@ void llama_prec_policy::load(llama_model_loader & ml, const llama_model & model)
 static thread_local bool llama_model_alloc_host = false;   // the last weight-buffer failure was a host buffer's
 bool llama_model_last_alloc_failed_on_host() { return llama_model_alloc_host; }
 // the whole GPU MoE layer that load would give up: the last picked on the device whose buffer failed; -1 = none there, -2 = not known
-static thread_local int32_t llama_model_alloc_drop = -2;
+static thread_local int32_t     llama_model_alloc_drop = -2;
+static thread_local std::string llama_model_auto_gl_list;
+static thread_local bool        llama_model_wl_retry = false;
 int32_t llama_model_last_alloc_drop_layer() { return llama_model_alloc_drop; }
+const std::string & llama_model_last_auto_gl_list() { return llama_model_auto_gl_list; }
+void llama_model_set_wl_retry(bool v) { llama_model_wl_retry = v; }
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     llama_model_alloc_drop = -2;   // (a failure of this load says which whole layer to give up)
+    llama_model_auto_gl_list.clear();
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
         // may need it later for tensor-parallel KV-cache split metadata.
@@ -1959,7 +1964,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // keeps it free itself, measured once the context exists, and loads the model again with one whole layer fewer when whole layers
         // left too little (keeping it here as well turned one whole layer into pool places, with the same VRAM free at the end)
         const auto fit_keep = [&](ggml_backend_dev_t d) -> int64_t {
-            return d != nullptr && d == ms_pool_dev ? 0 : vram_keep(d);
+            if (d == nullptr || d == ms_pool_dev) {
+                return 0;
+            }
+            return keep_list ? vram_keep(d) : std::max<int64_t>(0, params.moe_stream_vram_free);
         };
         // the compute buffers' margin per token of the physical batch (the auto-fit's, and the whole-layer check's estimate)
         static const double fit_mib_per_token = getenv("MOE_STREAM_FIT_MIB_PER_TOKEN")
@@ -2054,6 +2062,29 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // file, the engine's check below then runs with the exact sizes and streams what still does not fit. The engine then places the
         // layers: each whole layer runs completely on its device, every other GPU layer on the pool's GPU, the output with the last layer.
         // A list given back by a reload (one layer fewer) is kept as it is; a reload that gave up every layer (whole-layer count 0) picks none
+        static const bool no_auto_mgpu = getenv("MOE_STREAM_NO_AUTO_MULTIGPU") && atoi(getenv("MOE_STREAM_NO_AUTO_MULTIGPU")) != 0;
+        bool auto_mgpu = false;
+        std::vector<int32_t> user_gl_init;
+        if (n_gpu_devs > 1 && !wl_spec && !no_auto_mgpu && ms_pool_dev != nullptr &&
+                (params.moe_stream_vram_experts > 0 || params.moe_stream_vram_free > 0) &&
+                params.moe_stream_gpu_layers != 0) {
+            auto_mgpu = true;
+            for (size_t i = devices.size(); i-- > 0; ) {
+                const auto t = ggml_backend_dev_type(devices[i].dev);
+                if ((t == GGML_BACKEND_DEVICE_TYPE_GPU || (params.moe_stream_uma == 1 && t == GGML_BACKEND_DEVICE_TYPE_IGPU)) &&
+                        devices[i].dev != ms_pool_dev) {
+                    auto_devs.push_back(devices[i].dev);
+                }
+            }
+            if (!llama_model_wl_retry && !gl_list_eff.empty()) {
+                for (const std::string & item : split_by(gl_list_eff, ',')) {
+                    if (!item.empty()) {
+                        user_gl_init.push_back(atoi(item.c_str()));
+                    }
+                }
+                gl_list_eff.clear();   // let auto_devs pack secondary GPUs first, then prepend non-overlapping pool-GPU whole layers
+            }
+        }
         if (!auto_devs.empty() && ms_pool_dev != nullptr) {
             const int il_end = n_layer_all - (int) hparams.n_layer_nextn;   // the trunk's end (the MTP block follows the last layer)
             std::vector<int64_t> exp_b(n_layer_all, 0), oth_b(n_layer_all, 0);
@@ -2107,6 +2138,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 for (const int32_t x : spec_order) {   // the layers named with a device come first, in the order given
                     gl_list_eff = format("%d", x) + (gl_list_eff.empty() ? "" : ",") + gl_list_eff;
                 }
+                if (!user_gl_init.empty()) {
+                    std::string u_pref;
+                    std::set<int32_t> seen;
+                    for (const int32_t x : user_gl_init) {
+                        if (x >= 0 && x < n_layer_all && whole_dev_flag[x] == nullptr && seen.insert(x).second) {
+                            u_pref += format("%s%d", u_pref.empty() ? "" : ",", x);
+                        }
+                    }
+                    if (!u_pref.empty()) {
+                        gl_list_eff = u_pref + (gl_list_eff.empty() ? "" : ",") + gl_list_eff;
+                    }
+                }
             }
             // the placement: a layer of the list on its device, the other GPU layers on the pool's GPU
             std::set<int32_t> in_list;
@@ -2131,7 +2174,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     gl_list_eff.empty() ? "none" : gl_list_eff.c_str()).c_str());
         }
         // the whole-layer count the engine is given: none when the device list was given and nothing of it is left (not the auto-fit)
-        const int32_t gpu_layers_n = wl_spec && gl_list_eff.empty() ? 0 : params.moe_stream_gpu_layers;
+        const int32_t gpu_layers_n = (wl_spec || auto_mgpu) && gl_list_eff.empty() ? 0 : params.moe_stream_gpu_layers;
 
         // What this process will need in RAM besides the expert pools: the weights of the layers
         // that stay on the host, and the tensors outside the layers (token embeddings, output). Walked
@@ -2640,7 +2683,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.wl_devs              = std::move(wl_devs);
         p1.wl_dev_of            = std::move(wl_dev_of);
         p1.wl_ubatch            = params.moe_stream_ubatch > 0 ? params.moe_stream_ubatch : 512;
-        p1.wl_by_device         = wl_spec;
+        p1.wl_by_device         = wl_spec || auto_mgpu;
         pimpl->moe_stream = std::make_unique<llama_moe_stream>(
                 params.moe_stream,
                 params.moe_stream_log ? params.moe_stream_log : "",
@@ -2694,6 +2737,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             for (const int32_t il : ms.gpu_layers) {
                 if (il >= 0 && il < n_layer_all) {
                     ms.whole_dev[il] = whole_dev_flag[il] != nullptr ? whole_dev_flag[il] : pimpl->dev_layer[il].dev;
+                }
+            }
+            if (auto_mgpu) {
+                llama_model_auto_gl_list.clear();
+                for (const int32_t il : ms.gpu_layers) {
+                    llama_model_auto_gl_list += format("%s%d", llama_model_auto_gl_list.empty() ? "" : ",", il);
                 }
             }
             // A named whole layer that did not fit on its GPU runs completely on the pool's GPU (its experts are streamed there):

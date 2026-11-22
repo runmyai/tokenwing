@@ -491,6 +491,7 @@ static struct llama_model * llama_model_load_from_file_impl(
     std::string gl_list = params.moe_stream_gpu_layers_list ? params.moe_stream_gpu_layers_list : "";
     int status = 0;
     llama_model * model = nullptr;
+    llama_model_set_wl_retry(false);
     for (;;) {
         llama_last_load_error.clear();
         std::tie(status, model) = llama_model_load(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, file, params);
@@ -500,6 +501,9 @@ static struct llama_model * llama_model_load_from_file_impl(
         // the layer given up: the last picked on the device whose buffer failed (with several GPUs maybe not the list's last); none there =
         // fewer whole layers cannot help, no retry
         const int32_t drop_il = llama_model_last_alloc_drop_layer();
+        if (can_retry && !llama_model_last_auto_gl_list().empty()) {
+            gl_list = llama_model_last_auto_gl_list();
+        }
         if (can_retry && !gl_list.empty() && drop_il == -1) {
             fprintf(stderr, "%s: --moe-stream: the weights did not fit (%s) on a GPU that holds none of the whole GPU MoE layers %s - fewer "
                     "whole layers cannot help there\n", __func__, llama_last_load_error.c_str(), gl_list.c_str());
@@ -530,6 +534,7 @@ static struct llama_model * llama_model_load_from_file_impl(
             if (gl_list.empty()) {
                 params.moe_stream_gpu_layers = 0;
             }
+            llama_model_set_wl_retry(true);
             continue;
         }
         if (can_retry && gl_list.empty() && params.moe_stream_gpu_layers > 0) {
@@ -538,10 +543,12 @@ static struct llama_model * llama_model_load_from_file_impl(
                     "plan is made again with one more layer streamed)\n", __func__,
                     llama_last_load_error.c_str(), params.moe_stream_gpu_layers);
             if (model) { llama_model_free(model); model = nullptr; }
+            llama_model_set_wl_retry(true);
             continue;
         }
         break;
     }
+    llama_model_set_wl_retry(false);
     if (model != nullptr && params.moe_stream_gpu_layers_list != nullptr && gl_list.c_str() == params.moe_stream_gpu_layers_list) {
         model->moe_stream_forget_gpu_layers_list();   // (the shortened list is this function's string: no pointer to it after the load)
     }

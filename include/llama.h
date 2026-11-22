@@ -613,6 +613,7 @@ extern "C" {
         int32_t      moe_stream_hc_fused;       // 1 = register-fused hyper-connection w_up + gated pre-mix on qwen4exp, 0 = off
         int32_t      moe_stream_ple_fast;       // 1 = deduplicated LBA-sorted raw-quant PLE GPU gather + fused dilated conv, 0 = off
         int32_t      moe_stream_hybrid_tail;    // > 0 = compute RAM experts routed by <= K tokens on CPU during GPU tail waves, 0 = off
+        uint32_t     moe_stream_auto_mask;      // bitmask of knobs auto-enabled by umbrella CLI groups (1=vram_free, 2=copy_ahead, 4=correction, 8=vram_list, 16=hip_mmvq, 32=hip_sync)
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights

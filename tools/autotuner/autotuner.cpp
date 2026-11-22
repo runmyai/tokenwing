@@ -839,6 +839,71 @@ static double gpu_gbps(ggml_backend_dev_t d, double seconds) {
     return gbps;
 }
 
+struct TuneGpuInfo {
+    std::string name;
+    size_t      mib  = 0;
+    double      gbps = 0.0;
+};
+
+struct TuneRec {
+    std::string              vram_device;
+    std::vector<std::string> args;
+};
+
+static TuneRec build_recommended_args(
+        const std::vector<TuneGpuInfo> & gpus,
+        const std::vector<TuneGpuInfo> & igpus,
+        int threads,
+        int threads_batch,
+        const std::string & fast_mask,
+        bool has_side_load,
+        int io_threads) {
+    TuneRec rec;
+    rec.args.push_back("--moe-stream");
+    rec.args.push_back("model");
+    rec.args.push_back("-t");
+    rec.args.push_back(std::to_string(threads));
+    if (threads_batch > threads) {
+        rec.args.push_back("-tb");
+        rec.args.push_back(std::to_string(threads_batch));
+    }
+    if (!fast_mask.empty()) {
+        rec.args.push_back("--cpu-mask");
+        rec.args.push_back(fast_mask);
+        rec.args.push_back("--cpu-strict");
+        rec.args.push_back("1");
+    }
+    if (has_side_load && io_threads > 0) {
+        rec.args.push_back("--moe-stream-io-threads");
+        rec.args.push_back(std::to_string(io_threads));
+    }
+    if (!gpus.empty()) {
+        size_t best_idx = 0;
+        for (size_t i = 1; i < gpus.size(); i++) {
+            const long long g_best = std::llround(gpus[best_idx].gbps);
+            const long long g_cur  = std::llround(gpus[i].gbps);
+            if (g_cur > g_best || (g_cur == g_best && gpus[i].mib > gpus[best_idx].mib)) {
+                best_idx = i;
+            }
+        }
+        rec.vram_device = gpus[best_idx].name;
+        if (best_idx != 0 && !rec.vram_device.empty()) {
+            rec.args.push_back("--moe-stream-vram-device");
+            rec.args.push_back(rec.vram_device);
+        }
+    } else {
+        for (const auto & ig : igpus) {
+            if (ig.mib >= 24576) {
+                rec.vram_device = ig.name;
+                rec.args.push_back("--moe-stream-uma");
+                rec.args.push_back("1");
+                break;
+            }
+        }
+    }
+    return rec;
+}
+
 } // namespace
 
 static int run_self_test() {
@@ -967,7 +1032,43 @@ static int run_self_test() {
         fs::remove_all(fx);
     }
 
-    printf("{\"self_test\": \"PASS\", \"ext0_piece_kib\": %zu, \"fixtures\": 4}\n", gi.piece_bytes >> 10);
+    // 5. Verify recommended_vram_device + recommended_args builder across multi-GPU, hybrid P-core, and UMA topologies.
+    {
+        const auto contains_pair = [](const std::vector<std::string> & a, const std::string & k, const std::string & v) {
+            for (size_t i = 0; i + 1 < a.size(); i++) {
+                if (a[i] == k && a[i + 1] == v) return true;
+            }
+            return false;
+        };
+
+        const TuneRec r_mgpu = build_recommended_args(
+            { {"CUDA0", 12288, 350.0}, {"CUDA1", 24576, 820.0} },
+            {},
+            6, 12, "0xfc03", true, 8);
+        if (r_mgpu.vram_device != "CUDA1" ||
+                !contains_pair(r_mgpu.args, "--moe-stream", "model") ||
+                !contains_pair(r_mgpu.args, "-t", "6") ||
+                !contains_pair(r_mgpu.args, "-tb", "12") ||
+                !contains_pair(r_mgpu.args, "--cpu-mask", "0xfc03") ||
+                !contains_pair(r_mgpu.args, "--moe-stream-io-threads", "8") ||
+                !contains_pair(r_mgpu.args, "--moe-stream-vram-device", "CUDA1")) {
+            fprintf(stderr, "autotuner self-test FAIL: mgpu recommended_args mismatch (dev=%s)\n", r_mgpu.vram_device.c_str());
+            return 1;
+        }
+
+        const TuneRec r_uma = build_recommended_args(
+            {},
+            { {"Vulkan0", 65536, 210.0} },
+            8, 8, "", false, 0);
+        if (r_uma.vram_device != "Vulkan0" ||
+                !contains_pair(r_uma.args, "--moe-stream-uma", "1") ||
+                std::find(r_uma.args.begin(), r_uma.args.end(), "-tb") != r_uma.args.end()) {
+            fprintf(stderr, "autotuner self-test FAIL: UMA recommended_args mismatch (dev=%s)\n", r_uma.vram_device.c_str());
+            return 1;
+        }
+    }
+
+    printf("{\"self_test\": \"PASS\", \"ext0_piece_kib\": %zu, \"fixtures\": 5}\n", gi.piece_bytes >> 10);
     return 0;
 }
 
@@ -1150,18 +1251,24 @@ int main(int argc, char ** argv) {
 
     // Prompt prefill (`-tb`) is compute-bound (tiled GEMM / iqk), so it scales across all physical cores minus GPU driver.
     const int threads_batch = std::max(threads, std::max(1, phys - gpu_reserve));
-    auto list_json = [&](const std::vector<std::pair<ggml_backend_dev_t, size_t>> & devs) {
+    auto list_json = [&](const std::vector<std::pair<ggml_backend_dev_t, size_t>> & devs, std::vector<TuneGpuInfo> & info) {
         std::string out;
         for (const auto & g : devs) {
+            const std::string name = ggml_backend_dev_name(g.first);
+            const double cur_gbps  = gpu_gbps(g.first, seconds);
+            info.push_back({ name, g.second, cur_gbps });
             char gb[32];
-            snprintf(gb, sizeof(gb), "%.0f", gpu_gbps(g.first, seconds));
-            out += (out.empty() ? "" : ", ") + std::string("{\"name\": \"") + json_escape(ggml_backend_dev_name(g.first)) +
+            snprintf(gb, sizeof(gb), "%.0f", cur_gbps);
+            out += (out.empty() ? "" : ", ") + std::string("{\"name\": \"") + json_escape(name) +
                    "\", \"desc\": \"" + json_escape(ggml_backend_dev_description(g.first)) +
                    "\", \"mib\": " + std::to_string(g.second) + ", \"gbps\": " + gb + "}";
         }
         return out;
     };
-    const std::string gpus = list_json(gpu_devs), igpus = list_json(igpu_devs);
+    std::vector<TuneGpuInfo> gpu_info, igpu_info;
+    const std::string gpus = list_json(gpu_devs, gpu_info), igpus = list_json(igpu_devs, igpu_info);
+    const TuneRec rec = build_recommended_args(
+        gpu_info, igpu_info, threads, threads_batch, fast_mask_out, !file.empty() && sp.readable, io);
 
     printf("{\"gpus\": [%s], \"igpus\": [%s], \"physical_cores\": %d, \"logical_cores\": %d, "
            "\"threads\": %d, \"threads_batch\": %d, \"saturation\": %d, "
@@ -1190,7 +1297,11 @@ int main(int argc, char ** argv) {
     } else {
         printf(", \"side_load\": false");
     }
-    printf("}\n");
+    printf(", \"recommended_vram_device\": \"%s\", \"recommended_args\": [", json_escape(rec.vram_device).c_str());
+    for (size_t i = 0; i < rec.args.size(); i++) {
+        printf("%s\"%s\"", i > 0 ? ", " : "", json_escape(rec.args[i]).c_str());
+    }
+    printf("]}\n");
 
     ggml_backend_buffer_free(buf);
     ggml_backend_free(be);

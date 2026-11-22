@@ -1911,6 +1911,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_stream_hc_fused         = params.moe_stream_hc_fused;
     mparams.moe_stream_ple_fast         = params.moe_stream_ple_fast;
     mparams.moe_stream_hybrid_tail      = params.moe_stream_hybrid_tail;
+    mparams.moe_stream_auto_mask        = params.moe_stream_auto_mask;
     mparams.moe_stream_plan             = params.moe_stream_plan;
     mparams.moe_stream_plan_bind_early  = params.moe_stream_plan_bind_early;  // test only
     mparams.moe_stream_drop_stale       = params.moe_stream_drop_stale;

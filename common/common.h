@@ -890,6 +890,12 @@ struct common_params {
     int32_t     moe_stream_gpu_wave_skip_zero = 0;  // 1 = GPU prompt matmuls skip the zero-slice pairs (they write 0)
     int32_t     moe_stream_gpu_skip_zero = 0;     // 1 = the GPU mmvq writes 0 for the VRAM pool's zero slices
     int32_t     moe_stream_prefill_fast  = 0;     // 1 = enable all compatible prefill fast paths
+    int32_t     moe_stream_fast_prefill  = -1;    // -1 = auto (on with --moe-stream), 0 = off, 1 = on
+    int32_t     moe_stream_fast_decode   = -1;    // -1 = auto (on with --moe-stream), 0 = off, 1 = on
+    int32_t     moe_stream_fast_cpu      = -1;    // -1 = auto (on with --moe-stream), 0 = off, 1 = on
+    int32_t     moe_stream_vram_cache    = -1;    // -1 = auto (on with --moe-stream on discrete GPU), 0 = off, 1 = on
+    int32_t     moe_stream_ram_cache     = -1;    // -1 = auto (on with --moe-stream), 0 = off, 1 = on
+    uint32_t    moe_stream_auto_mask     = 0;     // bitmask of knobs auto-enabled by umbrella flags
     int32_t     moe_stream_mmq_moe_opt   = 0;     // 1 = scale CUDA MMQ ncols_opt by per-expert token count
     int32_t     moe_stream_gpu_moe_fused = 0;     // 1 = fused dual-bucket gate+up+SwiGLU->INT8->down CUDA prefill
     int64_t     moe_stream_pinned_ring   = 0;     // bytes of pinned host H2D staging ring (1 = 256 MiB, 0 = off)
@@ -976,6 +982,8 @@ struct common_params {
     std::string tts_speaker_file = "";
 
     bool is_gen_docs = false; // whether we are running inside llama-gen-docs
+    bool usage_internal = false; // --help-internal: include internal moe-stream options in usage
+    std::set<std::string> cli_explicit; // canonical opt.args[0] names explicitly supplied via CLI or env
 };
 
 // call once at the start of a program if it uses libcommon

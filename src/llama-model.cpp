@@ -2063,17 +2063,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // layers: each whole layer runs completely on its device, every other GPU layer on the pool's GPU, the output with the last layer.
         // A list given back by a reload (one layer fewer) is kept as it is; a reload that gave up every layer (whole-layer count 0) picks none
         static const bool no_auto_mgpu = getenv("MOE_STREAM_NO_AUTO_MULTIGPU") && atoi(getenv("MOE_STREAM_NO_AUTO_MULTIGPU")) != 0;
-        bool auto_mgpu = false;
+        bool auto_gl_budget = false;
         std::vector<int32_t> user_gl_init;
-        if (n_gpu_devs > 1 && !wl_spec && !no_auto_mgpu && ms_pool_dev != nullptr &&
+        if (!wl_spec && !no_auto_mgpu && ms_pool_dev != nullptr &&
                 (params.moe_stream_vram_experts > 0 || params.moe_stream_vram_free > 0) &&
                 params.moe_stream_gpu_layers != 0) {
-            auto_mgpu = true;
-            for (size_t i = devices.size(); i-- > 0; ) {
-                const auto t = ggml_backend_dev_type(devices[i].dev);
-                if ((t == GGML_BACKEND_DEVICE_TYPE_GPU || (params.moe_stream_uma == 1 && t == GGML_BACKEND_DEVICE_TYPE_IGPU)) &&
-                        devices[i].dev != ms_pool_dev) {
-                    auto_devs.push_back(devices[i].dev);
+            auto_gl_budget = true;
+            if (n_gpu_devs > 1) {
+                for (size_t i = devices.size(); i-- > 0; ) {
+                    const auto t = ggml_backend_dev_type(devices[i].dev);
+                    if ((t == GGML_BACKEND_DEVICE_TYPE_GPU || (params.moe_stream_uma == 1 && t == GGML_BACKEND_DEVICE_TYPE_IGPU)) &&
+                            devices[i].dev != ms_pool_dev) {
+                        auto_devs.push_back(devices[i].dev);
+                    }
                 }
             }
             if (!llama_model_wl_retry && !gl_list_eff.empty()) {
@@ -2082,16 +2084,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         user_gl_init.push_back(atoi(item.c_str()));
                     }
                 }
-                gl_list_eff.clear();   // let auto_devs pack secondary GPUs first, then prepend non-overlapping pool-GPU whole layers
+                if (n_gpu_devs > 1) {
+                    gl_list_eff.clear();   // let auto_devs pack secondary GPUs first, then prepend non-overlapping pool-GPU whole layers
+                }
             }
         }
-        if (!auto_devs.empty() && ms_pool_dev != nullptr) {
+        if ((!auto_devs.empty() || auto_gl_budget) && ms_pool_dev != nullptr) {
             const int il_end = n_layer_all - (int) hparams.n_layer_nextn;   // the trunk's end (the MTP block follows the last layer)
             std::vector<int64_t> exp_b(n_layer_all, 0), oth_b(n_layer_all, 0);
             int64_t out_b = 0;
             for (const auto & it : ml.weights_map) {
                 int il = -1;
                 sscanf(it.first.c_str(), "blk.%d.", &il);
+                const bool nextn = hparams.n_layer_nextn > 0 && il >= il_end;
+                if (nextn && !ml.load_mtp) {
+                    continue;
+                }
                 const int64_t b = (int64_t) ggml_nbytes(it.second.tensor);
                 if (il >= 0 && il < n_layer_all) {
                     (llama_moe_stream_is_exps(it.first.c_str()) ? exp_b : oth_b)[il] += b;
@@ -2134,6 +2142,81 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         n > 0 ? format("takes layers %d-%d", lo, hi).c_str() : "takes no layer", used/1073741824.0,
                         fit_keep(d)/1048576.0, f/1048576.0);
             }
+            if (auto_gl_budget && pick && user_gl_init.empty() && params.moe_stream_gpu_layers < 0) {
+                size_t f_pool = 0, tot_pool = 0;
+                ggml_backend_dev_memory(ms_pool_dev, &f_pool, &tot_pool);
+                const int64_t pool_keep = keep_list ? vram_keep(ms_pool_dev) : std::max<int64_t>(0, params.moe_stream_vram_free);
+                int64_t pool_oth = 0, pool_ctx = 0;
+                const bool sec_took_last = !auto_devs.empty() && il_end > 0 && whole_dev_flag[il_end - 1] != nullptr && whole_dev_flag[il_end - 1] != ms_pool_dev;
+                if (!sec_took_last && pimpl->dev_output.dev != cpu_dev) {
+                    pool_oth += out_b;
+                }
+                std::set<int64_t> distinct_mib;
+                for (int x = 0; x < n_layer_all; x++) {
+                    if (pimpl->dev_layer[x].dev == cpu_dev) {
+                        continue;
+                    }
+                    const ggml_backend_dev_t owner = x >= il_end && il_end > 0
+                                                   ? (whole_dev_flag[il_end - 1] != nullptr ? whole_dev_flag[il_end - 1] : ms_pool_dev)
+                                                   : (whole_dev_flag[x] != nullptr ? whole_dev_flag[x] : ms_pool_dev);
+                    if (owner == ms_pool_dev) {
+                        pool_oth += oth_b[x];
+                        if (offload_kv) {
+                            pool_ctx += llama_moe_stream_layer_ctx_bytes(hparams, arch, (uint32_t) x, params);
+                        }
+                    }
+                    if (x < il_end && x >= (int) hparams.n_layer_dense_lead && exp_b[x] > 0 && whole_dev_flag[x] == nullptr) {
+                        distinct_mib.insert((exp_b[x] + 524288) >> 20);
+                    }
+                }
+                const int64_t lend_reclaim = (params.moe_stream_vram_lend_prompt != 0 && params.moe_stream_vram_follow == 1)
+                                           ? std::min<int64_t>(wl_compute, 640LL << 20) : 0;
+                const int64_t room_after_fixed = (int64_t) f_pool - pool_keep - wl_compute - wl_prewarm - pool_oth - pool_ctx;
+                const int64_t eff_room = room_after_fixed + lend_reclaim;
+                const int64_t vx_floor = 2500LL << 20;
+                int64_t pool_used = 0;
+                std::vector<int32_t> pool_picked;
+                if (eff_room > vx_floor) {
+                    if (distinct_mib.size() == 1) {
+                        for (int x = (int) hparams.n_layer_dense_lead; x < il_end && (int) pool_picked.size() < 2; x++) {
+                            if (pimpl->dev_layer[x].dev == cpu_dev || exp_b[x] == 0 || whole_dev_flag[x] != nullptr) {
+                                continue;
+                            }
+                            if (eff_room - pool_used - exp_b[x] < vx_floor) {
+                                break;
+                            }
+                            pool_used += exp_b[x];
+                            whole_dev_flag[x] = ms_pool_dev;
+                            pool_picked.push_back(x);
+                        }
+                    } else if (distinct_mib.size() > 1) {
+                        const int64_t wl_cap = std::min<int64_t>(eff_room - vx_floor, (int64_t) (eff_room * 0.32));
+                        for (int x = il_end - 1; x >= (int) hparams.n_layer_dense_lead; x--) {
+                            if (pimpl->dev_layer[x].dev == cpu_dev || exp_b[x] == 0 || whole_dev_flag[x] != nullptr) {
+                                continue;
+                            }
+                            if (pool_used + exp_b[x] > wl_cap) {
+                                continue;
+                            }
+                            pool_used += exp_b[x];
+                            whole_dev_flag[x] = ms_pool_dev;
+                            pool_picked.push_back(x);
+                        }
+                        std::sort(pool_picked.begin(), pool_picked.end());
+                    }
+                }
+                for (const int32_t x : pool_picked) {
+                    user_gl_init.push_back(x);
+                }
+                if (!pool_picked.empty()) {
+                    std::string plist;
+                    for (const int32_t x : pool_picked) {
+                        plist += format("%s%d", plist.empty() ? "" : ",", x);
+                    }
+                    fprintf(stderr, "%s: auto whole-layer budget on %s: takes layers %s (%.2f GiB of experts, %.2f GiB available after weights/ctx)\n",
+                            __func__, ggml_backend_dev_name(ms_pool_dev), plist.c_str(), pool_used/1073741824.0, eff_room/1073741824.0);
+                }
+            }
             if (pick) {
                 for (const int32_t x : spec_order) {   // the layers named with a device come first, in the order given
                     gl_list_eff = format("%d", x) + (gl_list_eff.empty() ? "" : ",") + gl_list_eff;
@@ -2142,7 +2225,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     std::string u_pref;
                     std::set<int32_t> seen;
                     for (const int32_t x : user_gl_init) {
-                        if (x >= 0 && x < n_layer_all && whole_dev_flag[x] == nullptr && seen.insert(x).second) {
+                        if (x >= 0 && x < n_layer_all && (whole_dev_flag[x] == nullptr || whole_dev_flag[x] == ms_pool_dev) && seen.insert(x).second) {
                             u_pref += format("%s%d", u_pref.empty() ? "" : ",", x);
                         }
                     }
@@ -2169,12 +2252,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (pimpl->dev_output.dev != cpu_dev && il_end > 0) {
                 pimpl->dev_output = pimpl->dev_layer[il_end - 1];
             }
-            fprintf(stderr, "%s: --moe-stream-gpu-layers-device auto: %s; the other GPU layers run on %s (the pool's GPU)%s\n", __func__,
-                    say.c_str(), ggml_backend_dev_name(ms_pool_dev), pick ? "" : format(", whole layers as given: %s",
-                    gl_list_eff.empty() ? "none" : gl_list_eff.c_str()).c_str());
+            if (!auto_devs.empty()) {
+                fprintf(stderr, "%s: --moe-stream-gpu-layers-device auto: %s; the other GPU layers run on %s (the pool's GPU)%s\n", __func__,
+                        say.c_str(), ggml_backend_dev_name(ms_pool_dev), pick ? "" : format(", whole layers as given: %s",
+                        gl_list_eff.empty() ? "none" : gl_list_eff.c_str()).c_str());
+            }
         }
-        // the whole-layer count the engine is given: none when the device list was given and nothing of it is left (not the auto-fit)
-        const int32_t gpu_layers_n = (wl_spec || auto_mgpu) && gl_list_eff.empty() ? 0 : params.moe_stream_gpu_layers;
+        // the whole-layer count the engine is given: none when the device list was given or auto_gl_budget picked (not the legacy auto-fit)
+        const int32_t gpu_layers_n = (wl_spec || auto_gl_budget) && gl_list_eff.empty() ? 0 : params.moe_stream_gpu_layers;
 
         // What this process will need in RAM besides the expert pools: the weights of the layers
         // that stay on the host, and the tensors outside the layers (token embeddings, output). Walked
@@ -2450,8 +2535,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // pool's) in the engine, which knows the streamed layers. A device that reports no memory is not checked
         std::vector<llama_moe_stream_p1::wl_dev> wl_devs;
         std::vector<int32_t>                     wl_dev_of;
-        // (with more than one GPU the auto-fit's picks are checked per device too: it counts the first GPU only)
-        if ((gpu_list || gpu_layers_n > 0 || (gpu_layers_n < 0 && n_gpu_devs > 1)) && !devices.empty()) {
+        // (the auto-fit's or auto-gl-budget's picks are checked per device before the weights load)
+        if ((gpu_list || gpu_layers_n > 0 || (gpu_layers_n < 0 && n_gpu_devs > 1) || auto_gl_budget) && !devices.empty()) {
             wl_dev_of.assign(n_layer_all, -1);
             const bool pool_on = params.moe_stream_vram_experts > 0 || params.moe_stream_vram_free > 0;
             for (const auto & dv : devices) {
@@ -2577,6 +2662,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.gpu_share_q8        = params.moe_stream_gpu_share_q8 == 1;
         p1.vram_experts        = params.moe_stream_vram_experts > 0 ? (uint32_t) params.moe_stream_vram_experts : 0;
         p1.vram_experts_file   = params.moe_stream_vram_experts_file ? params.moe_stream_vram_experts_file : "";
+        p1.vram_experts_auto   = (params.moe_stream_auto_mask & (1u << 3)) != 0;
         p1.vram_experts_margin = params.moe_stream_vram_experts_margin > 0 ? params.moe_stream_vram_experts_margin
                                                                            : (int64_t) 512*1024*1024;
         p1.vram_free           = params.moe_stream_vram_free > 0 ? params.moe_stream_vram_free : 0;
@@ -2588,7 +2674,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.vram_scratch        = params.moe_stream_vram_scratch;   // -1 = derived
         p1.vram_growth         = params.moe_stream_vram_growth > 0 ? params.moe_stream_vram_growth : 0;  // 0 = derived
         {
-            const llama_moe_corr_ref cref = llama_moe_correction_ref(params.moe_stream_correction, ml.file_paths[0], /* say = */ true);
+            const llama_moe_corr_ref cref = llama_moe_correction_ref(params.moe_stream_correction, ml.file_paths[0],
+                    /* say = */ (params.moe_stream_auto_mask & (1u << 2)) == 0);
             p1.correction_file     = cref.path;
             p1.correction_base     = cref.base;
             p1.correction_size     = cref.size;
@@ -2658,8 +2745,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 }
             }
         }
-        p1.hip_mmvq             = params.moe_stream_hip_mmvq == 1;
-        p1.hip_sync             = std::max(0, params.moe_stream_hip_sync);
+        {
+            const bool has_rocm = ggml_backend_reg_by_name("ROCm") != nullptr;
+            p1.hip_mmvq = params.moe_stream_hip_mmvq == 1 || (has_rocm && (params.moe_stream_auto_mask & (1u << 4)) != 0);
+            p1.hip_sync = params.moe_stream_hip_sync > 0 ? params.moe_stream_hip_sync
+                        : (has_rocm && (params.moe_stream_auto_mask & (1u << 5)) != 0) ? 1 : 0;
+        }
         p1.elastic              = params.moe_stream_elastic == 1;
         // one leave-free number: --moe-stream-ram-margin, else --moe-stream-ram-free, else the OS default (el_parse_opts) - the start's
         // fill, elastic RAM's floor and the prompt guard all keep the same amount free
@@ -2677,13 +2768,33 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.copy_ahead           = params.moe_stream_copy_ahead;   // copy-ahead for GPU prompts (0 / 1 / 2)
         p1.vram_lend_prompt     = params.moe_stream_vram_lend_prompt != 0;
         p1.vram_lend_short      = std::max(1, params.moe_stream_vram_lend_short);
+        if ((params.moe_stream_auto_mask & 1u) != 0 && ms_pool_dev == nullptr) {
+            p1.vram_free = 0;
+            p1.vram_experts = 0;
+            p1.vram_experts_file.clear();
+            p1.vram_follow = false;
+            p1.vram_parallel = false;
+            p1.vram_parallel_cross = false;
+            p1.vram_copyback = false;
+            p1.vram_end_fill = 0;
+            p1.copy_ahead = 0;
+            p1.vram_lend_prompt = false;
+            p1.prompt_split = false;
+        }
+        if ((params.moe_stream_auto_mask & 2u) != 0 && ms_pool_dev != nullptr && p1.copy_ahead == 1) {
+            size_t f_p = 0, tot_p = 0;
+            ggml_backend_dev_memory(ms_pool_dev, &f_p, &tot_p);
+            if (tot_p > 0 && tot_p < (10ULL << 30)) {
+                p1.copy_ahead = 2;
+            }
+        }
         p1.timing               = params.moe_stream_timing == 1;
         p1.out_check            = std::max(0, params.moe_stream_out_check);
         p1.nonpool              = params.moe_stream_nonpool != nullptr;
         p1.wl_devs              = std::move(wl_devs);
         p1.wl_dev_of            = std::move(wl_dev_of);
         p1.wl_ubatch            = params.moe_stream_ubatch > 0 ? params.moe_stream_ubatch : 512;
-        p1.wl_by_device         = wl_spec || auto_mgpu;
+        p1.wl_by_device         = wl_spec || !auto_devs.empty();
         pimpl->moe_stream = std::make_unique<llama_moe_stream>(
                 params.moe_stream,
                 params.moe_stream_log ? params.moe_stream_log : "",
@@ -2739,7 +2850,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     ms.whole_dev[il] = whole_dev_flag[il] != nullptr ? whole_dev_flag[il] : pimpl->dev_layer[il].dev;
                 }
             }
-            if (auto_mgpu) {
+            if (auto_gl_budget) {
                 llama_model_auto_gl_list.clear();
                 for (const int32_t il : ms.gpu_layers) {
                     llama_model_auto_gl_list += format("%s%d", llama_model_auto_gl_list.empty() ? "" : ",", il);
@@ -4854,6 +4965,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_hc_fused         =*/ 0,      // off
         /*.moe_stream_ple_fast         =*/ 0,      // off
         /*.moe_stream_hybrid_tail      =*/ 0,      // off
+        /*.moe_stream_auto_mask        =*/ 0,      // no umbrella auto-enabled bits
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,

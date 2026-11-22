@@ -114,6 +114,11 @@ common_arg & common_arg::set_preset_only() {
     return *this;
 }
 
+common_arg & common_arg::set_internal() {
+    is_internal = true;
+    return *this;
+}
+
 bool common_arg::in_example(enum llama_example ex) {
     return examples.find(ex) != examples.end();
 }
@@ -792,15 +797,19 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         if (opt.get_value_from_env(value)) {
             try {
                 if (opt.handler_void && is_truthy(value)) {
+                    if (!opt.args.empty()) { params.cli_explicit.insert(opt.args[0]); }
                     opt.handler_void(params);
                 }
                 if (opt.handler_int) {
+                    if (!opt.args.empty()) { params.cli_explicit.insert(opt.args[0]); }
                     opt.handler_int(params, std::stoi(value));
                 }
                 if (opt.handler_bool) {
+                    if (!opt.args.empty()) { params.cli_explicit.insert(opt.args[0]); }
                     opt.handler_bool(params, parse_bool_value(value));
                 }
                 if (opt.handler_string) {
+                    if (!opt.args.empty()) { params.cli_explicit.insert(opt.args[0]); }
                     opt.handler_string(params, value);
                     continue;
                 }
@@ -843,6 +852,9 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             bool is_positive = tmp.second;
             if (opt.has_value_from_env()) {
                 fprintf(stderr, "warn: %s environment variable is set, but will be overwritten by command line argument %s\n", opt.env, arg.c_str());
+            }
+            if (!opt.args.empty()) {
+                params.cli_explicit.insert(opt.args[0]);
             }
             try {
                 if (opt.handler_void) {
@@ -899,6 +911,180 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
+    }
+
+    // Resolve purpose-driven --moe-stream umbrella groups into concrete internal settings
+    // whenever --moe-stream is active, without overriding any explicitly provided CLI/env flags.
+    if (!params.moe_stream.empty()) {
+        const auto has = [&](const char * k) {
+            return params.cli_explicit.count(k) > 0;
+        };
+        const bool is_model_word = (params.moe_stream == "model");
+        if (is_model_word && !has("-lm") && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
+            params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;
+        }
+
+        const bool g_prefill = params.moe_stream_fast_prefill != 0;
+        const bool g_decode  = params.moe_stream_fast_decode  != 0;
+        const bool g_cpu     = params.moe_stream_fast_cpu     != 0;
+        const bool g_vram    = params.moe_stream_vram_cache > 0 ||
+                               (params.moe_stream_vram_cache < 0 && params.n_gpu_layers != 0 && params.moe_stream_uma != 1);
+        const bool g_ram     = params.moe_stream_ram_cache    != 0;
+
+        if (ctx_arg.ex == LLAMA_EXAMPLE_SERVER) {
+            if (!has("-np")) {
+                params.n_parallel = 1;
+            }
+            if (g_ram && !has("-cram") && !params.cache_ram_explicit) {
+                params.cache_ram_mib = 0;
+                if (!has("--cache-idle-slots")) {
+                    params.cache_idle_slots = false;
+                }
+            }
+            if (g_decode && !has("-bs") && params.n_gpu_layers != 0) {
+                params.sampling.backend_sampling = true;
+            }
+        }
+
+        if (g_decode) {
+            const bool legacy_guess =
+                has("--moe-stream-oracle") ||
+                has("--moe-stream-chance-model") ||
+                has("--moe-stream-prefetch-lead") ||
+                has("--moe-stream-prefetch-inflight") ||
+                has("--moe-stream-early-order") ||
+                has("--moe-stream-read-threshold") ||
+                has("--moe-stream-demand-last") ||
+                (has("--moe-stream-prefetch") && params.moe_stream_prefetch == 0);
+
+            if (!has("--moe-stream-overlap"))        { params.moe_stream_overlap        = 1; }
+            if (!has("--moe-stream-proj-ready") && params.moe_stream_overlap == 1) {
+                params.moe_stream_proj_ready = 1;
+            }
+            if (!has("--moe-stream-io-wake"))        { params.moe_stream_io_wake        = 1; }
+            if (!has("--moe-stream-chunk-prefetch")) { params.moe_stream_chunk_prefetch = 512 * 1024; }
+            if (!has("--moe-stream-promote"))        { params.moe_stream_promote        = 1; }
+            if (!has("--moe-stream-guess-cap"))      { params.moe_stream_guess_cap      = 2; }
+            if (!has("--moe-stream-pred-shared"))    { params.moe_stream_pred_shared    = 1; }
+            if (!legacy_guess) {
+                if (!has("--moe-stream-plan")) { params.moe_stream_plan = 1; }
+                if (params.moe_stream_plan == 1) {
+                    if (!has("--moe-stream-drop-stale"))     { params.moe_stream_drop_stale     = 1; }
+                    if (!has("--moe-stream-needed-early"))   { params.moe_stream_needed_early   = 1; }
+                    if (!has("--moe-stream-lookahead"))      { params.moe_stream_lookahead      = 2; }
+                    if (!has("--moe-stream-guess-combined")) { params.moe_stream_guess_combined = 1; }
+                    if (!has("--moe-stream-wordstart"))      { params.moe_stream_wordstart      = 2; }
+                    if (!has("--moe-stream-protect-named"))  { params.moe_stream_protect_named  = 1; }
+                    if (!has("--moe-stream-guess-inflight") && params.moe_stream_promote == 1) {
+                        params.moe_stream_guess_inflight = 4;
+                    }
+                }
+            }
+            if (!has("--moe-stream-fused-route"))  { params.moe_stream_fused_route  = 1; }
+            if (!has("--moe-stream-conv-silu"))    { params.moe_stream_conv_silu    = 1; }
+            if (!has("--moe-stream-gpu-share-q8")) { params.moe_stream_gpu_share_q8 = 1; }
+            if (!has("--moe-stream-gpu-skip-zero")){ params.moe_stream_gpu_skip_zero= 1; }
+            if (!has("--moe-stream-async-h2d"))    { params.moe_stream_async_h2d    = 1; }
+            if (!has("--moe-stream-hc-share"))     { params.moe_stream_hc_share     = 1; }
+            if (!has("--moe-stream-hc-silu"))      { params.moe_stream_hc_silu      = 1; }
+            if (!has("--moe-stream-hc-q8"))        { params.moe_stream_hc_q8        = 1; }
+            if (!has("--moe-stream-rs-window"))    { params.moe_stream_rs_window    = 1; }
+            if (!has("--moe-stream-rs-inplace"))   { params.moe_stream_rs_inplace   = 1; }
+            if (!has("--moe-stream-ple-late"))     { params.moe_stream_ple_late     = 1; }
+            if (!has("--moe-stream-hip-mmvq"))     { params.moe_stream_auto_mask |= (1u << 4); }
+            if (!has("--moe-stream-hip-sync"))     { params.moe_stream_auto_mask |= (1u << 5); }
+            if (is_model_word && !has("--moe-stream-correction") && !legacy_guess) {
+                params.moe_stream_correction = "model";
+                params.moe_stream_auto_mask |= (1u << 2);
+            }
+        }
+
+        if (g_cpu) {
+            if (!has("--moe-stream-cpu-skip-zero"))    { params.moe_stream_cpu_skip_zero  = 1; }
+            if (!has("--moe-stream-cpu-x4"))           { params.moe_stream_cpu_x4         = 1; }
+            if (!has("--moe-stream-cpu-fuse"))         { params.moe_stream_cpu_fuse       = 1; }
+            if (!has("--moe-stream-cpu-dispatch"))     { params.moe_stream_cpu_dispatch   = 1; }
+            if (!has("--moe-stream-cpu-down-scale"))   { params.moe_stream_cpu_down_scale = 1; }
+            if (!has("--moe-stream-cpu-topk"))         { params.moe_stream_cpu_topk       = 1; }
+            if (!has("--moe-stream-cpu-q8-tiled"))     { params.moe_stream_cpu_q8_tiled   = 1; }
+            if (!has("--moe-stream-cpu-fa"))           { params.moe_stream_cpu_fa         = 1; }
+            if (!has("--moe-stream-cpu-mmid-merge"))   { params.moe_stream_cpu_mmid_merge = 1; }
+            if (!has("--moe-stream-cpu-iqk"))          { params.moe_stream_cpu_iqk        = 8; }
+            if (!has("--moe-stream-cpu-weighted-sum")) { params.moe_stream_cpu_wsum       = 1; }
+            if (!has("--moe-stream-cpu-small-ops"))    { params.moe_stream_cpu_small_ops  = 1; }
+        }
+
+        if (g_ram) {
+            if (!has("--moe-stream-policy"))     { params.moe_stream_policy     = "decay"; }
+            if (!has("--moe-stream-prompt-end")) { params.moe_stream_prompt_end = 1; }
+            if (!has("--moe-stream-idle-load") && is_model_word &&
+                !has("--moe-stream-slots") && !params.moe_stream_plan_only) {
+                params.moe_stream_idle_load = 2;
+            }
+        }
+
+        if (g_vram) {
+            if (!has("--moe-stream-vram-free") && !has("--moe-stream-vram-experts")) {
+                params.moe_stream_vram_free = 200LL << 20;
+                params.moe_stream_auto_mask |= (1u << 0);
+            }
+            const bool has_pool = params.moe_stream_vram_free > 0 || params.moe_stream_vram_experts > 0;
+            if (has_pool) {
+                if (is_model_word && !has("--moe-stream-vram-experts-file")) {
+                    params.moe_stream_vram_experts_file = "model";
+                    params.moe_stream_auto_mask |= (1u << 3);
+                }
+                if (!has("--moe-stream-vram-follow"))   { params.moe_stream_vram_follow   = 1; }
+                if (!has("--moe-stream-vram-parallel") && params.moe_stream_needed_early == 1) {
+                    params.moe_stream_vram_parallel = 1;
+                }
+                if (!has("--moe-stream-vram-copyback") && params.moe_stream_vram_follow == 1) {
+                    params.moe_stream_vram_copyback = 1;
+                }
+            }
+        }
+
+        if (g_prefill) {
+            if (!has("-b") && params.n_ctx >= 262144) {
+                params.n_batch = 1024;
+            }
+            if (!has("-ub")) {
+                params.n_ubatch = (params.n_ctx >= 262144)
+                    ? std::min<int32_t>(1024, params.n_batch)
+                    : std::min<int32_t>(2048, params.n_batch);
+            }
+            if (!has("--moe-stream-prefill-fast"))      { params.moe_stream_prefill_fast      = 1; }
+            if (!has("--moe-stream-layer-major"))       { params.moe_stream_layer_major       = 1; }
+            if (!has("--moe-stream-layer-major-batch")) { params.moe_stream_layer_major_batch = 32768; }
+            if (!has("--moe-stream-wave-plan"))         { params.moe_stream_wave_plan         = 1; }
+            if (!has("--moe-stream-read-ahead"))        { params.moe_stream_read_ahead        = 1; }
+            if (!has("--moe-stream-window") && params.moe_stream_layer_major == 1 && params.moe_stream_wave_plan == 1 &&
+                params.moe_stream_elastic == 0 && params.moe_stream_shares == 0 &&
+                params.moe_stream_hugepages == 0 && params.moe_stream_pin == 0 && params.moe_stream_uma == 0) {
+                params.moe_stream_window = 1;
+            }
+            if (!has("--moe-stream-prompt-defer") && params.moe_stream_overlap == 1) {
+                params.moe_stream_prompt_defer = 1;
+            }
+            if (!has("--moe-stream-gpu-waves"))          { params.moe_stream_gpu_waves          = 512; }
+            if (!has("--moe-stream-gpu-wave-skip-zero")) { params.moe_stream_gpu_wave_skip_zero = 1; }
+            if (params.moe_stream_vram_free > 0 || params.moe_stream_vram_experts > 0) {
+                if (!has("--moe-stream-prompt-split") && params.moe_stream_vram_parallel >= 1 &&
+                    params.moe_stream_needed_early == 1 && params.moe_stream_gpu_waves > 0) {
+                    params.moe_stream_prompt_split = 1;
+                }
+                if (params.moe_stream_vram_free > 0) {
+                    if (!has("--moe-stream-vram-end-fill")) { params.moe_stream_vram_end_fill = 1; }
+                    if (!has("--moe-stream-copy-ahead")) {
+                        params.moe_stream_copy_ahead = 1;
+                        params.moe_stream_auto_mask |= (1u << 1);
+                    }
+                    if (!has("--moe-stream-vram-lend-prompt") && params.moe_stream_vram_follow == 1) {
+                        params.moe_stream_vram_lend_prompt = 1;
+                    }
+                }
+            }
+        }
     }
 
     // A streaming setting that needs another one is switched off with one line and the model runs
@@ -1107,11 +1293,21 @@ static void common_params_print_usage(common_params_context & ctx_arg) {
         }
     };
 
+    const bool show_internal = ctx_arg.params.usage_internal ||
+        (getenv("LLAMA_HELP_INTERNAL") != nullptr && is_truthy(getenv("LLAMA_HELP_INTERNAL")));
+
     std::vector<common_arg *> common_options;
     std::vector<common_arg *> sampling_options;
     std::vector<common_arg *> spec_options;
     std::vector<common_arg *> specific_options;
+    std::vector<common_arg *> internal_options;
     for (auto & opt : ctx_arg.options) {
+        if (opt.is_internal) {
+            if (show_internal) {
+                internal_options.push_back(&opt);
+            }
+            continue;
+        }
         // in case multiple LLAMA_EXAMPLE_* are set, we prioritize the LLAMA_EXAMPLE_* matching current example
         if (opt.is_sampling) {
             sampling_options.push_back(&opt);
@@ -1136,6 +1332,11 @@ static void common_params_print_usage(common_params_context & ctx_arg) {
     print_section("sampling params",         sampling_options);
     print_section("speculative params",      spec_options);
     print_section("example-specific params", specific_options);
+    if (show_internal) {
+        print_section("internal moe-stream params", internal_options);
+    } else {
+        printf("\nNote: internal MoE streaming diagnostic/micro-flags are omitted; pass --help-internal to list them.\n");
+    }
 }
 
 static void common_params_print_completion(common_params_context & ctx_arg) {
@@ -1145,6 +1346,9 @@ static void common_params_print_completion(common_params_context & ctx_arg) {
     std::vector<common_arg *> specific_options;
 
     for (auto & opt : ctx_arg.options) {
+        if (opt.is_internal) {
+            continue;
+        }
         if (opt.is_sampling) {
             sampling_options.push_back(&opt);
         } else if (opt.is_spec) {
@@ -1489,6 +1693,13 @@ bool common_arg_utils::is_autoy(const std::string & value) {
     return value == "auto" || value == "-1";
 }
 
+static int32_t parse_moe_group_opt(const char * flag, const std::string & value) {
+    if (common_arg_utils::is_autoy(value))  { return -1; }
+    if (common_arg_utils::is_truthy(value)) { return  1; }
+    if (common_arg_utils::is_falsey(value)) { return  0; }
+    throw std::invalid_argument(string_format("error: unknown value for %s: '%s' (expected auto, 0, or 1)", flag, value.c_str()));
+}
+
 // Simple CSV parser that handles quoted fields and escaped quotes
 // example:
 //    input:  value1,"value, with, commas","value with ""escaped"" quotes",value4
@@ -1697,6 +1908,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "print usage and exit",
         [](common_params & params) {
             params.usage = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD}));
+    add_opt(common_arg(
+        {"--help-internal"},
+        "print usage including internal MoE streaming diagnostic and micro-tuning flags, then exit",
+        [](common_params & params) {
+            params.usage = true;
+            params.usage_internal = true;
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD}));
     add_opt(common_arg(
@@ -3469,20 +3688,55 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--moe-stream-fast-prefill"}, "[auto|0|1]",
+        "enable all layer-major, sliding-window, wave planner, copy-ahead, prompt-lending, and CUDA/ROCm prefill fast paths (default: auto = on with --moe-stream)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_fast_prefill = parse_moe_group_opt("--moe-stream-fast-prefill", value);
+        }
+    ).set_env("LLAMA_ARG_MOE_FAST_PREFILL"));
+    add_opt(common_arg(
+        {"--moe-stream-fast-decode"}, "[auto|0|1]",
+        "enable cross-layer router lookahead, late-bound priority I/O, projection-ready overlap, fused routing, shared Q8_1 inputs, and embedded correction (default: auto = on with --moe-stream)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_fast_decode = parse_moe_group_opt("--moe-stream-fast-decode", value);
+        }
+    ).set_env("LLAMA_ARG_MOE_FAST_DECODE"));
+    add_opt(common_arg(
+        {"--moe-stream-fast-cpu"}, "[auto|0|1]",
+        "enable SIMD x4/iqk CPU expert kernels, fused gate+up+SwiGLU, zero-slice skip, tiled Q8_0/FA, and CPU-layer op fusions (default: auto = on with --moe-stream)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_fast_cpu = parse_moe_group_opt("--moe-stream-fast-cpu", value);
+        }
+    ).set_env("LLAMA_ARG_MOE_FAST_CPU"));
+    add_opt(common_arg(
+        {"--moe-stream-vram-cache"}, "[auto|0|1]",
+        "enable dynamic hot-expert VRAM pool with follower, parallel CPU/GPU execution, copyback, and automatic whole-layer budgeting (default: auto = on with --moe-stream on discrete GPUs)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_vram_cache = parse_moe_group_opt("--moe-stream-vram-cache", value);
+        }
+    ).set_env("LLAMA_ARG_MOE_VRAM_CACHE"));
+    add_opt(common_arg(
+        {"--moe-stream-ram-cache"}, "[auto|0|1]",
+        "enable decayed RAM slot residency, prompt-end recency retention, and startup warm preload on TokenWing model files (default: auto = on with --moe-stream)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_ram_cache = parse_moe_group_opt("--moe-stream-ram-cache", value);
+        }
+    ).set_env("LLAMA_ARG_MOE_RAM_CACHE"));
+    add_opt(common_arg(
         {"--moe-stream-slots"}, "N",
         "expert slots per MoE layer for --moe-stream, must be >= 3*moe_expert_used and <= the number of "
         "experts a layer has (default: as many as the RAM budget pays for, see --moe-stream-ram)",
         [](common_params & params, int value) {
             params.moe_stream_slots = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-log"}, "PATH",
         "write a per-token miss log of --moe-stream to PATH",
         [](common_params & params, const std::string & value) {
             params.moe_stream_log = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-io-threads"}, "N",
         "number of threads that read the expert sidecar for --moe-stream (default: 8)",
@@ -3499,7 +3753,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_gpu_waves = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-gpu-layers"}, "N",
         "keep the routed experts of N whole MoE layers on the GPU instead of streaming them: they are "
@@ -3521,7 +3775,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.moe_stream_gpu_layers_list = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-gpu-layers-device"}, "DEV=LIST",
         "whole MoE layers whose routed experts sit on GPU DEV (a name as --list-devices prints it), whatever device holds the rest of "
@@ -3559,7 +3813,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.moe_stream_other_rest = (int64_t) moe_stream_parse_size(value);
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_internal());
     add_opt(common_arg(
         {"--moe-stream-vram-reserve"}, "SIZE",
         "VRAM to keep free for the KV cache, the compute buffers and the driver when --moe-stream-gpu-layers "
@@ -3568,7 +3822,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.moe_stream_vram_reserve = (int64_t) moe_stream_parse_size(value);
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-gpu-layers-mode"}, "MODE",
         "which layers --moe-stream-gpu-layers (negative) keeps on the GPU: 'hot' takes the ones a census "
@@ -3582,7 +3836,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.moe_stream_gpu_layers_mode = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-hugepages"}, "0|1",
         "allocate the expert pools 2 MiB-aligned and madvise(MADV_HUGEPAGE) them, so that a 3.13 MB expert "
@@ -3591,7 +3845,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_hugepages = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-pin"}, "0|1",
         "register the expert pools with the CUDA driver (cudaHostRegister) so that RAM->VRAM copies run at "
@@ -3601,7 +3855,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_stream_pin     = value;
             params.moe_stream_pin_set = true;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-policy"}, "NAME",
         "how a layer's pool evicts: 'lru' (default), 'lfu' (the expert used most often, with every "
@@ -3612,7 +3866,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.moe_stream_policy = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-pred-shared"}, "0|1",
         "predict the next layer's experts from the residual plus the *shared* expert's output of this "
@@ -3622,7 +3876,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_pred_shared = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-pred-recall"}, "0|1",
         "count recall@8 of the layer-ahead expert guess: the guessed top-8 of layer L+1 is scored against "
@@ -3631,7 +3885,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_pred_recall = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-pred-scores"}, "PREFIX",
         "write the layer-ahead guess's router scores for ALL experts of every generated word and MoE "
@@ -3641,7 +3895,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.moe_stream_pred_scores = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-pred-input"}, "PREFIX",
         "record the vector the next layer's router is run on - with --moe-stream-pred-shared 1 the normed "
@@ -3653,7 +3907,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.moe_stream_pred_input = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-pred-input-every"}, "N",
         "with --moe-stream-pred-input: record 1 generated word in N (default 8). N = 1 records every "
@@ -3661,7 +3915,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_pred_input_every = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-record"}, "DIR",
         "write the side-by-side recording of every decode word and streamed layer into DIR: "
@@ -3672,7 +3926,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.moe_stream_record = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-record-words"}, "N",
         "with --moe-stream-record: keep at most N decode words (default 1024, ~0.33 MiB of RAM per word on "
@@ -3680,7 +3934,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_record_words = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-overlap"}, "0|1",
         "compute a layer's experts whose bytes have already landed while the missing ones are still "
@@ -3691,7 +3945,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_overlap = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-chunk"}, "KiB",
         "split every demand read of an expert into chunks of this many bytes, so that the I/O "
@@ -3703,7 +3957,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             const int64_t bytes = std::max<int64_t>(0, (int64_t) value) * 1024;
             params.moe_stream_chunk = (int32_t) std::min<int64_t>(bytes, (int64_t) 2*1024*1024*1024 - 1);
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-chunk-prefetch"}, "KiB",
         "the same for a prefetch read, which is not on the critical path (default: 0 = one read "
@@ -3712,21 +3966,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             const int64_t bytes = std::max<int64_t>(0, (int64_t) value) * 1024;
             params.moe_stream_chunk_prefetch = (int32_t) std::min<int64_t>(bytes, (int64_t) 2*1024*1024*1024 - 1);
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-prefetch"}, "0|1",
         "prefetch the experts that the next layer's router predicts (default: 1)",
         [](common_params & params, int value) {
             params.moe_stream_prefetch = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-prefetch-m"}, "M",
         "experts predicted per token for the next MoE layer (default: 0 = the model's experts per token, e.g. 8 on Ling, 6 on Flint)",
         [](common_params & params, int value) {
             params.moe_stream_prefetch_m = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-prefetch-lead"}, "N",
         "MoE layers of lead for the expert prefetcher: 1 predicts the next layer only (default), "
@@ -3734,7 +3988,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_prefetch_lead = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-prefetch-m2"}, "M",
         "experts the correction of a two-layer-lead guess covers (default: 0, the same as "
@@ -3742,7 +3996,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_prefetch_m2 = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-demand-last"}, "BOOL",
         "let a queued prefetched read overtake a demand read (default: false, i.e. a demand read, "
@@ -3750,7 +4004,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_demand_last = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-prefetch-inflight"}, "N",
         "cap the guessed reads in flight at once (default: 0, no cap). Measured on one drive that "
@@ -3759,7 +4013,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_prefetch_inflight = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-early-order"}, "BOOL",
         "make this layer's expert ids depend on the early-guess op, so the guess is issued before the "
@@ -3768,7 +4022,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_early_order = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-io-wake"}, "read|chunk",
         "how many I/O threads a queued read wakes: one per read (default) or one per chunk, so the chunks of a guess run in parallel",
@@ -3779,7 +4033,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_io_wake = value == "chunk" ? 1 : 0;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-plan"}, "0|1",
         "1 = a decode word's 1-ahead guess puts its experts on a waiting list, and an I/O thread takes a RAM slot "
@@ -3794,7 +4048,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_plan = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-plan-bind-early"}, "0|1",
         "TEST ONLY: with --moe-stream-plan 1, every list entry takes its slot and queues its read the moment it is "
@@ -3807,7 +4061,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_plan_bind_early = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-drop-stale"}, "0|1",
         "with --moe-stream-plan 1, when a layer starts, its waiting-list entries it did not pick are removed (never "
@@ -3821,7 +4075,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_drop_stale = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-needed-early"}, "0|1",
         "with --moe-stream-plan 1, a decode word's 1-ahead guess is handed to a helper thread that makes "
@@ -3835,7 +4089,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_needed_early = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-behind-backlog"}, "B",
         "with --moe-stream-plan 1 and --moe-stream-behind-rank, the drive counts as behind while B or more reads (needed "
@@ -3849,7 +4103,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_behind_backlog = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-behind-rank"}, "R",
         "with --moe-stream-behind-backlog: while the drive is behind, waiting-list entries whose rank in their guess "
@@ -3862,7 +4116,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_behind_rank = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-guess-top"}, "K",
         "with --moe-stream-plan 1, a decode word's 1-ahead guess puts its first K ranks on the waiting list: ranks 1..k "
@@ -3877,7 +4131,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_guess_top = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-lookahead"}, "N",
         "each streamed layer also guesses the streamed layers 2..N ahead (the recorder's lead-d guess: the target's router "
@@ -3894,7 +4148,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_stream_lookahead = value;
             params.moe_stream_lookahead_set = true;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-guess-pace"}, "B",
         "with --moe-stream-lookahead N > 1, a far guess (2 or more layers ahead) adds at most B new waiting-list entries "
@@ -3907,7 +4161,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_guess_pace = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-plan-old-order"}, "0|1",
         "TEST ONLY: with --moe-stream-lookahead N > 1, the waiting list's old order (one class, no live / "
@@ -3920,7 +4174,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_plan_old_order = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-plan-extra-near"}, "0|1",
         "TEST ONLY: with --moe-stream-lookahead N > 1, order A - a target's extra ranks (k+1..K) right after its top k, "
@@ -3933,7 +4187,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_plan_extra_near = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-guess-combined"}, "0|1",
         "with --moe-stream-lookahead N > 1, a layer's N guesses in one step - one norm, one multiply by the N targets' "
@@ -3947,7 +4201,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_guess_combined = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-protect-named"}, "0|1",
         "with --moe-stream-plan 1, while a streamed layer has not started in this decode word, a READY expert that a guess "
@@ -3961,7 +4215,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_protect_named = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-wordstart"}, "D",
         "in a decode word of one token, the last D layers before the first streamed layer (VRAM MoE layers, or dense "
@@ -3976,7 +4230,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_wordstart = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-proj-ready"}, "0|1",
         "each RAM slot has a ready flag per projection (gate, up, down), and a needed read is issued as two requests, "
@@ -3990,7 +4244,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_proj_ready = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-guess-inflight"}, "G",
         "with --moe-stream-plan 1, while no needed read is in service, a reader starts a guess piece or binds a list "
@@ -4003,21 +4257,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_guess_inflight = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-promote"}, "BOOL",
         "a needed expert whose guess read has chunks still queued moves them to the needed-read queue (default: false)",
         [](common_params & params, int value) {
             params.moe_stream_promote = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-guess-cap"}, "N",
         "while a needed read is queued or running, at most N guess chunks are read at the same time (default: -1 = no cap)",
         [](common_params & params, int value) {
             params.moe_stream_guess_cap = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-guess-cap-refill"}, "BOOL",
         "with --moe-stream-guess-cap: a finished guess chunk wakes a sleeping I/O thread for the freed place while needed reads "
@@ -4025,7 +4279,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_guess_cap_refill = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-evict-halflife"}, "W",
         "with --moe-stream-policy decay: decode words after which a use counts half (default: 64)",
@@ -4037,7 +4291,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_evict_halflife = v;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-evict-credit"}, "C",
         "with --moe-stream-policy decay: value added to an expert the 1-ahead guess ranked in its top 16 but the layer did not choose (default: 0)",
@@ -4049,7 +4303,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_evict_credit = v;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-prompt-end"}, "first-use|recency",
         "wave order of a prompt's last ubatch: first-use (default) or recency (the experts the end of the prompt used most go last, so they stay in RAM for the reply)",
@@ -4060,7 +4314,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_prompt_end = value == "recency" ? 1 : 0;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-prompt-end-halflife"}, "T",
         "with --moe-stream-prompt-end recency: tokens before the end of the prompt after which a use counts half (default: 128)",
@@ -4072,7 +4326,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_prompt_end_halflife = v;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-prompt-values"}, "BOOL",
         "with --moe-stream-policy decay: a prompt's expert uses count as decode words would (each use weighs 2^(-tokens to the "
@@ -4080,14 +4334,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_prompt_values = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-chance-model"}, "FILE",
         "probability table (JSON) for the 1-ahead guess: read every candidate not in RAM whose probability is at least --moe-stream-read-threshold, best first, instead of the top --moe-stream-prefetch-m (default: off)",
         [](common_params & params, const std::string & value) {
             params.moe_stream_chance_model = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-read-threshold"}, "P",
         "with --moe-stream-chance-model: the probability a 1-ahead candidate needs to be read (default: 0.3)",
@@ -4099,7 +4353,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_read_threshold = v;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-cpu-skip-zero"}, "0|1",
         "a ubatch that runs in waves on the CPU gives every (token, expert) pair outside the wave one of the pool's "
@@ -4113,7 +4367,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_cpu_skip_zero = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-slot-check"}, "0|1",
         "1 = an expert of a MoE layer that has no RAM slot when its matmul runs stops the run with a message (layer, expert, "
@@ -4127,7 +4381,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_slot_check = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-wave-plan"}, "0|1",
         "1 = a ubatch that runs in waves gets its waves from a plan built once at the first wave: the experts already in RAM "
@@ -4142,7 +4396,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_wave_plan = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-wave-victim"}, "0|1",
         "1 = in a ubatch that runs in waves, a slot keeps its wave mark until the call's last wave, so a later wave takes the "
@@ -4155,7 +4409,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_wave_victim = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-vram-experts"}, "N",
         "keep the first N experts of every streamed MoE layer's ranked list (--moe-stream-vram-experts-file) in VRAM: the "
@@ -4170,7 +4424,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_vram_experts = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-vram-experts-file"}, "FNAME",
         "the ranked expert list per MoE layer for --moe-stream-vram-experts (JSON, format \"tokenwing vram-experts v1\", made by "
@@ -4179,7 +4433,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.moe_stream_vram_experts_file = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-vram-experts-margin"}, "SIZE",
         "VRAM that must still be free after the VRAM expert pool and the compute buffers, e.g. 512MiB; the run stops "
@@ -4187,7 +4441,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.moe_stream_vram_experts_margin = (int64_t) moe_stream_parse_size(value);
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-vram-free"}, "SIZE|DEV=SIZE,...",
         "size the VRAM experts pool from the free VRAM instead of a pinned N: N per streamed layer = the largest count that still "
@@ -4216,7 +4470,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.moe_stream_vram_scratch = (int64_t) moe_stream_parse_size(value);
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-vram-growth"}, "SIZE",
         "with --moe-stream-vram-free: the VRAM the CUDA runtime still adds after the load-time check (op scratch buffers of the "
@@ -4226,7 +4480,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.moe_stream_vram_growth = (int64_t) moe_stream_parse_size(value);
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-correction"}, "FNAME",
         "the trained correction file of the router-trick guess (tokenwing-tools/correction/make_correction.py). "
@@ -4241,7 +4495,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.moe_stream_correction = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-idle-load"}, "0|1|2",
         "1 = idle-time loading: after the model is loaded, and after every request once no call has come for --moe-stream-idle-pause, "
@@ -4261,7 +4515,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_idle_load = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-usage-file"}, "FNAME",
         "the usage table of --moe-stream-idle-load (\"tokenwing usage v1\"; default: next to the sidecar, <sidecar>.usage.json; "
@@ -4270,7 +4524,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.moe_stream_usage_file = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-idle-pause"}, "MS",
         "with --moe-stream-idle-load 1 or 2, no call for this many milliseconds = idle (default: 500)",
@@ -4282,7 +4536,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_idle_pause_ms = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-read-ahead"}, "0|1",
         "1 = read-ahead in big prompt calls (calls of at least --moe-stream-read-ahead-min tokens, which use most of every layer's "
@@ -4298,7 +4552,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_read_ahead = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-read-ahead-min"}, "N",
         "--moe-stream-read-ahead only in calls of at least N tokens (default: 4096)",
@@ -4310,7 +4564,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_read_ahead_min = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-window"}, "0|1",
         "1 = in a layer-major prompt call of at least --moe-stream-read-ahead-min tokens whose layers need more than one wave, the RAM "
@@ -4327,7 +4581,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_window = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-window-keep"}, "F",
         "with --moe-stream-window 1, a finished layer keeps F x its share during the call (0 < F <= 1) and the rest is read "
@@ -4340,7 +4594,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_window_keep = f;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-prompt-defer"}, "0|1",
         "1 = a prompt call whose expert matmuls run on the CPU (CPU-only, and on a GPU machine the CPU waves under "
@@ -4354,7 +4608,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_prompt_defer = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-prompt-split"}, "0|1",
         "1 = in a prompt call whose expert matmuls run on the CPU (under --moe-stream-gpu-waves), the GPU "
@@ -4370,7 +4624,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_prompt_split = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-prompt-split-places"}, "N",
         "with --moe-stream-prompt-split 1, the VRAM tail places a prompt call borrows (the lowest-value experts' places; "
@@ -4384,7 +4638,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_prompt_split_places = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-gpu-wave-skip-zero"}, "0|1",
         "1 = a GPU prompt matmul over expert waves (the scheduler's per-wave copy) or the VRAM pool's prompt pass skips the "
@@ -4398,7 +4652,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_gpu_wave_skip_zero = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-vram-follow"}, "0|1",
         "with --moe-stream-vram-experts N, the VRAM expert pool moves with the text: while a reply is "
@@ -4413,7 +4667,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_vram_follow = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-vram-follow-tick"}, "N",
         "a tick (the swaps) every N reply words (default: 8)",
@@ -4425,7 +4679,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_vram_follow_tick = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-vram-follow-swaps"}, "N",
         "at most N swaps per tick (default: 64)",
@@ -4437,7 +4691,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_vram_follow_swaps = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-vram-follow-recent"}, "N",
         "the recent pick count (the rank) is halved every N reply words (default: 256)",
@@ -4449,7 +4703,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_vram_follow_recent = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-vram-follow-longterm"}, "N",
         "the long-term pick count (the tie-break) is halved every N reply words (default: 1024)",
@@ -4461,7 +4715,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_vram_follow_longterm = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-vram-follow-ratio"}, "R",
         "a swap needs the incoming expert's recent count > floor(R x the leaving one's) + --moe-stream-vram-follow-margin "
@@ -4474,7 +4728,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_vram_follow_ratio = r;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-vram-follow-margin"}, "N",
         "the margin of the swap rule (default: 4)",
@@ -4486,7 +4740,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_vram_follow_margin = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-vram-follow-fixed"}, "0|1",
         "test only: every decided swap is switched at the next call start, copying there (from the RAM slot, or the "
@@ -4499,7 +4753,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_vram_follow_fixed = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-vram-follow-pinned"}, "0|1",
         "the uploader copies through a pinned bounce buffer; 0 = straight from the RAM slot (default: 1)",
@@ -4511,7 +4765,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_vram_follow_pinned = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-vram-parallel"}, "0|1|2",
         "with --moe-stream-vram-experts (with or without --moe-stream-vram-follow) and --moe-stream-needed-early 1, "
@@ -4529,7 +4783,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_vram_parallel = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-vram-copyback"}, "0|1",
         "with --moe-stream-vram-follow 1, an expert that leaves VRAM follow's set is copied back GPU -> RAM into its "
@@ -4543,7 +4797,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_vram_copyback = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-async-h2d"}, "0|1",
         "with --moe-stream (no pipeline parallelism; one or more GPUs), a CPU split's output that lies in the GPU's pinned "
@@ -4557,7 +4811,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_async_h2d = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-tail-wave-w"}, "N",
         "with --moe-stream-vram-free and --moe-stream-vram-follow 1: cap GPU tail-wave width to N experts (e.g. 64) "
@@ -4565,7 +4819,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_tail_wave_w = std::max(0, value);
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-vram-chunk"}, "SIZE",
         "with --moe-stream-vram-experts / --moe-stream-vram-free: split the VRAM expert pool into buffers of "
@@ -4585,7 +4839,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.moe_stream_vram_chunk = v;
             }
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-uma"}, "0|1",
         "unified-memory GPUs (integrated GPUs, Apple): the GPU's weights and whole MoE layers are counted in the "
@@ -4618,7 +4872,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_hip_mmvq = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-hip-sync"}, "N",
         "ROCm: before a GPU stream sync or a wait for one of the engine's GPU marks, spin up to N microseconds on "
@@ -4631,7 +4885,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_hip_sync = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-gpu-skip-zero"}, "0|1",
         "with --moe-stream-vram-experts: the GPU's one-token expert matmul writes 0 for the pairs that name one of the VRAM "
@@ -4644,7 +4898,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_gpu_skip_zero = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-cpu-x4"}, "0|1|2",
         "the CPU expert matmul on plain MXFP4, IQ4_XS, Q3_K, Q4_0 and Q2_0 pools: 0 = one row per call (ggml's kernel), 1 = a 4-row "
@@ -4658,7 +4912,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_cpu_x4 = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-cpu-x4-prefetch"}, "next|none|N",
         "software prefetch of the --moe-stream-cpu-x4 kernel: next = the same block of the next 4-row group, none, or N = "
@@ -4678,7 +4932,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.moe_stream_cpu_x4_pf = n;
             }
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-cpu-fuse"}, "0|1",
         "1 = for one token, the CPU runs the MoE gate matmul, up matmul and SwiGLU as one step (activation quantized once, "
@@ -4691,7 +4945,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_cpu_fuse = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-cpu-dispatch"}, "0|1",
         "1 = for one token, the CPU's expert matmul (mul_mat_id) splits its work as ik_llama.cpp does: one chunk queue "
@@ -4705,7 +4959,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_cpu_dispatch = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-cpu-pieces"}, "N",
         "for one token, the CPU's expert steps (the fused gate/up step of --moe-stream-cpu-fuse 1 and the split of "
@@ -4720,7 +4974,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_cpu_pieces = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-cpu-conv1"}, "0|1",
         "1 = for one token, the CPU's expert steps (as --moe-stream-cpu-pieces) convert the token's activation row to the "
@@ -4734,7 +4988,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_cpu_conv1 = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-cpu-weighted-sum"}, "0|1",
         "1 = with --moe-stream: in a layer whose MoE tail runs on the CPU (-ngl 0, a CPU-only machine, the layers -ngl N "
@@ -4751,7 +5005,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_cpu_wsum = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-cpu-iqk"}, "N",
         "N > 0 = with --moe-stream: the CPU's picked-expert matmul (MUL_MAT_ID) in calls of 32+ tokens uses ik_llama.cpp's kernels (x86, AVX2 or AVX-512) for each "
@@ -4765,7 +5019,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_cpu_iqk = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-cpu-mmid-merge"}, "0|1",
         "1 = with --moe-stream: the CPU's tiled picked-expert matmul (MUL_MAT_ID, prompts) runs a thread's consecutive 64-row weight "
@@ -4779,7 +5033,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_cpu_mmid_merge = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-guess-skip-full"}, "0|1",
         "1 = with --moe-stream: a reply word's combined guess skips the target layers that hold every expert in RAM (all READY; "
@@ -4794,7 +5048,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_guess_skip_full = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-nonpool-measured"}, "0|1",
         "1 = the memory held back outside the expert pools comes from this run's own needs: the KV cache, the host compute buffers and the "
@@ -4809,14 +5063,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_nonpool_measured = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-nonpool-growth"}, "SIZE",
         "with --moe-stream-nonpool-measured 1: bytes held back on top of the record (default: 128MiB)",
         [](common_params & params, const std::string & value) {
             params.moe_stream_nonpool_growth = moe_stream_parse_size(value);
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-guess-skip-full-gpu"}, "0|1",
         "1 = with --moe-stream-guess-skip-full 1 on a GPU machine: the GPU's combined guess (its router rows) and its top-k skip the "
@@ -4830,7 +5084,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_guess_skip_full_gpu = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-cpu-fuse-small"}, "MASK",
         "with --moe-stream: fewer small CPU steps, the same results. A sum of: 1 = a reply's router chain (sigmoid, top-k, get_rows, "
@@ -4845,7 +5099,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_cpu_fuse_small = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-cpu-fa"}, "0|1|2",
         "with --moe-stream: CPU flash attention with a q8_0 K and V cache. 0 = as before; 1 = prompts take the tiled path (each K / V "
@@ -4860,7 +5114,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_cpu_fa = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-cpu-q8-tiled"}, "N",
         "with --moe-stream: q8_0 weights (attention, shared experts, dense layers, output head) take the CPU's tiled matmul "
@@ -4871,7 +5125,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_cpu_q8_tiled = std::max(value, 0);
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-cpu-topk"}, "0|1",
         "1 = with --moe-stream on a machine with no GPU device: the router's and the guesses' top-k pick reads each row once and "
@@ -4886,7 +5140,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_cpu_topk = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-cpu-down-scale"}, "0|1",
         "1 = with --moe-stream: skip the down projection's input scale step of mistral4 / mellum / flint (#30861: the input divided "
@@ -4903,7 +5157,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_cpu_down_scale = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-cpu-state-inplace"}, "0|1",
         "1 = with --moe-stream: in a linear-attention layer (Gated DeltaNet / KDA) on the CPU device (-ngl 0, a CPU-only "
@@ -4919,7 +5173,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_cpu_state_inplace = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-cpu-small-ops"}, "0|1",
         "1 = with --moe-stream: on the CPU, the grouped expert pick (--moe-stream-fused-route's op) takes the top k from the "
@@ -4933,7 +5187,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_cpu_small_ops = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-fused-route"}, "0|1",
         "the expert selection of every router and every 1-ahead guess (selection bias, expert groups, top k) as one "
@@ -4947,7 +5201,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_fused_route = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-conv-silu"}, "0|1",
         "Ling (bailingmoe3) KDA layers: apply the conv's SiLU before the reshape instead of after it, so the CUDA "
@@ -4961,7 +5215,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_conv_silu = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-hc-share"}, "0|1",
         "hyper-connection models (qwen4exp) with --moe-stream-pred-shared 1: the 2*sigmoid(inject) weights of a layer's FFN "
@@ -4975,7 +5229,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_hc_share = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-rs-window"}, "0|1",
         "qwen4exp delta-net layers, reply graphs with the GPU producer (--moe-stream-needed-early 1): the next delta-net "
@@ -4990,7 +5244,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_rs_window = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-ple-late"}, "0|1",
         "qwen4exp: the n-gram embedding rows (the per-layer table one layer reads, memory-mapped from the model file) are "
@@ -5004,7 +5258,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_ple_late = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-hc-silu"}, "0|1",
         "hyper-connection models (qwen4exp): each mix's 1/hc scale and the SiLU after it are marked for the CUDA backend, "
@@ -5017,7 +5271,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_hc_silu = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-prefill-fast"}, "0|1",
         "1 = turn on the CUDA/ROCm prefill fast paths together (--moe-stream-mmq-moe-opt, --moe-stream-gpu-moe-fused, "
@@ -5026,7 +5280,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_prefill_fast = std::min(std::max(value, 0), 1);
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-mmq-moe-opt"}, "0|1",
         "CUDA MMQ: size batched expert tiles against average tokens per expert instead of total batch tokens and skip "
@@ -5034,7 +5288,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_mmq_moe_opt = std::min(std::max(value, 0), 1);
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-gpu-moe-fused"}, "0|1",
         "CUDA MoE prefill: fuse gate, up, GLU, INT8 re-quantization and down projection across dual dense/sparse tile "
@@ -5042,7 +5296,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_gpu_moe_fused = std::min(std::max(value, 0), 1);
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-pinned-ring"}, "SIZE",
         "stage GPU tail-wave expert copies through a reusable pinned host ring of SIZE bytes (auto or 1 = 256MiB) "
@@ -5058,7 +5312,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.moe_stream_pinned_ring = v;
             }
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-lm-bf16"}, "0|1",
         "with --moe-stream-layer-major 1: keep the call's inter-group hidden state (lm_hid / lm_moe) in BF16 instead of "
@@ -5066,7 +5320,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_lm_bf16 = std::min(std::max(value, 0), 1);
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-lend-output"}, "0|1",
         "with --moe-stream-layer-major 1: lend an untied VRAM output.weight buffer to the call's layer-major tensors "
@@ -5074,7 +5328,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_lend_output = std::min(std::max(value, 0), 1);
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-qsa-fused"}, "0|1",
         "qwen4exp sparse attention: gather sorted selected KV pools directly in a GQA-transposed CUDA kernel without "
@@ -5082,7 +5336,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_qsa_fused = std::min(std::max(value, 0), 1);
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-hc-fused"}, "0|1",
         "qwen4exp hyper-connections: fuse the low-rank up projection and gated stream mix in registers on CUDA without "
@@ -5090,7 +5344,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_hc_fused = std::min(std::max(value, 0), 1);
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-ple-fast"}, "0|1",
         "qwen4exp per-layer embeddings: deduplicate and LBA-sort n-gram row gathers through a host cache, upload unique "
@@ -5098,7 +5352,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_ple_fast = std::min(std::max(value, 0), 1);
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-hybrid-tail"}, "K",
         "in GPU tail-wave prompts of <= 2048 tokens, compute RAM-resident experts routed by at most K tokens on CPU "
@@ -5106,7 +5360,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_hybrid_tail = std::max(0, value);
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-hc-q8"}, "0|1",
         "hyper-connection models (qwen4exp), CUDA with --moe-stream-gpu-share-q8 1: each mix's grouped norm also writes the "
@@ -5120,7 +5374,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_hc_q8 = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-rs-inplace"}, "0|1",
         "qwen4exp delta-net layers, reply graphs of one sequence whose recurrent state stays in its own cache row: the delta "
@@ -5135,7 +5389,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_rs_inplace = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-gpu-share-q8"}, "0|1",
         "CUDA: matvecs (one to eight rows) that read exactly the same input bytes in one graph compute share one "
@@ -5149,7 +5403,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_gpu_share_q8 = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-probation"}, "BOOL",
         "make a prefetched slot that nobody used the first eviction victim (default: false, i.e. "
@@ -5157,7 +5411,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_probation = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-max-waves"}, "N",
         "cap the expert waves a ubatch and layer is split into (default: 0, the bound that is always enough). "
@@ -5167,7 +5421,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_max_waves = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-ram"}, "SIZE",
         "RAM budget for the --moe-stream expert pools, e.g. 20GiB; the slots per MoE layer follow from it. "
@@ -5209,7 +5463,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.moe_stream_ram_margin = (int64_t) moe_stream_parse_size(value);
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-elastic-opts"}, "K=V,...",
         "elastic RAM tunables: keep=SIZE free-RAM trigger floor, gap=SIZE deadband above keep (512MiB), again=SIZE free RAM needed to start taking back (keep+1GiB), "
@@ -5220,7 +5474,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.moe_stream_elastic_opts = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-shares"}, "0|1",
         "1 = slot shares per layer that adapt: one slot at a time (1 % steps) moves from the layer that would "
@@ -5234,14 +5488,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_shares = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-share-file"}, "FNAME",
         "with --moe-stream-shares 1: the starting split, one line 'slots <model layer> <slots>' per layer (default: equal shares)",
         [](common_params & params, const std::string & value) {
             params.moe_stream_share_file = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-share-opts"}, "K=V,...",
         "slot-share tunables: step=PCT of the giving layer per move (1), every=N decode words between checks (64), "
@@ -5251,7 +5505,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.moe_stream_share_opts = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-layer-major"}, "0|1",
         "1 = a prompt call of 2 or more ubatches runs layer by layer: every ubatch through one layer, then every ubatch through the "
@@ -5262,7 +5516,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_layer_major = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-layer-major-batch"}, "N",
         "with --moe-stream-layer-major 1 the engine raises -b to the context size; N > 0 caps that raise at N tokens per call (a "
@@ -5273,7 +5527,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_layer_major_batch = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-vram-end-fill"}, "N",
         "with --moe-stream-vram-free's pool tail (a GPU-wave prompt empties it): 1 = refill the tail's free places at the end of the call "
@@ -5288,7 +5542,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_vram_end_fill = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-copy-ahead"}, "0|1|2|3",
         "with --moe-stream-vram-free's pool tail, GPU prompts copy the next wave's / layer's experts into the tail while this wave "
@@ -5305,7 +5559,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_copy_ahead = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-vram-lend-prompt"}, "0|1",
         "with --moe-stream-vram-free's GPU expert pool and --moe-stream-vram-follow, a prompt call's GPU compute buffer (ggml's "
@@ -5318,7 +5572,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_vram_lend_prompt = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-vram-lend-short"}, "N",
         "with --moe-stream-vram-lend-prompt 1: prompt calls of at most N tokens (a short follow-up message) run in the real "
@@ -5330,7 +5584,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_vram_lend_short = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-timing"}, "0|1",
         "1 = with --moe-stream: measure where the time of every call goes - the host backend's compute, the device's kernels "
@@ -5360,7 +5614,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.moe_stream_out_check = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-cpu-repack"}, "BOOL",
         "keep the expert pools in llama.cpp's repacked CPU layout, so the expert MUL_MAT_ID uses the repacked CPU "
@@ -5370,7 +5624,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_cpu_repack = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-verify"}, "BOOL",
         "byte-compare one filled expert slot of every streamed layer, and one expert of a whole layer "
@@ -5383,7 +5637,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_verify = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-plan-only"},
         "print the plan of --moe-stream (slots, pool RAM, streamed layers) and stop, loading nothing",
@@ -5398,7 +5652,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.moe_stream_oracle = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-oracle-lead"}, "N",
         "how many MoE layers the oracle looks ahead, in MoE layers (default: 1); N = n_moe_layers is one "
@@ -5406,7 +5660,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.moe_stream_oracle_lead = value;
         }
-    ));
+    ).set_internal());
     add_opt(common_arg(
         {"--dump-router-input"},
         "llama-moe-trace: also dump the input vector of every router",

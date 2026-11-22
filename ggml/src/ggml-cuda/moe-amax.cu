@@ -37,15 +37,8 @@ static __global__ void k_moe_amax_div(const float * x, float * __restrict__ e_ou
 }
 
 bool ggml_cuda_fuse_amax_on() {
-    static const bool on = [] {
-        const char * v = getenv("GGML_CUDA_FUSE_AMAX");
-        const bool r = v != nullptr && atoi(v) != 0;
-        if (r) {
-            fprintf(stderr, "%s: GGML_CUDA_FUSE_AMAX=1: the down-input scale chain (#30861: ABS .. DIV) runs as one kernel\n", __func__);
-        }
-        return r;
-    }();
-    return on;
+    static const char * v = getenv("GGML_CUDA_FUSE_AMAX");
+    return v != nullptr ? atoi(v) != 0 : ggml_cuda_prefill_fast_defaults_on();
 }
 
 static float op_param_f(const ggml_tensor * t, int k) {

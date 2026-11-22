@@ -1853,6 +1853,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     {
         const bool fast = params.moe_stream_prefill_fast == 1;
         uint32_t cuda_pf_flags = 0;
+        if (fast)                                   { cuda_pf_flags |= (1u << 5); }
         if (fast || params.moe_stream_mmq_moe_opt   == 1) { cuda_pf_flags |= (1u << 0); }
         if (fast || params.moe_stream_gpu_moe_fused == 1) { cuda_pf_flags |= (1u << 1); }
         if (fast || params.moe_stream_qsa_fused     == 1) { cuda_pf_flags |= (1u << 2); }

@@ -836,15 +836,8 @@ void ggml_cuda_op_rms_norm_mul_rows_q8_1(ggml_backend_cuda_context & ctx, ggml_t
 }
 
 bool ggml_cuda_fuse_norm_q8_on() {
-    static const bool on = [] {
-        const char * v = getenv("GGML_CUDA_FUSE_NORM_QUANT");
-        const bool r = v != nullptr && atoi(v) != 0;
-        if (r) {
-            fprintf(stderr, "%s: GGML_CUDA_FUSE_NORM_QUANT=1: a one-row RMS_NORM + MUL feeding a matvec also writes its q8_1 copy\n", __func__);
-        }
-        return r;
-    }();
-    return on;
+    static const char * v = getenv("GGML_CUDA_FUSE_NORM_QUANT");
+    return v != nullptr ? atoi(v) != 0 : ggml_cuda_prefill_fast_defaults_on();
 }
 
 // the fusion's shape rule: one row, contiguous F32, the dispatch's vec path with vpt 1 and ncols4 == the block size, no padding

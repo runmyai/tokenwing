@@ -25,6 +25,7 @@
 
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cfloat>
 #include <cstdio>
@@ -145,22 +146,27 @@ inline bool ggml_cuda_test_pdl_nosync(const char * which) {
     return on;
 }
 
-// GGML_CUDA_COPY_KERNEL=<max bytes> (default 0 = off) - small same-type device copies run as a kernel with
+extern std::atomic<bool> g_ggml_cuda_prefill_fast_defaults;
+
+inline bool ggml_cuda_prefill_fast_defaults_on() {
+    return g_ggml_cuda_prefill_fast_defaults.load(std::memory_order_relaxed);
+}
+
+// GGML_CUDA_COPY_KERNEL=<max bytes> (default 0 = off, or 65536 when prefill-fast env defaults are on) - small same-type device copies run as a kernel with
 // the early start (cpy.cu) and concat_cont, whose output the linear-attention layers' conv-state snapshot copies, gives the early-start
-// signal so that copy can start at once (TEST ONLY: GGML_CUDA_TEST_NO_CONCAT_LC=1 leaves the signal out, to measure it). Read once
+// signal so that copy can start at once (TEST ONLY: GGML_CUDA_TEST_NO_CONCAT_LC=1 leaves the signal out, to measure it).
 inline int64_t ggml_cuda_copy_kernel_max() {
-    static const int64_t m = []() {
-        const char * v = getenv("GGML_CUDA_COPY_KERNEL");
-        const long long x = v != nullptr ? atoll(v) : 0;
+    static const char * v = getenv("GGML_CUDA_COPY_KERNEL");
+    if (v != nullptr) {
+        const long long x = atoll(v);
         return (int64_t) (x > 0 ? x : 0);
-    }();
-    return m;
+    }
+    return ggml_cuda_prefill_fast_defaults_on() ? 65536 : 0;
 }
 
 inline bool ggml_cuda_copy_kernel_concat_lc() {
-    static const bool on = ggml_cuda_copy_kernel_max() > 0 &&
-        !(getenv("GGML_CUDA_TEST_NO_CONCAT_LC") && atoi(getenv("GGML_CUDA_TEST_NO_CONCAT_LC")) != 0);
-    return on;
+    static const bool not_disabled = !(getenv("GGML_CUDA_TEST_NO_CONCAT_LC") && atoi(getenv("GGML_CUDA_TEST_NO_CONCAT_LC")) != 0);
+    return ggml_cuda_copy_kernel_max() > 0 && not_disabled;
 }
 
 inline uint64_t ggml_cuda_test_pdl_hold_ns() {

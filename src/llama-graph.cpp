@@ -4025,6 +4025,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 *ids_c = ggml_view_2d(ctx0, ids_all, ids_all->ne[0], nc, ids_all->nb[1], c0*ids_all->nb[1]);
                 *x_c   = ggml_view_2d(ctx0, lm_x, n_embd, nc, lm_x->nb[1], c0*lm_x->nb[1]);
                 *w_c   = ggml_view_3d(ctx0, weights, 1, weights->ne[1], nc, weights->nb[1], weights->nb[2], c0*weights->nb[2]);
+                // Expand weights chunk view before build_expert_wave/build_vram_chain so DFS places
+                // (experts * scale_s) and (first * w_c) consecutively for fused MoE weighted reduction.
+                ggml_build_forward_expand(gf, *w_c);
             };
 
             // With GPU waves, each wave's ids (and the VRAM ids) go to the GPU ONCE through a cont on the

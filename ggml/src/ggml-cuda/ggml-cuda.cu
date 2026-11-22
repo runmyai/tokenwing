@@ -920,7 +920,11 @@ void ggml_backend_cuda_set_share_q8_1(bool on) {
     ggml_cuda_share_q8_1_on.store(on, std::memory_order_relaxed);
 }
 
+std::atomic<bool> g_ggml_cuda_prefill_fast_defaults{false};
+
 void ggml_backend_cuda_set_prefill_opts(uint32_t flags) {
+    const bool env_defaults = ((flags & GGML_CUDA_PREFILL_FAST_ENV) != 0) || ((flags & 0x1fu) == 0x1fu);
+    g_ggml_cuda_prefill_fast_defaults.store(env_defaults, std::memory_order_relaxed);
     ggml_cuda_set_mmq_moe_opt      ((flags & GGML_CUDA_PREFILL_MMQ_MOE_OPT) != 0);
     ggml_cuda_set_moe_fused_prefill((flags & GGML_CUDA_PREFILL_MOE_FUSED)   != 0);
     ggml_cuda_set_qsa_fused        ((flags & GGML_CUDA_PREFILL_QSA_FUSED)   != 0);

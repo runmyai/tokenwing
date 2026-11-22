@@ -51,6 +51,7 @@ GGML_BACKEND_API void ggml_backend_cuda_set_share_q8_1(bool on);
 #define GGML_CUDA_PREFILL_QSA_FUSED   (1u << 2)
 #define GGML_CUDA_PREFILL_HC_FUSED    (1u << 3)
 #define GGML_CUDA_PREFILL_PLE_FAST    (1u << 4)
+#define GGML_CUDA_PREFILL_FAST_ENV    (1u << 5)
 
 // Process-wide opt-in switches for CUDA prefill fast paths (default 0 = all off).
 // Also reachable via proc address "ggml_backend_cuda_set_prefill_opts".

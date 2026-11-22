@@ -315,30 +315,81 @@ void ggml_cuda_mul_mat_q(
     };
 
     if (!ids) {
-        mmid_pop_all();
+        const int64_t s11_in = src1->nb[1] / ts_src1;
+        const int64_t s12_in = src1->nb[2] / ts_src1;
+        const int64_t s13_in = src1->nb[3] / ts_src1;
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
-        ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
-        if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
-            src1_scale.alloc(ne13*ne12*ne11);
-        }
+        const int dense_q8_fmt = 2000 + (int) mmq_get_q8_1_ds_layout(src0->type);
+        const bool can_share_dense = ctx.mmid_share.active && ggml_cuda_mmq_moe_opt_enabled() && !use_native_fp4 &&
+                                     ne10 > 0 && ne11 > 0 && ne12 > 0 && ne13 > 0 &&
+                                     (int64_t) (int) s11_in == s11_in && (int64_t) (int) ne13 == ne13 &&
+                                     ctx.q8_1_share.is_graph_input(src1);
+        const char * s1_lo = (const char *) src1->data;
+        const size_t s1_span = can_share_dense
+            ? (size_t) (ne13 - 1) * src1->nb[3] + (size_t) (ne12 - 1) * src1->nb[2] + (size_t) (ne11 - 1) * src1->nb[1] + (size_t) ne10 * ts_src1
+            : 0;
+        const bool hit_dense = can_share_dense &&
+                               ctx.mmid_share.ids == src1 && ctx.mmid_share.lo == s1_lo &&
+                               ctx.mmid_share.src1 == src1 && ctx.mmid_share.s1_lo == s1_lo &&
+                               ctx.mmid_share.ne10 == ne10 && ctx.mmid_share.ne10_padded == ne10_padded &&
+                               ctx.mmid_share.n_expert_used == ne11 && ctx.mmid_share.ne12 == ne12 &&
+                               ctx.mmid_share.moe_nz == (int) ne13 &&
+                               ctx.mmid_share.si1 == (int) s11_in && ctx.mmid_share.s12 == s12_in &&
+                               ctx.mmid_share.ne02 == s13_in &&
+                               ctx.mmid_share.q8_fmt == dense_q8_fmt &&
+                               ctx.mmid_share.q8_pad >= src1_q8_1_padding &&
+                               ctx.mmid_share.q8_buf != nullptr;
 
-        {
-            const int64_t s11 = src1->nb[1] / ts_src1;
-            const int64_t s12 = src1->nb[2] / ts_src1;
-            const int64_t s13 = src1->nb[3] / ts_src1;
+        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+        ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
+        char * q8_ptr = nullptr;
+
+        if (hit_dense) {
+            q8_ptr = ctx.mmid_share.q8_buf;
+        } else {
+            mmid_pop_all();
+            if (can_share_dense) {
+                ctx.mmid_share.q8_buf = (char *) ctx.pool().alloc(nbytes_src1_q8_1, &ctx.mmid_share.q8_cap);
+                q8_ptr = ctx.mmid_share.q8_buf;
+            } else {
+                src1_q8_1.alloc(nbytes_src1_q8_1);
+                q8_ptr = src1_q8_1.get();
+            }
+            if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
+                src1_scale.alloc(ne13*ne12*ne11);
+            }
+
             if (use_native_fp4) {
                 static constexpr size_t align_float8 = 32;
                 const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
-                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_fp4_cuda(src1_d, nullptr, q8_ptr, src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11_in, s12_in, s13_in, ne10_padded,
                                         ne11, ne12, ne13, stream);
-
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_q8_1_cuda(src1_d, nullptr, q8_ptr, src0->type, ne10, s11_in, s12_in, s13_in, ne10_padded,
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
+
+            if (can_share_dense) {
+                ctx.mmid_share.ids           = src1;
+                ctx.mmid_share.lo            = s1_lo;
+                ctx.mmid_share.hi            = s1_lo + s1_span;
+                ctx.mmid_share.src1          = src1;
+                ctx.mmid_share.s1_lo         = s1_lo;
+                ctx.mmid_share.s1_hi         = s1_lo + s1_span;
+                ctx.mmid_share.ne02          = s13_in;
+                ctx.mmid_share.ne12          = ne12;
+                ctx.mmid_share.n_expert_used = ne11;
+                ctx.mmid_share.ne10          = ne10;
+                ctx.mmid_share.ne10_padded   = ne10_padded;
+                ctx.mmid_share.s12           = s12_in;
+                ctx.mmid_share.si1           = (int) s11_in;
+                ctx.mmid_share.moe_nz        = (int) ne13;
+                ctx.mmid_share.pad_j         = J_best;
+                ctx.mmid_share.q8_fmt        = dense_q8_fmt;
+                ctx.mmid_share.q8_pad        = src1_q8_1_padding;
+            }
         }
 
         // Stride depends on quantization format
@@ -348,7 +399,7 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, src0->type, (const int *) q8_ptr, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,

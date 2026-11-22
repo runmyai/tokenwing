@@ -18324,17 +18324,18 @@ bool llama_moe_stream::htail_layer_ok(int32_t il) const {
     if (il < 0 || (size_t) il >= layers.size() || !layers[il] || cpu_repack_on.load()) {
         return false;
     }
+    const auto * cpu_api = llama_cpu_moe_api();
     const llama_moe_stream_layer & sl = *layers[il];
     for (int k = 0; k < 3; ++k) {
         const ggml_tensor * P = sl.weights[k].pool;
         if (!P || !P->buffer || !ggml_backend_buffer_is_host(P->buffer)) {
             return false;
         }
-        const auto * tr = ggml_get_type_traits_cpu(P->type);
+        const auto * tr = cpu_api->get_type_traits_cpu(P->type);
         if (!tr || !tr->vec_dot) {
             return false;
         }
-        const auto * tr_q = ggml_get_type_traits_cpu(tr->vec_dot_type);
+        const auto * tr_q = cpu_api->get_type_traits_cpu(tr->vec_dot_type);
         const int64_t bs  = ggml_blck_size(tr->vec_dot_type);
         if (!tr_q || !tr_q->from_float || bs <= 0 || (P->ne[0] % bs) != 0) {
             return false;
@@ -18363,12 +18364,13 @@ void llama_moe_stream::compute_hybrid_tail_cpu(
     const int64_t k_used       = w_in->ne[1];
     const size_t  x_tok_stride = x_in->ne[1] == nt && x_in->ne[2] == 1 ? x_in->nb[1] : x_in->nb[2];
 
-    const auto * tr_g  = ggml_get_type_traits_cpu(P_gate->type);
-    const auto * tr_u  = ggml_get_type_traits_cpu(P_up->type);
-    const auto * tr_d  = ggml_get_type_traits_cpu(P_down->type);
-    const auto * tr_gq = tr_g ? ggml_get_type_traits_cpu(tr_g->vec_dot_type) : nullptr;
-    const auto * tr_uq = tr_u ? ggml_get_type_traits_cpu(tr_u->vec_dot_type) : nullptr;
-    const auto * tr_dq = tr_d ? ggml_get_type_traits_cpu(tr_d->vec_dot_type) : nullptr;
+    const auto * cpu_api = llama_cpu_moe_api();
+    const auto * tr_g  = cpu_api->get_type_traits_cpu(P_gate->type);
+    const auto * tr_u  = cpu_api->get_type_traits_cpu(P_up->type);
+    const auto * tr_d  = cpu_api->get_type_traits_cpu(P_down->type);
+    const auto * tr_gq = tr_g ? cpu_api->get_type_traits_cpu(tr_g->vec_dot_type) : nullptr;
+    const auto * tr_uq = tr_u ? cpu_api->get_type_traits_cpu(tr_u->vec_dot_type) : nullptr;
+    const auto * tr_dq = tr_d ? cpu_api->get_type_traits_cpu(tr_d->vec_dot_type) : nullptr;
     if (!tr_g || !tr_u || !tr_d || !tr_g->vec_dot || !tr_u->vec_dot || !tr_d->vec_dot ||
             !tr_gq || !tr_uq || !tr_dq || !tr_gq->from_float || !tr_uq->from_float || !tr_dq->from_float) {
         return;

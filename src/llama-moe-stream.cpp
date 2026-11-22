@@ -4272,6 +4272,12 @@ llama_moe_stream::~llama_moe_stream() {
         pring_cap  = 0;
         pring_head = 0;
     }
+    if (tailw_zero_pin_buf) {
+        ggml_backend_buffer_free(tailw_zero_pin_buf);
+        tailw_zero_pin_buf = nullptr;
+        tailw_zero_pin_ptr = nullptr;
+        tailw_zero_pin_cap = 0;
+    }
     if (tailw_ctx) {   // the tail waves' tensor headers (their memory is the pool's, freed above)
         ggml_free(tailw_ctx);
         tailw_ctx = nullptr;
@@ -16162,7 +16168,64 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
 
     // 4. fill from the sidecar (O_DIRECT, one whole expert block at a time) and mark the experts as held
     int64_t n_filled = 0;
+    int64_t n_ram_cached = 0;
     if (!vx_test_empty) {
+        auto upload_and_cache = [&](llama_moe_stream_layer & sl, const vx_group_t & G, int32_t e, int32_t vslot,
+                const uint8_t * stage, size_t nb_g, size_t nb_d) {
+            if (sl.weights[1].offs == sl.weights[0].offs + nb_g) {
+                ggml_backend_tensor_set(G.gate_up, stage + sl.weights[0].offs, (size_t) vslot*2*nb_g, 2*nb_g);
+            } else {
+                ggml_backend_tensor_set(G.gate_up, stage + sl.weights[0].offs, (size_t) vslot*2*nb_g,        nb_g);
+                ggml_backend_tensor_set(G.gate_up, stage + sl.weights[1].offs, (size_t) vslot*2*nb_g + nb_g, nb_g);
+            }
+            ggml_backend_tensor_set(G.down, stage + sl.weights[2].offs, (size_t) vslot*nb_d, nb_d);
+            sl.vx_slot[e] = vslot;
+            n_filled++;
+
+            // When every expert keeps a RAM copy (vx_keep_ram), populate an EMPTY RAM slot directly from stage
+            // so initial idle_round does not re-read these held experts from SSD a second time.
+            if (vx_keep_ram && !convert_on_read && !el_on && e >= 0 && (uint32_t) e < sl.n_expert && sl.expert_slot[e] < 0 &&
+                    sl.weights[0].pool != nullptr && sl.weights[0].pool->data != nullptr &&
+                    sl.weights[1].pool != nullptr && sl.weights[1].pool->data != nullptr &&
+                    sl.weights[2].pool != nullptr && sl.weights[2].pool->data != nullptr) {
+                int32_t rs = -1;
+                const uint32_t s_lim = std::min<uint32_t>(sl.share, sl.n_slots);
+                for (uint32_t cand = 0; cand < s_lim; ++cand) {
+                    if (sl.slot_state[cand] == MOE_STREAM_SLOT_EMPTY &&
+                            (sl.slot_off.empty() || !sl.slot_off[cand]) &&
+                            sl.slot_expert[cand] < 0 && !sl.keep[cand]) {
+                        rs = (int32_t) cand;
+                        break;
+                    }
+                }
+                if (rs >= 0) {
+                    std::memcpy((char *) sl.weights[0].pool->data + (size_t) rs*sl.weights[0].size, stage + sl.weights[0].offs, sl.weights[0].size);
+                    std::memcpy((char *) sl.weights[1].pool->data + (size_t) rs*sl.weights[1].size, stage + sl.weights[1].offs, sl.weights[1].size);
+                    std::memcpy((char *) sl.weights[2].pool->data + (size_t) rs*sl.weights[2].size, stage + sl.weights[2].offs, sl.weights[2].size);
+                    if (!sl.el_zero_known.empty() && (size_t) rs < sl.el_zero_known.size()) {
+                        sl.el_zero_known[(size_t) rs] = 0;
+                        sl.el_res       [(size_t) rs] = 1;
+                        sl.el_land      [(size_t) rs] = 0;
+                    }
+                    sl.slot_expert[(size_t) rs] = e;
+                    sl.expert_slot[(size_t) e]  = rs;
+                    sl.gsf_dirty = 1;
+                    if (pr_on) {
+                        const int64_t t_pr = ggml_time_us();
+                        for (int p = 0; p < 3; ++p) {
+                            sl.proj_ready_us[p][(size_t) rs] = t_pr;
+                            reinterpret_cast<std::atomic<uint32_t> *>(&sl.proj_ready[p][(size_t) rs])->store(1, std::memory_order_release);
+                        }
+                    }
+                    slot_settle_ready(sl, rs);
+                    if (!sl.slot_idle.empty() && (size_t) rs < sl.slot_idle.size()) {
+                        sl.slot_idle[(size_t) rs] = 1;
+                    }
+                    n_ram_cached++;
+                }
+            }
+        };
+
         for (auto & G : vx_groups) {
             const size_t nb_g  = ggml_row_size(G.t_gate, G.ne_gate[0])*G.ne_gate[1];   // one gate (or up) slice
             const size_t nb_d  = ggml_row_size(G.t_down, G.ne_down[0])*G.ne_down[1];
@@ -16208,11 +16271,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                         moe_stream_fail("--moe-stream-vram-experts: reading expert %d of layer %d from the sidecar failed (%s)",
                                 e, sl.il, r < 0 ? strerror(errno) : "short read");
                     }
-                    ggml_backend_tensor_set(G.gate_up, stage + sl.weights[0].offs, (size_t) slot*2*nb_g,        nb_g);
-                    ggml_backend_tensor_set(G.gate_up, stage + sl.weights[1].offs, (size_t) slot*2*nb_g + nb_g, nb_g);
-                    ggml_backend_tensor_set(G.down,    stage + sl.weights[2].offs, (size_t) slot*nb_d,          nb_d);
-                    sl.vx_slot[e] = slot;
-                    n_filled++;
+                    upload_and_cache(sl, G, e, slot, stage, nb_g, nb_d);
                 }
                 next_base += (int32_t) n_li;
             }
@@ -16251,11 +16310,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                         moe_stream_fail("--moe-stream-vram-experts: reading expert %d of layer %d from the sidecar failed (%s)",
                                 e, sl.il, r < 0 ? strerror(errno) : "short read");
                     }
-                    ggml_backend_tensor_set(G.gate_up, stage + sl.weights[0].offs, (size_t) slot*2*nb_g,        nb_g);
-                    ggml_backend_tensor_set(G.gate_up, stage + sl.weights[1].offs, (size_t) slot*2*nb_g + nb_g, nb_g);
-                    ggml_backend_tensor_set(G.down,    stage + sl.weights[2].offs, (size_t) slot*nb_d,          nb_d);
-                    sl.vx_slot[e] = slot;
-                    n_filled++;
+                    upload_and_cache(sl, G, e, slot, stage, nb_g, nb_d);
                     k++;
                     any = true;
                 }
@@ -16266,6 +16321,10 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
             fprintf(stderr, "%s: the pool's tail: %d places (the largest RAM pool view, %d slots + zero slices; %.1f MiB = the pool copies of a GPU-wave graph, "
                     "which no longer take compute-buffer memory): %d filled with the list's next experts, %d free%s\n", __func__, tail_n, tail_n,
                     (double) tail_n*(2*nb_g + nb_d)/1048576.0, k, tail_n - k, tail_preset ? "" : " (MOE_STREAM_TEST_PRESET_COPY=0: the copies stay in the compute buffer, the tail is still vacated for GPU-wave graphs)");
+        }
+        if (n_ram_cached > 0) {
+            fprintf(stderr, "%s: vx_keep_ram: cached %lld held experts into RAM slots during initial sidecar fill\n",
+                    __func__, (long long) n_ram_cached);
         }
     }
 
@@ -18701,8 +18760,14 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
         }
     }
     if (!tailw_zero_ok) {
-        for (int32_t r = 0; r < (int32_t) n_zero; r++) {
-            tailw_list.push_back({ Wp + r, zb + r });
+        const bool skip_zero_dma = !ca_test_check && p1.gpu_wave_skip_zero && out != nullptr &&
+                (n / std::max<int64_t>(1, (int64_t) n_expert_used)) >= 2 &&
+                ggml_is_quantized(g1s[0]->type) && ggml_is_quantized(g1s[1]->type) && ggml_is_quantized(g1s[2]->type) &&
+                zero_tail_of(g1s[0], sl.il) > 0 && zero_tail_of(g1s[1], sl.il) > 0 && zero_tail_of(g1s[2], sl.il) > 0;
+        if (!skip_zero_dma) {
+            for (int32_t r = 0; r < (int32_t) n_zero; r++) {
+                tailw_list.push_back({ Wp + r, zb + r });
+            }
         }
         tailw_zero_ok = true;
     }
@@ -18753,8 +18818,28 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
                 }
             }
             const int64_t mx = std::max(pd[0], std::max(pd[1], pd[2]));
-            if ((int64_t) tailw_zero_src.size() < mx) {
+            if (mx > (int64_t) tailw_zero_pin_cap) {
+                if (ggml_backend_dev_t dev = ggml_backend_get_device(tailw_be)) {
+                    if (ggml_backend_buffer_type_t hbuft = ggml_backend_dev_host_buffer_type(dev)) {
+                        const size_t want = std::max<size_t>((size_t) GGML_PAD(mx, 4096), 4096);
+                        if (ggml_backend_buffer_t nb = ggml_backend_buft_alloc_buffer(hbuft, want)) {
+                            if (tailw_zero_pin_buf) {
+                                ggml_backend_buffer_free(tailw_zero_pin_buf);
+                            }
+                            tailw_zero_pin_buf = nb;
+                            tailw_zero_pin_ptr = (uint8_t *) ggml_backend_buffer_get_base(nb);
+                            tailw_zero_pin_cap = want;
+                            std::memset(tailw_zero_pin_ptr, 0, want);
+                        }
+                    }
+                }
+            }
+            const void * zero_ptr = tailw_zero_pin_ptr && (int64_t) tailw_zero_pin_cap >= mx ? (const void *) tailw_zero_pin_ptr : nullptr;
+            if (zero_ptr == nullptr && (int64_t) tailw_zero_src.size() < mx) {
                 tailw_zero_src.assign((size_t) mx, 0);
+            }
+            if (zero_ptr == nullptr) {
+                zero_ptr = tailw_zero_src.data();
             }
             for (int32_t p = 0; p < T; p++) {
                 const int32_t q = p + 1;
@@ -18768,7 +18853,7 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
                     ggml_tensor * D    = g1s[(size_t) k];
                     ggml_tensor * base = k < 2 || tail_dn_r1[(size_t) sl.vx_group] ? GT.gate_up : GT.down;
                     const size_t  off  = (size_t) ((const char *) D->data - (const char *) base->data) + (size_t) q*D->nb[2];
-                    ggml_backend_tensor_set_async(tailw_be, base, tailw_zero_src.data(), off, (size_t) pd[(size_t) k]);
+                    ggml_backend_tensor_set_async(tailw_be, base, zero_ptr, off, (size_t) pd[(size_t) k]);
                     tailw_pads      += 1;
                     tailw_pad_bytes += pd[(size_t) k];
                     calls += 1;

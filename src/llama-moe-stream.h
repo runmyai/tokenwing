@@ -1666,6 +1666,9 @@ struct llama_moe_stream {
     ggml_backend_event_t  pring_ev[PRING_SLICES] = {};
     bool                  pring_ev_rec[PRING_SLICES] = {};
     int64_t               pring_wraps = 0, pring_bytes = 0;
+    ggml_backend_buffer_t tailw_zero_pin_buf = nullptr;
+    uint8_t *             tailw_zero_pin_ptr = nullptr;
+    size_t                tailw_zero_pin_cap = 0;
     void                  pring_ensure();
     void                  tailw_set_async_staged(ggml_tensor * D, const char * src, size_t dst_off, size_t nbytes);
 

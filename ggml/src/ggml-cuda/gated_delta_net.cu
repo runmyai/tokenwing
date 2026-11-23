@@ -1,5 +1,6 @@
 #include "gated_delta_net.cuh"
 #include "gated-delta-net-mma.cuh"
+#include "moe-fused-prefill.cuh"
 #include "ggml-cuda/common.cuh"
 
 #include <cstdint>
@@ -249,6 +250,11 @@ static ggml_cuda_gdn_mma_args ggml_cuda_gdn_mma_args_from_tensor(const ggml_tens
 
     const int64_t S_v = v->ne[0];
     const int64_t H   = v->ne[1];
+    const bool    kda = (g->ne[0] == S_v);
+    const int     K   = ggml_get_op_params_i32(dst, 0);
+    const bool    opt = ggml_cuda_mmq_moe_opt_enabled();
+    const bool    ok_g = (g->ne[0] == 1) || (opt && kda);
+    const bool    ok_k = opt ? (K <= 1 && K < v->ne[2]) : (K < v->ne[2]);
     return {
         (const float *) q->data,
         (const float *) k->data,
@@ -273,7 +279,8 @@ static ggml_cuda_gdn_mma_args ggml_cuda_gdn_mma_args_from_tensor(const ggml_tens
         (int64_t) (beta->nb[2] / sizeof(float)),
         (int64_t) (beta->nb[3] / sizeof(float)),
         1.0f / sqrtf((float) S_v),
-        g->ne[0] == 1 && ggml_get_op_params_i32(dst, 0) < v->ne[2] && S_v == 128 && q->ne[0] == 128,
+        kda,
+        ok_g && ok_k && S_v == 128 && q->ne[0] == 128,
     };
 }
 

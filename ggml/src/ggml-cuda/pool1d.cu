@@ -71,15 +71,8 @@ static __global__ void pool1d_row_max_kernel(const int iw, const int nr, const f
 }
 
 static bool ggml_cuda_pool1d_row_on() {
-    static const bool on = [] {
-        const char * e = getenv("GGML_CUDA_POOL1D_ROW");
-        const bool r = e != nullptr && atoi(e) != 0;
-        if (r) {
-            fprintf(stderr, "%s: GGML_CUDA_POOL1D_ROW=1: a MAX pool over whole rows runs one warp per row\n", __func__);
-        }
-        return r;
-    }();
-    return on;
+    static const char * e = getenv("GGML_CUDA_POOL1D_ROW");
+    return e != nullptr ? atoi(e) != 0 : ggml_cuda_prefill_fast_defaults_on();
 }
 
 static void pool1d_nchw_kernel_f32_f32_cuda(

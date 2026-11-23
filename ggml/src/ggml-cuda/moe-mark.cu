@@ -292,15 +292,8 @@ bool ggml_cuda_moe_mark_sync(void) {
 // work: the mark kernel reads the view and writes the CONT node's memory too, so the CONT is not launched (its readers - the VRAM
 // pass's get_rows, the scheduler's copies - read the same bytes, written earlier in the same stream)
 static bool ggml_cuda_moe_mark_ids_on() {
-    static const bool on = [] {
-        const char * v = getenv("GGML_CUDA_MOE_MARK_IDS");
-        const bool r = v != nullptr && atoi(v) != 0;
-        if (r) {
-            fprintf(stderr, "%s: GGML_CUDA_MOE_MARK_IDS=1: the router mark copies the top-k ids itself (no separate ids copy)\n", __func__);
-        }
-        return r;
-    }();
-    return on;
+    static const char * v = getenv("GGML_CUDA_MOE_MARK_IDS");
+    return v != nullptr ? atoi(v) != 0 : ggml_cuda_prefill_fast_defaults_on();
 }
 
 bool ggml_cuda_moe_mark_takes_node(const ggml_tensor * node) {

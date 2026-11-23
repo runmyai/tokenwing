@@ -519,15 +519,15 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
 
 #if !defined(GGML_USE_MUSA)   // MUSA keeps its own copy path (mudnn); it has no early start to gain from
     // Small same-type copies as a kernel (see cpy_small_rows), read once
-    static const int64_t copy_kernel_max = []() {
-        const int64_t m = ggml_cuda_copy_kernel_max();
-        if (m > 0) {
+    const int64_t copy_kernel_max = ggml_cuda_copy_kernel_max();
+    if (copy_kernel_max > 0) {
+        static std::atomic<bool> logged_copy_kernel{false};
+        if (!logged_copy_kernel.exchange(true, std::memory_order_relaxed)) {
             fprintf(stderr, "%s: GGML_CUDA_COPY_KERNEL=%lld: same-type device copies up to %lld bytes run as a kernel (early start), not "
-                    "as a memcpy node; concat_cont gives the early-start signal: %s\n", __func__, (long long) m,
-                    (long long) m, ggml_cuda_copy_kernel_concat_lc() ? "yes" : "no (GGML_CUDA_TEST_NO_CONCAT_LC, test only)");
+                    "as a memcpy node; concat_cont gives the early-start signal: %s\n", __func__, (long long) copy_kernel_max,
+                    (long long) copy_kernel_max, ggml_cuda_copy_kernel_concat_lc() ? "yes" : "no (GGML_CUDA_TEST_NO_CONCAT_LC, test only)");
         }
-        return m;
-    }();
+    }
     // (review: a 0-byte copy - a SET of an empty tensor - keeps the memcpy path; a kernel grid of 0 blocks is an invalid launch)
     if (copy_kernel_max > 0 && src0->type == src1->type && ggml_nbytes(src0) > 0 && (int64_t) ggml_nbytes(src0) <= copy_kernel_max) {
         if (contiguous_srcs) {

@@ -5364,7 +5364,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-gpu-layers-cap"}, "F",
-        "with --moe-stream-vram-cache: maximum fraction of available pool-GPU room assigned to whole MoE layers (default: 0.32)",
+        "with --moe-stream-vram-cache: maximum fraction of available pool-GPU room assigned to whole MoE layers (default: 0.52)",
         [](common_params & params, const std::string & value) {
             params.moe_stream_gpu_layers_cap = std::stof(value);
         }
@@ -5372,8 +5372,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-stream-gpu-layers-uniform-max"}, "N",
         "with --moe-stream-vram-cache: maximum whole MoE layers placed on the pool GPU when all MoE layers have uniform "
-        "expert sizes (-1 = match --moe-stream-wordstart, 0 = bounded only by --moe-stream-gpu-layers-cap and "
-        "--moe-stream-gpu-layers-floor, > 0 = explicit cap; default: -1)",
+        "expert sizes (0 = bounded only by --moe-stream-gpu-layers-cap and --moe-stream-gpu-layers-floor, "
+        "-1 = match --moe-stream-wordstart, > 0 = explicit cap; default: 0)",
         [](common_params & params, int value) {
             params.moe_stream_gpu_layers_uniform_max = value;
         }

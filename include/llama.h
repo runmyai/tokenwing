@@ -615,8 +615,8 @@ extern "C" {
         int64_t      moe_stream_gpu_layers_floor;        // min VRAM room kept for the expert pool by auto whole-layer budget (default 2500 MiB)
         int64_t      moe_stream_gpu_layers_lend_reclaim; // max prompt-lend reclaim credited by auto whole-layer budget (default 640 MiB)
         int64_t      moe_stream_copy_ahead_one_below;    // total VRAM threshold below which auto copy-ahead picks 1 set (default 10 GiB)
-        float        moe_stream_gpu_layers_cap;          // max fraction of pool-GPU room taken by whole layers (default 0.32)
-        int32_t      moe_stream_gpu_layers_uniform_max;  // max uniform whole layers (-1 = wordstart, 0 = uncapped, > 0 = cap)
+        float        moe_stream_gpu_layers_cap;          // max fraction of pool-GPU room taken by whole layers (default 0.52)
+        int32_t      moe_stream_gpu_layers_uniform_max;  // max uniform whole layers (0 = bounded by cap & floor, -1 = wordstart, > 0 = cap)
         uint32_t     moe_stream_auto_mask;      // bitmask of knobs auto-enabled by umbrella CLI groups (1=vram_free, 2=copy_ahead, 4=correction, 8=vram_list, 16=hip_mmvq, 32=hip_sync, 64=auto_gl)
 
         // Keep the booleans together to avoid misalignment during copy-by-value.

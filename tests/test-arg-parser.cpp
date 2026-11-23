@@ -361,7 +361,8 @@ static void test(void) {
         assert(p.moe_stream_gpu_layers_floor == (2500LL << 20));
         assert(p.moe_stream_gpu_layers_lend_reclaim == (640LL << 20));
         assert(p.moe_stream_copy_ahead_one_below == (10LL << 30));
-        assert(p.moe_stream_gpu_layers_uniform_max == -1);
+        assert(std::abs(p.moe_stream_gpu_layers_cap - 0.52f) < 1e-6f);
+        assert(p.moe_stream_gpu_layers_uniform_max == 0);
     }
 
     // 262k context auto-scales batch/ubatch under --moe-stream model

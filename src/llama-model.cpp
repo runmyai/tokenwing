@@ -4978,8 +4978,8 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_gpu_layers_floor        =*/ 2500LL << 20, // 2500 MiB pool floor
         /*.moe_stream_gpu_layers_lend_reclaim =*/ 640LL << 20,  // 640 MiB max prompt-lend reclaim
         /*.moe_stream_copy_ahead_one_below    =*/ 10LL << 30,   // 10 GiB single-set threshold
-        /*.moe_stream_gpu_layers_cap          =*/ 0.32f,        // 32 % max whole-layer fraction
-        /*.moe_stream_gpu_layers_uniform_max  =*/ -1,           // match wordstart
+        /*.moe_stream_gpu_layers_cap          =*/ 0.52f,        // 52 % max whole-layer fraction
+        /*.moe_stream_gpu_layers_uniform_max  =*/ 0,            // bounded by cap & floor
         /*.moe_stream_auto_mask        =*/ 0,      // no umbrella auto-enabled bits
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,

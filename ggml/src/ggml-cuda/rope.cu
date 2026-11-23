@@ -845,7 +845,7 @@ static void rms_norm_mul_rope_cuda(
     const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
 
 #if !defined(GGML_USE_HIP)
-    if (ncols <= 256) {
+    if (ncols <= 256 && ggml_cuda_prefill_fast_defaults_on()) {
         const dim3 block_dims(WARP_SIZE, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 0, stream};
         if (freq_factors == nullptr) {

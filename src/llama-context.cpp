@@ -3380,12 +3380,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // the router's picks and weights [k, T], and with hyper-connection streams also the routed-expert sum lm_moe [n_embd, T] and
         // the FFN combine's inject weights lm_inj [hc, T]; with a GPU expert pool that has a tail they all live in the tail's
         // extension (vacated for this call's GPU-wave graphs first), else in a buffer of their own
-        std::vector<uint8_t> lent_output_backup;
+        bool lm_output_lent = false;
         auto restore_lent_output = [&]() {
-            if (!lent_output_backup.empty() && model.output) {
+            if (lm_output_lent && !lm_output_backup.empty() && model.output) {
                 synchronize();
-                ggml_backend_tensor_set(model.output, lent_output_backup.data(), 0, lent_output_backup.size());
-                lent_output_backup.clear();
+                ggml_backend_tensor_set(model.output, lm_output_backup.data(), 0, lm_output_backup.size());
+                lm_output_lent = false;
             }
         };
         struct lent_output_raii_t {
@@ -3491,8 +3491,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 char * hbase = (char *) ggml_backend_buffer_get_base(hbuf_only.get());
                 GGML_ASSERT(ggml_backend_tensor_alloc(hbuf_only.get(), lm_hid, hbase) == GGML_STATUS_SUCCESS);
                 synchronize();
-                lent_output_backup.resize(out_bytes);
-                ggml_backend_tensor_get(model.output, lent_output_backup.data(), 0, out_bytes);
+                if (lm_output_backup.size() != out_bytes) {
+                    lm_output_backup.resize(out_bytes);
+                    ggml_backend_tensor_get(model.output, lm_output_backup.data(), 0, out_bytes);
+                }
+                lm_output_lent = true;
                 lm_hbuf = std::move(hbuf_only);
                 size_t off = 0;
                 for (ggml_tensor * t : { lm_x, lm_moe, lm_inj, lm_ids, lm_w }) {

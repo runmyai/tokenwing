@@ -904,7 +904,11 @@ struct common_params {
     int32_t     moe_stream_qsa_fused     = 0;     // 1 = zero-mask GQA-transposed QSA sparse attention
     int32_t     moe_stream_hc_fused      = 0;     // 1 = register-fused hyper-connection up + gated pre-mix
     int32_t     moe_stream_ple_fast      = 0;     // 1 = deduplicated raw-quant GPU PLE gather + fused dilated conv
-    int32_t     moe_stream_hybrid_tail   = 0;     // > 0 = CPU tail co-execution for <= K-token RAM experts
+    int64_t     moe_stream_gpu_layers_floor        = 2500LL << 20; // min VRAM room kept for the pool by auto whole-layer budget
+    int64_t     moe_stream_gpu_layers_lend_reclaim = 640LL << 20;  // max prompt-lend reclaim credited by auto whole-layer budget
+    int64_t     moe_stream_copy_ahead_one_below    = 10LL << 30;   // total VRAM threshold below which auto copy-ahead picks 1 set
+    float       moe_stream_gpu_layers_cap          = 0.32f;        // max fraction of pool-GPU room taken by whole layers
+    int32_t     moe_stream_gpu_layers_uniform_max  = -1;           // max uniform whole layers (-1 = wordstart, 0 = uncapped, > 0 = cap)
     int32_t     moe_stream_plan = 0;              // 1 = the waiting list with late binding (decode words)
     int32_t     moe_stream_plan_bind_early = 0;   // test only - every list entry is bound when it is added
     int32_t     moe_stream_drop_stale = 0;        // with plan 1, unpicked entries / started reads dropped at the target

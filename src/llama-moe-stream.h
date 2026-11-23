@@ -212,7 +212,6 @@ struct llama_moe_stream_p1 {
     bool        qsa_fused      = false;   // --moe-stream-qsa-fused 1
     bool        hc_fused       = false;   // --moe-stream-hc-fused 1
     bool        ple_fast       = false;   // --moe-stream-ple-fast 1
-    int32_t     hybrid_tail    = 0;       // --moe-stream-hybrid-tail K
     bool        plan           = false;   // --moe-stream-plan 1, the waiting list with late binding (decode words)
     bool        plan_bind_early = false;  // test only - every list entry is bound the moment it is added
     bool        drop_stale     = false;   // at its target's start, entries it did not pick go, and their started reads'
@@ -964,11 +963,6 @@ struct llama_moe_stream_job {
     bool     refill      = false;   // a take-back's refill read (q_refill: after every needed and guessed read, a few at a time)
 };
 
-struct llama_moe_stream_htail_pair {
-    int32_t pair_idx;
-    int32_t slot;
-};
-
 // the userdata of one wave's remapping op: the layer and which wave of the ubatch it loads
 struct llama_moe_stream_wave {
     llama_moe_stream_layer * sl = nullptr;
@@ -984,7 +978,6 @@ struct llama_moe_stream_wave {
     // 3 = pred_il3 (three ahead). The chain's later steps come from remap() as they always did.
     int32_t tlead = 2;
     const ggml_tensor * tail_gate = nullptr;   // the tail tensor this wave's gate matmul reads in the graph built last (copy-ahead check)
-    std::vector<llama_moe_stream_htail_pair> htail_pairs;
 };
 
 struct llama_moe_stream {
@@ -1684,11 +1677,6 @@ struct llama_moe_stream {
     void set_lm_routed_ids(int32_t il, const int32_t * ids_host, int64_t n);
     void clear_lm_routed_masks() { lm_routed_mask.clear(); }
 
-    bool                      htail_armed = false;
-    int32_t                   htail_k     = 0;
-    int64_t                   htail_computed_pairs = 0, htail_saved_bytes = 0;
-    bool htail_layer_ok(int32_t il) const;
-    void compute_hybrid_tail_cpu(const llama_moe_stream_wave * wctx, const struct ggml_tensor * x_in, const struct ggml_tensor * w_in, struct ggml_tensor * dst, int ith, int nth);
     // Three pieces for --moe-stream-g1-ahead; nothing calls them
     // unless that setting or the test switches below are on
     uint32_t tailw_wave_w = 0;   // (c) the wave width of a tail-wave graph (graph and remap op alike), 0 = the plain width; option A sets the half places

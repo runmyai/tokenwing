@@ -1024,6 +1024,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         }
 
         if (g_vram) {
+            params.moe_stream_auto_mask |= (1u << 6);
             if (!has("--moe-stream-vram-free") && !has("--moe-stream-vram-experts")) {
                 params.moe_stream_vram_free = 200LL << 20;
                 params.moe_stream_auto_mask |= (1u << 0);
@@ -5354,11 +5355,43 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_internal());
     add_opt(common_arg(
-        {"--moe-stream-hybrid-tail"}, "K",
-        "in GPU tail-wave prompts of <= 2048 tokens, compute RAM-resident experts routed by at most K tokens on CPU "
-        "threads instead of copying whole expert slices over PCIe (default: 0 = off)",
+        {"--moe-stream-gpu-layers-floor"}, "SIZE",
+        "with --moe-stream-vram-cache: minimum VRAM room reserved for the hot expert pool before the automatic whole-layer "
+        "budget places whole MoE layers on the pool GPU (default: 2500MiB)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_gpu_layers_floor = (int64_t) moe_stream_parse_size(value);
+        }
+    ).set_internal());
+    add_opt(common_arg(
+        {"--moe-stream-gpu-layers-cap"}, "F",
+        "with --moe-stream-vram-cache: maximum fraction of available pool-GPU room assigned to whole MoE layers (default: 0.32)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_gpu_layers_cap = std::stof(value);
+        }
+    ).set_internal());
+    add_opt(common_arg(
+        {"--moe-stream-gpu-layers-uniform-max"}, "N",
+        "with --moe-stream-vram-cache: maximum whole MoE layers placed on the pool GPU when all MoE layers have uniform "
+        "expert sizes (-1 = match --moe-stream-wordstart, 0 = bounded only by --moe-stream-gpu-layers-cap and "
+        "--moe-stream-gpu-layers-floor, > 0 = explicit cap; default: -1)",
         [](common_params & params, int value) {
-            params.moe_stream_hybrid_tail = std::max(0, value);
+            params.moe_stream_gpu_layers_uniform_max = value;
+        }
+    ).set_internal());
+    add_opt(common_arg(
+        {"--moe-stream-gpu-layers-lend-reclaim"}, "SIZE",
+        "with --moe-stream-vram-cache, --moe-stream-vram-lend-prompt 1, and --moe-stream-vram-follow 1: maximum prompt "
+        "compute-buffer VRAM credited back to the automatic whole-layer budget (default: 640MiB)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_gpu_layers_lend_reclaim = (int64_t) moe_stream_parse_size(value);
+        }
+    ).set_internal());
+    add_opt(common_arg(
+        {"--moe-stream-copy-ahead-one-below"}, "SIZE",
+        "total pool-GPU VRAM threshold below which automatic --moe-stream-copy-ahead selects one copy set (2) instead of "
+        "two (1) (default: 10GiB)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_copy_ahead_one_below = (int64_t) moe_stream_parse_size(value);
         }
     ).set_internal());
     add_opt(common_arg(

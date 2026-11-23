@@ -874,7 +874,7 @@ struct llama_model {
     bool prefill_ple_fast_on()           const { return params.moe_stream_prefill_fast == 1 || params.moe_stream_ple_fast    == 1; }
     bool prefill_lm_bf16_on()            const { return params.moe_stream_prefill_fast == 1 || params.moe_stream_lm_bf16     == 1; }
     bool prefill_lm_bf16_explicit()      const { return params.moe_stream_lm_bf16     == 1; }
-    bool prefill_lend_output_on()        const { return params.moe_stream_prefill_fast == 1 || params.moe_stream_lend_output == 1; }
+    bool prefill_lend_output_on()        const { return params.moe_stream_lend_output == 1; }
     bool prefill_lend_output_explicit()  const { return params.moe_stream_lend_output == 1; }
 
 protected:

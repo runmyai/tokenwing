@@ -1910,7 +1910,11 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_stream_qsa_fused        = params.moe_stream_qsa_fused;
     mparams.moe_stream_hc_fused         = params.moe_stream_hc_fused;
     mparams.moe_stream_ple_fast         = params.moe_stream_ple_fast;
-    mparams.moe_stream_hybrid_tail      = params.moe_stream_hybrid_tail;
+    mparams.moe_stream_gpu_layers_floor        = params.moe_stream_gpu_layers_floor;
+    mparams.moe_stream_gpu_layers_lend_reclaim = params.moe_stream_gpu_layers_lend_reclaim;
+    mparams.moe_stream_copy_ahead_one_below    = params.moe_stream_copy_ahead_one_below;
+    mparams.moe_stream_gpu_layers_cap          = params.moe_stream_gpu_layers_cap;
+    mparams.moe_stream_gpu_layers_uniform_max  = params.moe_stream_gpu_layers_uniform_max;
     mparams.moe_stream_auto_mask        = params.moe_stream_auto_mask;
     mparams.moe_stream_plan             = params.moe_stream_plan;
     mparams.moe_stream_plan_bind_early  = params.moe_stream_plan_bind_early;  // test only

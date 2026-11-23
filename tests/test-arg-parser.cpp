@@ -357,7 +357,11 @@ static void test(void) {
         assert(p.moe_stream_vram_follow == 1);
         assert(p.moe_stream_vram_parallel == 1);
         assert(p.moe_stream_vram_copyback == 1);
-        assert((p.moe_stream_auto_mask & 0x3Fu) == 0x3Fu);
+        assert((p.moe_stream_auto_mask & 0x7Fu) == 0x7Fu);
+        assert(p.moe_stream_gpu_layers_floor == (2500LL << 20));
+        assert(p.moe_stream_gpu_layers_lend_reclaim == (640LL << 20));
+        assert(p.moe_stream_copy_ahead_one_below == (10LL << 30));
+        assert(p.moe_stream_gpu_layers_uniform_max == -1);
     }
 
     // 262k context auto-scales batch/ubatch under --moe-stream model
@@ -399,15 +403,23 @@ static void test(void) {
         assert(p.moe_stream_vram_follow == 0);
         assert(p.moe_stream_cpu_iqk == 0);
         assert(p.moe_stream_idle_load == 0);
+        assert((p.moe_stream_auto_mask & (1u << 6)) == 0);
 
         common_params p_ov;
         argv = {"binary_name", "-m", "m.gguf", "--moe-stream", "model",
-                "--moe-stream-copy-ahead", "2", "--moe-stream-gpu-layers", "0", "--moe-stream-elastic", "1"};
+                "--moe-stream-copy-ahead", "2", "--moe-stream-gpu-layers", "0", "--moe-stream-elastic", "1",
+                "--moe-stream-gpu-layers-floor", "3GiB", "--moe-stream-gpu-layers-cap", "0.40",
+                "--moe-stream-gpu-layers-uniform-max", "4", "--moe-stream-gpu-layers-lend-reclaim", "512MiB",
+                "--moe-stream-copy-ahead-one-below", "12GiB"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), p_ov, LLAMA_EXAMPLE_COMMON));
         assert(p_ov.moe_stream_copy_ahead == 2);
         assert(p_ov.moe_stream_gpu_layers == 0);
         assert(p_ov.moe_stream_elastic == 1);
         assert(p_ov.moe_stream_window == 0);
+        assert(p_ov.moe_stream_gpu_layers_floor == (3LL << 30));
+        assert(p_ov.moe_stream_gpu_layers_uniform_max == 4);
+        assert(p_ov.moe_stream_gpu_layers_lend_reclaim == (512LL << 20));
+        assert(p_ov.moe_stream_copy_ahead_one_below == (12LL << 30));
         assert((p_ov.moe_stream_auto_mask & (1u << 1)) == 0);
     }
 
@@ -418,20 +430,24 @@ static void test(void) {
         auto find_internal = [&](const char * name, bool & found, bool & internal) {
             found = false;
             for (const auto & opt : ctx_arg.options) {
-                if (std::find(opt.args.begin(), opt.args.end(), name) != opt.args.end()) {
-                    found = true;
-                    internal = opt.is_internal;
-                    break;
+                for (const char * a : opt.args) {
+                    if (a && strcmp(a, name) == 0) {
+                        found = true;
+                        internal = opt.is_internal;
+                        return;
+                    }
                 }
             }
         };
-        bool f1 = false, i1 = true, f2 = false, i2 = true, f3 = false, i3 = false;
+        bool f1 = false, i1 = true, f2 = false, i2 = true, f3 = false, i3 = false, f4 = false, i4 = false;
         find_internal("--moe-stream", f1, i1);
         find_internal("--moe-stream-fast-prefill", f2, i2);
         find_internal("--moe-stream-copy-ahead", f3, i3);
+        find_internal("--moe-stream-gpu-layers-floor", f4, i4);
         assert(f1 && !i1);
         assert(f2 && !i2);
         assert(f3 && i3);
+        assert(f4 && i4);
     }
 
     // --draft cannot be used outside llama-speculative

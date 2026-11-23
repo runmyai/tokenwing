@@ -379,12 +379,15 @@ template <int C, int V> struct alignas(128) shared_kda {
     } scratch;
 
     float g_pref[C * D];
-    float lower[C * C];
+    float lower[(C * (C - 1)) / 2];
     float beta[C];
     int   wide_gate;
 
-    static __device__ __forceinline__ int lower_index(int r, int c) { return r * C + c; }
+    static __device__ __forceinline__ int lower_index(int r, int c) { return (r * (r - 1)) / 2 + c; }
 };
+
+static_assert(sizeof(shared<16, 128>)     <= 99 * 1024, "GDN whole-head SMEM exceeds 99 KiB consumer smpbo");
+static_assert(sizeof(shared_kda<16, 128>) <= 99 * 1024, "GDN KDA whole-head SMEM exceeds 99 KiB consumer smpbo");
 
 template <int C, int V, int BLOCKS = 1>
 static __global__ __launch_bounds__(256, BLOCKS) void gdn_kda_single(ggml_cuda_gdn_mma_args a) {
@@ -760,7 +763,12 @@ static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a
             }
             return init_kda<16, 32, 2>(device) ? gdn_path::slice32_two_blocks : gdn_path::ar;
         }
-        return init_kda<16, 128, 1>(device) ? gdn_path::whole_head : gdn_path::ar;
+        if (init_kda<16, 128, 1>(device)) {
+            return gdn_path::whole_head;
+        }
+        return init_kda<16, 32, 2>(device) ? gdn_path::slice32_two_blocks
+             : init_kda<16, 32, 1>(device) ? gdn_path::slice32_one_block
+             : gdn_path::ar;
     }
     // Value splitting pays off when whole heads leave at least half the SMs idle.
     if (a.H * a.n_seqs * 2 <= info.nsm) {
@@ -770,7 +778,12 @@ static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a
         }
         return init<16, 32, 2>(device) ? gdn_path::slice32_two_blocks : gdn_path::ar;
     }
-    return init<16, 128>(device) ? gdn_path::whole_head : gdn_path::ar;
+    if (init<16, 128>(device)) {
+        return gdn_path::whole_head;
+    }
+    return init<16, 32, 2>(device) ? gdn_path::slice32_two_blocks
+         : init<16, 32, 1>(device) ? gdn_path::slice32_one_block
+         : gdn_path::ar;
 #endif // GGML_USE_HIP
 }
 }  // namespace

@@ -1901,6 +1901,15 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_stream_prompt_split_places = params.moe_stream_prompt_split_places;
     mparams.moe_stream_gpu_wave_skip_zero = params.moe_stream_gpu_wave_skip_zero;
     mparams.moe_stream_gpu_skip_zero    = params.moe_stream_gpu_skip_zero;
+    mparams.moe_stream_prefill_fast     = params.moe_stream_prefill_fast;
+    mparams.moe_stream_mmq_moe_opt      = params.moe_stream_mmq_moe_opt;
+    mparams.moe_stream_gpu_moe_fused    = params.moe_stream_gpu_moe_fused;
+    mparams.moe_stream_pinned_ring      = params.moe_stream_pinned_ring;
+    mparams.moe_stream_lm_bf16          = params.moe_stream_lm_bf16;
+    mparams.moe_stream_lend_output      = params.moe_stream_lend_output;
+    mparams.moe_stream_qsa_fused        = params.moe_stream_qsa_fused;
+    mparams.moe_stream_hc_fused         = params.moe_stream_hc_fused;
+    mparams.moe_stream_ple_fast         = params.moe_stream_ple_fast;
     mparams.moe_stream_plan             = params.moe_stream_plan;
     mparams.moe_stream_plan_bind_early  = params.moe_stream_plan_bind_early;  // test only
     mparams.moe_stream_drop_stale       = params.moe_stream_drop_stale;

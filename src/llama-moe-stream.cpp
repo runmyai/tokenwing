@@ -4254,6 +4254,26 @@ llama_moe_stream::~llama_moe_stream() {
         if (G.ctx) { ggml_free(G.ctx); }
     }
     vx_groups.clear();
+    for (int s = 0; s < PRING_SLICES; ++s) {
+        if (pring_ev[s]) {
+            ggml_backend_event_free(pring_ev[s]);
+            pring_ev[s]     = nullptr;
+            pring_ev_rec[s] = false;
+        }
+    }
+    if (pring_buf) {
+        ggml_backend_buffer_free(pring_buf);
+        pring_buf  = nullptr;
+        pring_ptr  = nullptr;
+        pring_cap  = 0;
+        pring_head = 0;
+    }
+    if (tailw_zero_pin_buf) {
+        ggml_backend_buffer_free(tailw_zero_pin_buf);
+        tailw_zero_pin_buf = nullptr;
+        tailw_zero_pin_ptr = nullptr;
+        tailw_zero_pin_cap = 0;
+    }
     if (tailw_ctx) {   // the tail waves' tensor headers (their memory is the pool's, freed above)
         ggml_free(tailw_ctx);
         tailw_ctx = nullptr;
@@ -4264,6 +4284,9 @@ llama_moe_stream::~llama_moe_stream() {
     // Unregister host pool addresses before destroying backend buffers (host_buft UMA pools own their memory inside bufs)
     for (size_t i = 0; i < pool_mem.size(); i++) {
         unregister_pool(pool_mem[i]);
+        if (unpin_pool_fn && i < pool_pinned.size() && pool_pinned[i]) {
+            unpin_pool_fn(pool_mem[i]);
+        }
     }
     bufs.clear();
     for (ggml_context * ctx : ctxs) {
@@ -4462,6 +4485,8 @@ ggml_tensor * llama_moe_stream::create_pool(int32_t il, const std::string & name
         sl->slot_expert .assign(nsa, -1);
         sl->slot_state  .assign(nsa, MOE_STREAM_SLOT_EMPTY);
         sl->slot_last_use.assign(nsa, 0);
+        sl->slot_tailw_gen.assign(nsa, 0);
+        sl->slot_ca_gen   .assign(nsa, 0);
         sl->slot_freq    .assign(nsa, 0);
         sl->slot_seg     .assign(nsa, 0);   // every slot starts in probation
         sl->slot_prefetch.assign(nsa, 0);
@@ -6213,6 +6238,7 @@ void llama_moe_stream::io_loop_t(int ith) {
             // the other threads and of the next layer.
             // A sidecar already in the repacked layout is copied into the slot as it is; only a
             // plain sidecar is converted, and then only into a repacked pool.
+            wait_slot_h2d_done(sl, job.slot);
             if (convert_on_read && !sl.repacked) {
                 // this thread's own scratch, so the reads stay parallel (one shared scratch behind a
                 // mutex serialized all of them and tripled the stall: 13.5 -> 42.8 ms/token)
@@ -7079,6 +7105,40 @@ void llama_moe_stream::note_lead(llama_moe_stream_layer & sl, int32_t slot) {
     }
 }
 
+void llama_moe_stream::wait_slot_h2d_done(const llama_moe_stream_layer & sl, int32_t slot) {
+    if (!pools_registered || slot < 0) {
+        return;
+    }
+    static_assert(sizeof(std::atomic<uint64_t>) == sizeof(uint64_t), "atomic<uint64_t> layout");
+    const uint64_t tg = (size_t) slot < sl.slot_tailw_gen.size()
+        ? reinterpret_cast<const std::atomic<uint64_t> *>(&sl.slot_tailw_gen[(size_t) slot])->load(std::memory_order_acquire)
+        : 0;
+    const uint64_t cg = (size_t) slot < sl.slot_ca_gen.size()
+        ? reinterpret_cast<const std::atomic<uint64_t> *>(&sl.slot_ca_gen[(size_t) slot])->load(std::memory_order_acquire)
+        : 0;
+    if (tg <= tailw_h2d_acked.load(std::memory_order_acquire) &&
+        cg <= ca_h2d_acked.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(h2d_ev_mtx);
+    uint64_t ta = tailw_h2d_acked.load(std::memory_order_relaxed);
+    if (tg > ta && tg <= tailw_h2d_seq.load(std::memory_order_relaxed)) {
+        ggml_backend_event_t ev = tailw_ev_ring[tg % H2D_EV_RING];
+        if (ev != nullptr) {
+            ggml_backend_event_synchronize(ev);
+        }
+        tailw_h2d_acked.store(tg, std::memory_order_release);
+    }
+    uint64_t ca = ca_h2d_acked.load(std::memory_order_relaxed);
+    if (cg > ca && cg <= ca_h2d_seq.load(std::memory_order_relaxed)) {
+        ggml_backend_event_t ev = ca_ev_ring[cg % H2D_EV_RING];
+        if (ev != nullptr) {
+            ggml_backend_event_synchronize(ev);
+        }
+        ca_h2d_acked.store(cg, std::memory_order_release);
+    }
+}
+
 // mtx must be held: a slot loses whatever expert it held
 void llama_moe_stream::drop_slot(llama_moe_stream_layer & sl, int32_t slot, int32_t taker, bool taker_guess, bool to_vram,
                                  bool by_copyback) {
@@ -7357,9 +7417,16 @@ bool llama_moe_stream::pin_pools(ggml_backend_reg_t reg) {
     }
 
     typedef bool (*register_fn)(void *, size_t);
+    typedef void (*unregister_fn)(void *);
     register_fn reg_fn = reg
-        ? (register_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer")
+        ? (register_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_pin_rw_host_buffer")
         : nullptr;
+    if (reg_fn && reg) {
+        unpin_pool_fn = (unregister_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_unpin_rw_host_buffer");
+    } else if (reg) {
+        reg_fn        = (register_fn)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer");
+        unpin_pool_fn = (unregister_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
+    }
 
     if (!reg_fn) {
         fprintf(stderr, "%s: this backend cannot register host memory (no "
@@ -7374,11 +7441,13 @@ bool llama_moe_stream::pin_pools(ggml_backend_reg_t reg) {
 
     size_t n_ok = 0;
     size_t ok_bytes = 0;
+    pool_pinned.assign(pool_mem.size(), 0);
 
     for (size_t i = 0; i < pool_mem.size(); i++) {
         if (reg_fn(pool_mem[i], pool_size[i])) {
-            n_ok     += 1;
-            ok_bytes += pool_size[i];
+            pool_pinned[i] = 1;
+            n_ok          += 1;
+            ok_bytes      += pool_size[i];
         } else {
             // no CUDA here, so no cudaGetErrorString(): the driver's own message needs the runtime
             fprintf(stderr, "%s: pool %zu (%.2f MiB) could not be registered with the driver\n", __func__,
@@ -7444,6 +7513,35 @@ void llama_moe_stream::note_use(llama_moe_stream_layer & sl, int32_t s, bool dem
 
 // is `a` a better victim than `b` under the layer's policy?
 bool llama_moe_stream::worse_than(const llama_moe_stream_layer & sl, int32_t a, int32_t b) const {
+    if (!decode_phase && p1.prefill_fast) {
+        const int32_t ea = sl.slot_expert[a];
+        const int32_t eb = sl.slot_expert[b];
+        if (ea >= 0 && eb >= 0) {
+            // Belady farthest-next-use during remap_needed: evict experts unused in this call (or used in a farther wave) first
+            if (sl.in_remap_fill) {
+                const bool need_a = (size_t) ea < sl.touched.size() && sl.touched[ea] != 0;
+                const bool need_b = (size_t) eb < sl.touched.size() && sl.touched[eb] != 0;
+                if (need_a != need_b) {
+                    return !need_a;
+                }
+                if (need_a && need_b && wp_tab_il == sl.il &&
+                        (size_t) ea < wp_tab.w_first.size() && (size_t) eb < wp_tab.w_first.size()) {
+                    const int32_t wa = wp_tab.w_first[ea];
+                    const int32_t wb = wp_tab.w_first[eb];
+                    if (wa != wb) {
+                        return wa > wb;
+                    }
+                }
+            }
+            // S3-FIFO decode scan shield: keep decode-hot experts (p1_dval > 0) over cold prefill transients
+            const bool hot_a = !sl.p1_dval.empty() && sl.p1_dval[ea] > 0.0f;
+            const bool hot_b = !sl.p1_dval.empty() && sl.p1_dval[eb] > 0.0f;
+            if (hot_a != hot_b) {
+                return !hot_a;
+            }
+        }
+    }
+
     if (policy == MOE_STREAM_POLICY_DECAY && decode_phase) {
         const float va = p1_value(sl, a);
         const float vb = p1_value(sl, b);
@@ -12658,6 +12756,11 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
     }
 
     // fill this wave
+    struct remap_fill_guard {
+        bool & flag;
+        explicit remap_fill_guard(bool & f) : flag(f) { flag = true; }
+        ~remap_fill_guard() { flag = false; }
+    } fill_guard(sl.in_remap_fill);
     for (size_t r = 0; r < sl.uniq.size(); r++) {
         const int32_t e = sl.uniq[r];
         const bool mine = in_wave(r);
@@ -15656,8 +15759,11 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                             ggml_row_size(Pk->type, Pk->ne[0])*Pk->ne[1] == (k < 2 ? nbg : nbd) && Pk->nb[2] == (k < 2 ? nbg : nbd);
                 }
             }
-            tailw_why = pools_registered ? "the pools are page-locked (--moe-stream-pin)"
-                   : reg == nullptr || (strcmp(ggml_backend_reg_name(reg), "CUDA") != 0 && strcmp(ggml_backend_reg_name(reg), "ROCm") != 0)
+            const bool cuda_or_rocm = reg != nullptr &&
+                (strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 || strcmp(ggml_backend_reg_name(reg), "ROCm") == 0);
+            const bool pin_tailw_ok = p1.prefill_fast && cuda_or_rocm;
+            tailw_why = (pools_registered && !pin_tailw_ok) ? "the pools are page-locked (--moe-stream-pin)"
+                   : !cuda_or_rocm
                    ? "not a CUDA / ROCm GPU (to do: a copy-done event)"
                    : !shape ? "a pool slice is not one VRAM place (merged gate|up or another type)" : "";
             tailw_ready = tailw_why.empty();
@@ -16086,7 +16192,64 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
 
     // 4. fill from the sidecar (O_DIRECT, one whole expert block at a time) and mark the experts as held
     int64_t n_filled = 0;
+    int64_t n_ram_cached = 0;
     if (!vx_test_empty) {
+        auto upload_and_cache = [&](llama_moe_stream_layer & sl, const vx_group_t & G, int32_t e, int32_t vslot,
+                const uint8_t * stage, size_t nb_g, size_t nb_d) {
+            if (sl.weights[1].offs == sl.weights[0].offs + nb_g) {
+                ggml_backend_tensor_set(G.gate_up, stage + sl.weights[0].offs, (size_t) vslot*2*nb_g, 2*nb_g);
+            } else {
+                ggml_backend_tensor_set(G.gate_up, stage + sl.weights[0].offs, (size_t) vslot*2*nb_g,        nb_g);
+                ggml_backend_tensor_set(G.gate_up, stage + sl.weights[1].offs, (size_t) vslot*2*nb_g + nb_g, nb_g);
+            }
+            ggml_backend_tensor_set(G.down, stage + sl.weights[2].offs, (size_t) vslot*nb_d, nb_d);
+            sl.vx_slot[e] = vslot;
+            n_filled++;
+
+            // When every expert keeps a RAM copy (vx_keep_ram), populate an EMPTY RAM slot directly from stage
+            // so initial idle_round does not re-read these held experts from SSD a second time.
+            if (p1.prefill_fast && vx_keep_ram && !convert_on_read && !el_on && e >= 0 && (uint32_t) e < sl.n_expert && sl.expert_slot[e] < 0 &&
+                    sl.weights[0].pool != nullptr && sl.weights[0].pool->data != nullptr &&
+                    sl.weights[1].pool != nullptr && sl.weights[1].pool->data != nullptr &&
+                    sl.weights[2].pool != nullptr && sl.weights[2].pool->data != nullptr) {
+                int32_t rs = -1;
+                const uint32_t s_lim = std::min<uint32_t>(sl.share, sl.n_slots);
+                for (uint32_t cand = 0; cand < s_lim; ++cand) {
+                    if (sl.slot_state[cand] == MOE_STREAM_SLOT_EMPTY &&
+                            (sl.slot_off.empty() || !sl.slot_off[cand]) &&
+                            sl.slot_expert[cand] < 0 && !sl.keep[cand]) {
+                        rs = (int32_t) cand;
+                        break;
+                    }
+                }
+                if (rs >= 0) {
+                    std::memcpy((char *) sl.weights[0].pool->data + (size_t) rs*sl.weights[0].size, stage + sl.weights[0].offs, sl.weights[0].size);
+                    std::memcpy((char *) sl.weights[1].pool->data + (size_t) rs*sl.weights[1].size, stage + sl.weights[1].offs, sl.weights[1].size);
+                    std::memcpy((char *) sl.weights[2].pool->data + (size_t) rs*sl.weights[2].size, stage + sl.weights[2].offs, sl.weights[2].size);
+                    if (!sl.el_zero_known.empty() && (size_t) rs < sl.el_zero_known.size()) {
+                        sl.el_zero_known[(size_t) rs] = 0;
+                        sl.el_res       [(size_t) rs] = 1;
+                        sl.el_land      [(size_t) rs] = 0;
+                    }
+                    sl.slot_expert[(size_t) rs] = e;
+                    sl.expert_slot[(size_t) e]  = rs;
+                    sl.gsf_dirty = 1;
+                    if (pr_on) {
+                        const int64_t t_pr = ggml_time_us();
+                        for (int p = 0; p < 3; ++p) {
+                            sl.proj_ready_us[p][(size_t) rs] = t_pr;
+                            reinterpret_cast<std::atomic<uint32_t> *>(&sl.proj_ready[p][(size_t) rs])->store(1, std::memory_order_release);
+                        }
+                    }
+                    slot_settle_ready(sl, rs);
+                    if (!sl.slot_idle.empty() && (size_t) rs < sl.slot_idle.size()) {
+                        sl.slot_idle[(size_t) rs] = 1;
+                    }
+                    n_ram_cached++;
+                }
+            }
+        };
+
         for (auto & G : vx_groups) {
             const size_t nb_g  = ggml_row_size(G.t_gate, G.ne_gate[0])*G.ne_gate[1];   // one gate (or up) slice
             const size_t nb_d  = ggml_row_size(G.t_down, G.ne_down[0])*G.ne_down[1];
@@ -16132,11 +16295,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                         moe_stream_fail("--moe-stream-vram-experts: reading expert %d of layer %d from the sidecar failed (%s)",
                                 e, sl.il, r < 0 ? strerror(errno) : "short read");
                     }
-                    ggml_backend_tensor_set(G.gate_up, stage + sl.weights[0].offs, (size_t) slot*2*nb_g,        nb_g);
-                    ggml_backend_tensor_set(G.gate_up, stage + sl.weights[1].offs, (size_t) slot*2*nb_g + nb_g, nb_g);
-                    ggml_backend_tensor_set(G.down,    stage + sl.weights[2].offs, (size_t) slot*nb_d,          nb_d);
-                    sl.vx_slot[e] = slot;
-                    n_filled++;
+                    upload_and_cache(sl, G, e, slot, stage, nb_g, nb_d);
                 }
                 next_base += (int32_t) n_li;
             }
@@ -16175,11 +16334,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                         moe_stream_fail("--moe-stream-vram-experts: reading expert %d of layer %d from the sidecar failed (%s)",
                                 e, sl.il, r < 0 ? strerror(errno) : "short read");
                     }
-                    ggml_backend_tensor_set(G.gate_up, stage + sl.weights[0].offs, (size_t) slot*2*nb_g,        nb_g);
-                    ggml_backend_tensor_set(G.gate_up, stage + sl.weights[1].offs, (size_t) slot*2*nb_g + nb_g, nb_g);
-                    ggml_backend_tensor_set(G.down,    stage + sl.weights[2].offs, (size_t) slot*nb_d,          nb_d);
-                    sl.vx_slot[e] = slot;
-                    n_filled++;
+                    upload_and_cache(sl, G, e, slot, stage, nb_g, nb_d);
                     k++;
                     any = true;
                 }
@@ -16190,6 +16345,10 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
             fprintf(stderr, "%s: the pool's tail: %d places (the largest RAM pool view, %d slots + zero slices; %.1f MiB = the pool copies of a GPU-wave graph, "
                     "which no longer take compute-buffer memory): %d filled with the list's next experts, %d free%s\n", __func__, tail_n, tail_n,
                     (double) tail_n*(2*nb_g + nb_d)/1048576.0, k, tail_n - k, tail_preset ? "" : " (MOE_STREAM_TEST_PRESET_COPY=0: the copies stay in the compute buffer, the tail is still vacated for GPU-wave graphs)");
+        }
+        if (n_ram_cached > 0) {
+            fprintf(stderr, "%s: vx_keep_ram: cached %lld held experts into RAM slots during initial sidecar fill\n",
+                    __func__, (long long) n_ram_cached);
         }
     }
 
@@ -16290,6 +16449,16 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
     // Tail waves: three tensors at the tail's copy places (where tail_copy_hook puts the scheduler's pool copies: gate, then up in the
     // merged gate|up tensor's tail, down in the down tensor's tail), the shape of a pool view of tail_copy_n slices
     if (tail_on && tailw_ready && !il_of_moe.empty()) {
+        if (pools_registered && dev != nullptr) {
+            for (size_t ei = 0; ei < H2D_EV_RING; ++ei) {
+                if (tailw_ev_ring[ei] == nullptr) {
+                    tailw_ev_ring[ei] = ggml_backend_event_new(dev);
+                }
+                if (ca_ev_ring[ei] == nullptr) {
+                    ca_ev_ring[ei] = ggml_backend_event_new(dev);
+                }
+            }
+        }
         // One set per pool group (format), at that group's copy places in the tail group's tensors (the sets share the bytes)
         const auto & G  = vx_groups[(size_t) tail_group];
         const size_t nb_g = ggml_row_size(G.t_gate, G.ne_gate[0])*G.ne_gate[1];
@@ -16324,6 +16493,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                 if (ok) {
                     t->buffer = G.buf;
                     t->data   = addr;
+                    t->flags |= GGML_TENSOR_FLAG_PREZERO_PAD;
                     tailw_tg[si][(size_t) k] = t;
                 }
             }
@@ -17211,9 +17381,9 @@ void llama_moe_stream::vf_cb_copy(vf_job_t & j, bool async) {
                          (uint8_t *) B.weights[1].pool->data + (size_t) s*B.weights[1].size,
                          (uint8_t *) B.weights[2].pool->data + (size_t) s*B.weights[2].size };
     const bool stale = vf_test_cb_stale > 0 && vf_cb_seen.fetch_add(1) + 1 == vf_test_cb_stale;   // TEST ONLY: the failure test
+    wait_slot_h2d_done(B, s);
     if (async && vf_bounce) {
-        ggml_backend_tensor_get_async(vf_be, G.gate_up, vf_bounce,          o_g, nb_g);
-        ggml_backend_tensor_get_async(vf_be, G.gate_up, vf_bounce + nb_g,   o_u, nb_g);
+        ggml_backend_tensor_get_async(vf_be, G.gate_up, vf_bounce,          o_g, 2 * nb_g);
         ggml_backend_tensor_get_async(vf_be, G.down,    vf_bounce + 2*nb_g, o_d, nb_d);
         ggml_backend_synchronize(vf_be);   // the copy's event: the bytes are in the bounce
         if (!stale) {
@@ -18000,6 +18170,7 @@ void llama_moe_stream::tail_vacate_t(std::unique_lock<std::mutex> & lock, int32_
     const int64_t t_cb0 = ggml_time_us();
     // TEST ONLY: the held experts without a RAM copy leave the tail without being copied back (the old behaviour, for the A/B)
     static const bool tail_cb_off = getenv("MOE_STREAM_TEST_NO_TAIL_COPYBACK") && atoi(getenv("MOE_STREAM_TEST_NO_TAIL_COPYBACK")) != 0;
+    std::deque<vf_job_t> cb_jobs;
     for (int32_t p = tail_first; p < tail_first + n_places; p++) {
         const int32_t il = vf_place_il[g][p], e = vf_place_e[g][p];
         if (il < 0) {
@@ -18016,8 +18187,87 @@ void llama_moe_stream::tail_vacate_t(std::unique_lock<std::mutex> & lock, int32_
         vf_place_e [g][p] = -1;
         n++;
         if (sl.expert_slot[e] < 0 && !tail_cb_off) {   // no RAM copy (elastic RAM drops them): the place's bytes are still there
-            n_cb += tail_copy_back(g, p, il, e) ? 1 : 0;
+            cb_jobs.emplace_back();
+            if (!tail_claim_cb_slot(g, p, il, e, cb_jobs.back())) {
+                cb_jobs.pop_back();
+            }
         }
+    }
+    if (!cb_jobs.empty()) {
+        const auto & G    = vx_groups[(size_t) g];
+        const size_t nb_g = ggml_row_size(G.t_gate, G.ne_gate[0]) * G.ne_gate[1];
+        const size_t nb_d = ggml_row_size(G.t_down, G.ne_down[0]) * G.ne_down[1];
+        const size_t stride = GGML_PAD(2 * nb_g + nb_d, 256);
+        const size_t need_cap = 2 * (size_t) VAC_D2H_HALF * stride;
+        bool use_pipe = cb_jobs.size() >= 2 && vf_be != nullptr && !vf_verify_on && vf_test_cb_stale == 0;
+        if (use_pipe && vac_d2h_cap < need_cap) {
+            if (vac_d2h_buf) {
+                ggml_backend_buffer_free(vac_d2h_buf);
+                vac_d2h_buf = nullptr;
+                vac_d2h_ptr = nullptr;
+                vac_d2h_cap = 0;
+            }
+            ggml_backend_buffer_type_t hbt = ggml_backend_dev_host_buffer_type(vf_dev);
+            ggml_backend_buffer_t b = hbt ? ggml_backend_buft_alloc_buffer(hbt, need_cap) : nullptr;
+            if (b && ggml_backend_buffer_get_type(b) == hbt && ggml_backend_buffer_is_host(b)) {
+                vac_d2h_buf = b;
+                vac_d2h_ptr = (uint8_t *) ggml_backend_buffer_get_base(b);
+                vac_d2h_cap = need_cap;
+                for (int h = 0; h < 2; ++h) {
+                    if (!vac_d2h_ev[h]) {
+                        vac_d2h_ev[h] = ggml_backend_event_new(vf_dev);
+                    }
+                }
+            } else if (b) {
+                ggml_backend_buffer_free(b);
+            }
+        }
+        if (use_pipe && vac_d2h_ptr != nullptr && vac_d2h_cap >= need_cap && vac_d2h_ev[0] && vac_d2h_ev[1]) {
+            const size_t nb_chunks = (cb_jobs.size() + (size_t) VAC_D2H_HALF - 1) / (size_t) VAC_D2H_HALF;
+            const auto issue_chunk = [&](size_t c) {
+                const size_t h  = c & 1;
+                const size_t i0 = c * (size_t) VAC_D2H_HALF;
+                const size_t i1 = std::min(i0 + (size_t) VAC_D2H_HALF, cb_jobs.size());
+                for (size_t i = i0; i < i1; ++i) {
+                    const vf_job_t & j = cb_jobs[i];
+                    const size_t o_g = (size_t) j.place * 2 * nb_g;
+                    const size_t o_d = (size_t) j.place * nb_d;
+                    uint8_t * dst_pin = vac_d2h_ptr + (h * (size_t) VAC_D2H_HALF + (i - i0)) * stride;
+                    ggml_backend_tensor_get_async(vf_be, G.gate_up, dst_pin,            o_g, 2 * nb_g);
+                    ggml_backend_tensor_get_async(vf_be, G.down,    dst_pin + 2 * nb_g, o_d, nb_d);
+                }
+                ggml_backend_event_record(vac_d2h_ev[h], vf_be);
+            };
+            issue_chunk(0);
+            for (size_t c = 0; c < nb_chunks; ++c) {
+                if (c + 1 < nb_chunks) {
+                    issue_chunk(c + 1);
+                }
+                const size_t h  = c & 1;
+                const size_t i0 = c * (size_t) VAC_D2H_HALF;
+                const size_t i1 = std::min(i0 + (size_t) VAC_D2H_HALF, cb_jobs.size());
+                ggml_backend_event_synchronize(vac_d2h_ev[h]);
+                for (size_t i = i0; i < i1; ++i) {
+                    vf_job_t & j = cb_jobs[i];
+                    auto &     B = *layers[j.leave_il];
+                    const int32_t s = j.cb_slot;
+                    const uint8_t * src_pin = vac_d2h_ptr + (h * (size_t) VAC_D2H_HALF + (i - i0)) * stride;
+                    uint8_t * d0 = (uint8_t *) B.weights[0].pool->data + (size_t) s * B.weights[0].size;
+                    uint8_t * d1 = (uint8_t *) B.weights[1].pool->data + (size_t) s * B.weights[1].size;
+                    uint8_t * d2 = (uint8_t *) B.weights[2].pool->data + (size_t) s * B.weights[2].size;
+                    std::memcpy(d0, src_pin,            nb_g);
+                    std::memcpy(d1, src_pin + nb_g,     nb_g);
+                    std::memcpy(d2, src_pin + 2 * nb_g, nb_d);
+                    vf_cb_settle(j);
+                }
+            }
+        } else {
+            for (vf_job_t & j : cb_jobs) {
+                vf_cb_copy(j, vf_be != nullptr);
+                vf_cb_settle(j);
+            }
+        }
+        n_cb += (int32_t) cb_jobs.size();
     }
     tail_vacated    = true;
     tail_vac_n      = n_places;
@@ -18038,11 +18288,7 @@ void llama_moe_stream::tail_vacate_t(std::unique_lock<std::mutex> & lock, int32_
     }
 }
 
-// Mtx held, in tail_vacate_t, right after expert e of layer il left tail place p of group g: it has no RAM copy (VRAM-held experts drop
-// theirs while elastic RAM may give slots back), so the prompt that borrows the place would read it from the SSD again. Its bytes are
-// still in the place: copy them into an EMPTY RAM slot of the layer that a prompt may read (the first n_slots; never a slot elastic RAM
-// switched off, never an eviction). No such slot: false, and the expert is read from the SSD when it is needed, as without this
-bool llama_moe_stream::tail_copy_back(int32_t g, int32_t p, int32_t il, int32_t e) {
+bool llama_moe_stream::tail_claim_cb_slot(int32_t g, int32_t p, int32_t il, int32_t e, vf_job_t & out_j) {
     auto & B = *layers[il];
     int32_t v = -1;
     const uint32_t n = std::min<uint32_t>(B.n_slots, n_slots);
@@ -18055,9 +18301,21 @@ bool llama_moe_stream::tail_copy_back(int32_t g, int32_t p, int32_t il, int32_t 
         tail_cb_noroom += 1;
         return false;
     }
+    out_j.group = g; out_j.place = p; out_j.leave_il = il; out_j.leave_e = e;
+    cb_claim(B, v, e, out_j);
+    wait_slot_h2d_done(B, v);
+    return true;
+}
+
+// Mtx held, in tail_vacate_t, right after expert e of layer il left tail place p of group g: it has no RAM copy (VRAM-held experts drop
+// theirs while elastic RAM may give slots back), so the prompt that borrows the place would read it from the SSD again. Its bytes are
+// still in the place: copy them into an EMPTY RAM slot of the layer that a prompt may read (the first n_slots; never a slot elastic RAM
+// switched off, never an eviction). No such slot: false, and the expert is read from the SSD when it is needed, as without this
+bool llama_moe_stream::tail_copy_back(int32_t g, int32_t p, int32_t il, int32_t e) {
     vf_job_t j;
-    j.group = g; j.place = p; j.leave_il = il; j.leave_e = e;
-    cb_claim(B, v, e, j);
+    if (!tail_claim_cb_slot(g, p, il, e, j)) {
+        return false;
+    }
     vf_cb_copy(j, vf_be != nullptr);   // (the uploader's stream and pinned bounce when VRAM follow runs, else a plain synchronous read)
     vf_cb_settle(j);
     return true;
@@ -18154,6 +18412,84 @@ void llama_moe_stream::lm_call_end(bool complete) {
 // stream as runs of consecutive places from consecutive slots, three projections each. From pageable pool memory a host-to-device copy
 // returns once its bytes are staged, so the slots may be refilled when the op returns (the CLOBBER gate's claim); the zero places are
 // copied once after every vacate (they hold experts at word time)
+void llama_moe_stream::pring_ensure() {
+    if (pring_buf != nullptr || p1.pinned_ring <= 0 || tailw_be == nullptr) {
+        return;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(tailw_be);
+    ggml_backend_buffer_type_t hbuft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    if (hbuft == nullptr) {
+        return;
+    }
+    for (int64_t sz = p1.pinned_ring; sz >= ((int64_t) 32 << 20); sz >>= 1) {
+        ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(hbuft, (size_t) sz);
+        if (b != nullptr) {
+            pring_buf   = b;
+            pring_ptr   = (char *) ggml_backend_buffer_get_base(b);
+            pring_cap   = (size_t) sz;
+            pring_head  = 0;
+            pring_slice = 0;
+            for (int s = 0; s < PRING_SLICES; ++s) {
+                pring_ev[s]     = ggml_backend_event_new(dev);
+                pring_ev_rec[s] = false;
+            }
+            fprintf(stderr, "llama_moe_stream: pinned H2D staging ring allocated: %.1f MiB\n", (double) sz / 1048576.0);
+            break;
+        }
+    }
+}
+
+void llama_moe_stream::tailw_set_async_staged(ggml_tensor * D, const char * src, size_t dst_off, size_t nbytes) {
+    if (p1.pinned_ring <= 0 || nbytes == 0) {
+        ggml_backend_tensor_set_async(tailw_be, D, src, dst_off, nbytes);
+        return;
+    }
+    if (pring_ptr == nullptr) {
+        pring_ensure();
+    }
+    const size_t slice_cap = pring_cap / PRING_SLICES;
+    if (pring_ptr == nullptr || slice_cap == 0 || nbytes > slice_cap) {
+        ggml_backend_tensor_set_async(tailw_be, D, src, dst_off, nbytes);
+        return;
+    }
+    if (pring_head + nbytes > slice_cap) {
+        if (pring_ev[pring_slice]) {
+            ggml_backend_event_record(pring_ev[pring_slice], tailw_be);
+            pring_ev_rec[pring_slice] = true;
+        }
+        pring_slice = (pring_slice + 1) % PRING_SLICES;
+        pring_head  = 0;
+        if (pring_ev_rec[pring_slice] && pring_ev[pring_slice]) {
+            ggml_backend_event_synchronize(pring_ev[pring_slice]);
+            pring_ev_rec[pring_slice] = false;
+        }
+        pring_wraps += 1;
+    }
+    char * stage = pring_ptr + (size_t) pring_slice * slice_cap + pring_head;
+    std::memcpy(stage, src, nbytes);
+    ggml_backend_tensor_set_async(tailw_be, D, stage, dst_off, nbytes);
+    pring_head   = GGML_PAD(pring_head + nbytes, 64);
+    pring_bytes += (int64_t) nbytes;
+}
+
+void llama_moe_stream::set_lm_routed_ids(int32_t il, const int32_t * ids_host, int64_t n) {
+    if (il < 0 || (size_t) il >= layers.size() || !layers[il] || ids_host == nullptr || n <= 0) {
+        return;
+    }
+    if (lm_routed_mask.size() < layers.size()) {
+        lm_routed_mask.resize(layers.size());
+    }
+    const uint32_t ne = layers[il]->n_expert;
+    auto & mask = lm_routed_mask[(size_t) il];
+    mask.assign(ne, 0);
+    for (int64_t i = 0; i < n; ++i) {
+        const int32_t e = ids_host[i];
+        if (e >= 0 && (uint32_t) e < ne) {
+            mask[(size_t) e] = 1;
+        }
+    }
+}
+
 void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, int64_t n, int32_t wave) {
     if (!tail_vacated) {
         moe_stream_fail("tail waves: layer %d's GPU wave reads the tail's places while experts are held there (the tail was not vacated)", sl.il);
@@ -18193,9 +18529,7 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
     const size_t  gix = (size_t) set*vx_groups.size() + (size_t) sl.vx_group;
     const auto & g1s = gix < tailw_tg.size() ? tailw_tg[gix] : std::array<ggml_tensor *, 3>{ tailw_t[0], tailw_t[1], tailw_t[2] };
     if (tailw_zero_group_s[set] != sl.vx_group) {
-        tailw_zero_group_s[set] = sl.vx_group;
-        tailw_zero_group        = sl.vx_group;
-        tailw_zero_ok           = false;
+        tailw_zero_ok = false;
     } else if (ca_sets > 1) {
         tailw_zero_ok = true;   // this set's zero places still hold zeros (set at the last write of them, cleared by a vacate)
     }
@@ -18320,6 +18654,7 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
         ca_list_e.clear();
         ca_job_il = -1;
     }
+
     int64_t moved = 0;
     for (int pass = 0; pass < 2; pass++) {
         int32_t free_p = 0;
@@ -18379,11 +18714,21 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
             }
         }
     }
+    bool zero_places_clean = tailw_zero_ok;
     if (!tailw_zero_ok) {
-        for (int32_t r = 0; r < (int32_t) n_zero; r++) {
-            tailw_list.push_back({ Wp + r, zb + r });
+        const bool skip_zero_dma = !ca_test_check && p1.prefill_fast && p1.gpu_wave_skip_zero && out != nullptr &&
+                (n / std::max<int64_t>(1, (int64_t) n_expert_used)) >= 2 &&
+                ggml_is_quantized(g1s[0]->type) && ggml_is_quantized(g1s[1]->type) && ggml_is_quantized(g1s[2]->type) &&
+                zero_tail_of(g1s[0], sl.il) > 0 && zero_tail_of(g1s[1], sl.il) > 0 && zero_tail_of(g1s[2], sl.il) > 0;
+        if (!skip_zero_dma) {
+            for (int32_t r = 0; r < (int32_t) n_zero; r++) {
+                tailw_list.push_back({ Wp + r, zb + r });
+            }
+            tailw_zero_group_s[set] = sl.vx_group;
+            tailw_zero_group        = sl.vx_group;
+            tailw_zero_ok           = true;
+            zero_places_clean       = true;
         }
-        tailw_zero_ok = true;
     }
     if (ca_sets > 1) {
         tailw_zero_ok = false;   // per set (tailw_zero_group_s); the next gather decides for its own set
@@ -18401,7 +18746,7 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
             ggml_tensor *       D = g1s[(size_t) k];
             const size_t nb = P->nb[2];
             GGML_ASSERT(nb == D->nb[2] && P->type == D->type);
-            ggml_backend_tensor_set_async(tailw_be, D, (const char *) P->data + (size_t) s0*nb, (size_t) p0*nb, (size_t) len*nb);
+            tailw_set_async_staged(D, (const char *) P->data + (size_t) s0*nb, (size_t) p0*nb, (size_t) len*nb);
             calls += 1;
             bytes += (int64_t) len*(int64_t) nb;
         }
@@ -18414,7 +18759,7 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
         const ggml_tensor * P = sl.weights[2].pool;
         ggml_tensor *       D = g1s[2];
         const size_t nb = P->nb[2];
-        ggml_backend_tensor_set_async(tailw_be, D, (const char *) P->data + (size_t) pd.second*nb, (size_t) pd.first*nb, nb);
+        tailw_set_async_staged(D, (const char *) P->data + (size_t) pd.second*nb, (size_t) pd.first*nb, nb);
         calls += 1;
         bytes += (int64_t) nb;
     }
@@ -18432,13 +18777,35 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
                 }
             }
             const int64_t mx = std::max(pd[0], std::max(pd[1], pd[2]));
-            if ((int64_t) tailw_zero_src.size() < mx) {
+            if (mx > (int64_t) tailw_zero_pin_cap) {
+                if (ggml_backend_dev_t dev = ggml_backend_get_device(tailw_be)) {
+                    if (ggml_backend_buffer_type_t hbuft = ggml_backend_dev_host_buffer_type(dev)) {
+                        const size_t want = std::max<size_t>((size_t) GGML_PAD(mx, 4096), 4096);
+                        if (ggml_backend_buffer_t nb = ggml_backend_buft_alloc_buffer(hbuft, want)) {
+                            if (tailw_zero_pin_buf) {
+                                ggml_backend_buffer_free(tailw_zero_pin_buf);
+                            }
+                            tailw_zero_pin_buf = nb;
+                            tailw_zero_pin_ptr = (uint8_t *) ggml_backend_buffer_get_base(nb);
+                            tailw_zero_pin_cap = want;
+                            std::memset(tailw_zero_pin_ptr, 0, want);
+                        }
+                    }
+                }
+            }
+            const void * zero_ptr = tailw_zero_pin_ptr && (int64_t) tailw_zero_pin_cap >= mx ? (const void *) tailw_zero_pin_ptr : nullptr;
+            if (zero_ptr == nullptr && (int64_t) tailw_zero_src.size() < mx) {
                 tailw_zero_src.assign((size_t) mx, 0);
             }
-            for (int32_t p = 0; p < T; p++) {
+            if (zero_ptr == nullptr) {
+                zero_ptr = tailw_zero_src.data();
+            }
+            const int32_t p_end = zero_places_clean ? T : Wp;
+            for (int32_t p = 0; p < p_end; p++) {
                 const int32_t q = p + 1;
-                if (!tailw_read[(size_t) p] || (q < T && (q >= Wp || tailw_used[(size_t) q]))) {
-                    continue;   // (not read, or the next place holds this wave's expert or zeros)
+                const bool q_zero_ok = q >= Wp && zero_places_clean;
+                if (!tailw_read[(size_t) p] || (q < T && (q_zero_ok || tailw_used[(size_t) q]))) {
+                    continue;   // (not read, or the next place holds this wave's expert or DMA-filled zeros)
                 }
                 for (int k = 0; k < 3; k++) {
                     if (pd[(size_t) k] <= 0) {
@@ -18447,11 +18814,71 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
                     ggml_tensor * D    = g1s[(size_t) k];
                     ggml_tensor * base = k < 2 || tail_dn_r1[(size_t) sl.vx_group] ? GT.gate_up : GT.down;
                     const size_t  off  = (size_t) ((const char *) D->data - (const char *) base->data) + (size_t) q*D->nb[2];
-                    ggml_backend_tensor_set_async(tailw_be, base, tailw_zero_src.data(), off, (size_t) pd[(size_t) k]);
+                    ggml_backend_tensor_set_async(tailw_be, base, zero_ptr, off, (size_t) pd[(size_t) k]);
                     tailw_pads      += 1;
                     tailw_pad_bytes += pd[(size_t) k];
                     calls += 1;
                 }
+            }
+            if (vx_test_pad_check) {
+                ggml_backend_synchronize(tailw_be);
+                std::vector<uint8_t> pbuf;
+                std::vector<float>   pf;
+                for (int k = 0; k < 3; k++) {
+                    if (pd[(size_t) k] <= 0) {
+                        continue;
+                    }
+                    ggml_tensor * D    = g1s[(size_t) k];
+                    ggml_tensor * base = k < 2 || tail_dn_r1[(size_t) sl.vx_group] ? GT.gate_up : GT.down;
+                    const int64_t ne   = pd[(size_t) k] / (int64_t) ggml_type_size(D->type) * (int64_t) ggml_blck_size(D->type);
+                    pbuf.resize((size_t) pd[(size_t) k]);
+                    pf.resize((size_t) ne);
+                    for (int32_t p = 0; p < p_end; p++) {
+                        if (!tailw_read[(size_t) p]) {
+                            continue;
+                        }
+                        const size_t off = (size_t) ((const char *) D->data - (const char *) base->data) + (size_t) (p + 1)*D->nb[2];
+                        ggml_backend_tensor_get(base, pbuf.data(), off, (size_t) pd[(size_t) k]);
+                        ggml_get_type_traits(D->type)->to_float(pbuf.data(), pf.data(), ne);
+                        for (const float v : pf) {
+                            if (!std::isfinite(v)) {
+                                moe_stream_fail("MOE_STREAM_TEST_PAD_CHECK: tail-wave layer %d wave %d proj %d place %d reads non-finite row padding at place %d",
+                                        sl.il, wave, k, p, p + 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (pools_registered && calls > 0) {
+        uint64_t gen = 0;
+        {
+            std::lock_guard<std::mutex> lk(h2d_ev_mtx);
+            gen = tailw_h2d_seq.load(std::memory_order_relaxed) + 1;
+            const uint64_t ta = tailw_h2d_acked.load(std::memory_order_relaxed);
+            if (gen - ta >= H2D_EV_RING) {
+                const uint64_t old = gen - (H2D_EV_RING - 1);
+                if (tailw_ev_ring[old % H2D_EV_RING] != nullptr) {
+                    ggml_backend_event_synchronize(tailw_ev_ring[old % H2D_EV_RING]);
+                }
+                tailw_h2d_acked.store(old, std::memory_order_release);
+            }
+            if (tailw_ev_ring[gen % H2D_EV_RING] != nullptr) {
+                ggml_backend_event_record(tailw_ev_ring[gen % H2D_EV_RING], tailw_be);
+            }
+            tailw_h2d_seq.store(gen, std::memory_order_release);
+        }
+        for (const auto & ps : tailw_list) {
+            const int32_t s = ps.second;
+            if (s >= 0 && (size_t) s < sl.slot_tailw_gen.size()) {
+                reinterpret_cast<std::atomic<uint64_t> *>(&sl.slot_tailw_gen[(size_t) s])->store(gen, std::memory_order_release);
+            }
+        }
+        for (const auto & pd : ca_dn) {
+            const int32_t s = pd.second;
+            if (s >= 0 && (size_t) s < sl.slot_tailw_gen.size()) {
+                reinterpret_cast<std::atomic<uint64_t> *>(&sl.slot_tailw_gen[(size_t) s])->store(gen, std::memory_order_release);
             }
         }
     }
@@ -18541,8 +18968,10 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
                 }
             }
         } else {
+            const bool has_rmask = (p1.prefill_fast || p1.pinned_ring > 0) && (size_t) il2 < lm_routed_mask.size() &&
+                                   lm_routed_mask[(size_t) il2].size() == sl2.n_expert;
             for (uint32_t e = 0; e < sl2.n_expert; e++) {
-                if (!sl2.vx_held((int32_t) e)) {
+                if (!sl2.vx_held((int32_t) e) && (!has_rmask || lm_routed_mask[(size_t) il2][e])) {
                     ca_es.push_back((int32_t) e);   // (a held expert may have a RAM copy now; the VRAM pass computes it)
                 }
             }
@@ -18878,6 +19307,10 @@ void llama_moe_stream::ca_end_call() {
     ca_cancel.store(false);
     if (issued) {
         ggml_backend_event_synchronize(ca_ev_a);
+        if (pools_registered) {
+            std::lock_guard<std::mutex> lk(h2d_ev_mtx);
+            ca_h2d_acked.store(ca_h2d_seq.load(std::memory_order_relaxed), std::memory_order_release);
+        }
     }
     for (const int32_t e : ca_list_e) {
         ca_place[(size_t) e] = -1;
@@ -19010,6 +19443,37 @@ void llama_moe_stream::ca_run_job(ca_job_t & j) {
         }
     }
     ggml_backend_event_record(ca_ev_a, vf_be);
+    if (pools_registered && bytes > 0) {
+        uint64_t cgen = 0;
+        {
+            std::lock_guard<std::mutex> lk(h2d_ev_mtx);
+            cgen = ca_h2d_seq.load(std::memory_order_relaxed) + 1;
+            const uint64_t ca = ca_h2d_acked.load(std::memory_order_relaxed);
+            if (cgen - ca >= H2D_EV_RING) {
+                const uint64_t old = cgen - (H2D_EV_RING - 1);
+                if (ca_ev_ring[old % H2D_EV_RING] != nullptr) {
+                    ggml_backend_event_synchronize(ca_ev_ring[old % H2D_EV_RING]);
+                }
+                ca_h2d_acked.store(old, std::memory_order_release);
+            }
+            if (ca_ev_ring[cgen % H2D_EV_RING] != nullptr) {
+                ggml_backend_event_record(ca_ev_ring[cgen % H2D_EV_RING], vf_be);
+            }
+            ca_h2d_seq.store(cgen, std::memory_order_release);
+        }
+        for (const auto & ps : j.list) {
+            const int32_t s = ps.second;
+            if (s >= 0 && (size_t) s < sl.slot_ca_gen.size()) {
+                reinterpret_cast<std::atomic<uint64_t> *>(&sl.slot_ca_gen[(size_t) s])->store(cgen, std::memory_order_release);
+            }
+        }
+        for (const auto & ad : j.added) {
+            const int32_t s = ad[2];
+            if (s >= 0 && (size_t) s < sl.slot_ca_gen.size()) {
+                reinterpret_cast<std::atomic<uint64_t> *>(&sl.slot_ca_gen[(size_t) s])->store(cgen, std::memory_order_release);
+            }
+        }
+    }
     j.bytes = bytes;
     j.us    = ggml_time_us() - t0;
 }
@@ -19218,6 +19682,7 @@ int32_t llama_moe_stream::tail_borrow(int32_t n, const std::vector<int32_t> * ke
     } else {
         vf_drain_all<false>(lock);
     }
+    vx_pad_clean();   // ensure any marked free tail places have zeroed row padding before prompt-split experts sit next to them
     const int32_t g = tail_group;
     // the experts the borrow must not take: the guesses of the layers in keep_il (the one computing and the next)
     std::vector<std::vector<uint8_t>> keep(layers.size());
@@ -20053,6 +20518,18 @@ void llama_moe_stream::vf_stop_uploader() {
         vf_cv.notify_all();
         vf_thread.join();
     }
+    for (int h = 0; h < 2; ++h) {
+        if (vac_d2h_ev[h]) {
+            ggml_backend_event_free(vac_d2h_ev[h]);
+            vac_d2h_ev[h] = nullptr;
+        }
+    }
+    if (vac_d2h_buf) {
+        ggml_backend_buffer_free(vac_d2h_buf);
+        vac_d2h_buf = nullptr;
+        vac_d2h_ptr = nullptr;
+        vac_d2h_cap = 0;
+    }
     if (vf_bounce_buf) {
         ggml_backend_buffer_free(vf_bounce_buf);
         vf_bounce_buf = nullptr;
@@ -20066,6 +20543,16 @@ void llama_moe_stream::vf_stop_uploader() {
         if (*ev) {
             ggml_backend_event_free(*ev);
             *ev = nullptr;
+        }
+    }
+    for (size_t ei = 0; ei < H2D_EV_RING; ++ei) {
+        if (tailw_ev_ring[ei]) {
+            ggml_backend_event_free(tailw_ev_ring[ei]);
+            tailw_ev_ring[ei] = nullptr;
+        }
+        if (ca_ev_ring[ei]) {
+            ggml_backend_event_free(ca_ev_ring[ei]);
+            ca_ev_ring[ei] = nullptr;
         }
     }
     if (psplit_ev) {   // prompt split: after the uploader stopped
@@ -21405,10 +21892,8 @@ bool llama_moe_stream::el_givable_any() const {
 // source, not a copy-back in flight (bit 1; bit 2 = copied back and not picked again is bookkeeping drop_slot counts), not a list
 // entry's slot
 bool llama_moe_stream::el_droppable(const llama_moe_stream_layer & sl, int32_t s) const {
-    return s >= 0 && s < (int32_t) sl.n_slots && !sl.slot_off[s] && sl.slot_state[s] != MOE_STREAM_SLOT_LOADING && !sl.keep[s] &&
-           !sl.vf_mark[s] && (sl.slot_cb[s] & 1) == 0 && sl.slot_pending[s] == 0 &&
-           !(sl.slot_cancel[s] && sl.slot_state[s] == MOE_STREAM_SLOT_LOADING) && sl.pl_bound_word[s] < 0;   // (a cancel that
-                                                                                                             // lost the race to a landing)
+    return s >= 0 && s < (int32_t) sl.n_slots && !sl.slot_off[s] && sl.slot_state[s] != MOE_STREAM_SLOT_LOADING &&
+           !slot_is_leased(sl, s) && !(sl.slot_cancel[s] && sl.slot_state[s] == MOE_STREAM_SLOT_LOADING);
 }
 
 // mtx held: switch off up to n of this layer's slots - the empty ones first, then the least valuable (the keep rule) - never below the

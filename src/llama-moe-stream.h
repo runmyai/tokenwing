@@ -203,6 +203,15 @@ struct llama_moe_stream_p1 {
     int32_t     prompt_split_places = 128;   // --moe-stream-prompt-split-places N
     bool        gpu_wave_skip_zero = false;   // --moe-stream-gpu-wave-skip-zero 1
     bool        gpu_skip_zero  = false;   // the GPU one-token mmvq writes 0 for the VRAM pool's zero slices
+    bool        prefill_fast   = false;   // --moe-stream-prefill-fast 1
+    bool        mmq_moe_opt    = false;   // --moe-stream-mmq-moe-opt 1
+    bool        gpu_moe_fused  = false;   // --moe-stream-gpu-moe-fused 1
+    int64_t     pinned_ring    = 0;       // --moe-stream-pinned-ring SIZE
+    bool        lm_bf16        = false;   // --moe-stream-lm-bf16 1
+    bool        lend_output    = false;   // --moe-stream-lend-output 1
+    bool        qsa_fused      = false;   // --moe-stream-qsa-fused 1
+    bool        hc_fused       = false;   // --moe-stream-hc-fused 1
+    bool        ple_fast       = false;   // --moe-stream-ple-fast 1
     bool        plan           = false;   // --moe-stream-plan 1, the waiting list with late binding (decode words)
     bool        plan_bind_early = false;  // test only - every list entry is bound the moment it is added
     bool        drop_stale     = false;   // at its target's start, entries it did not pick go, and their started reads'
@@ -328,6 +337,8 @@ struct llama_moe_stream_layer {
     std::vector<int32_t>  slot_expert;    // [n_slots]  expert id, or -1 when empty
     std::vector<uint8_t>  slot_state;     // [n_slots]  llama_moe_stream_slot_state
     std::vector<uint64_t> slot_last_use;  // [n_slots]  LRU stamp
+    std::vector<uint64_t> slot_tailw_gen; // [n_slots]  atomic H2D sequence stamp for page-locked tail-wave copies
+    std::vector<uint64_t> slot_ca_gen;    // [n_slots]  atomic H2D sequence stamp for page-locked copy-ahead copies
     // The readiness table ggml's mul_mat_id polls, one flag per slice of the pool tensor
     // (n_slots real slots, then the n_expert_used all-zero slices which are ready from the start).
     // Plain uint32 because it is written with atomic stores from another thread; the accesses are the
@@ -757,7 +768,8 @@ struct llama_moe_stream_layer {
     std::vector<uint8_t> b0_cls;          // [n_expert_used]
     // A call of this layer left a wait to ggml's mul_mat_id (--moe-stream-overlap), whose time is still in the CPU
     // backend's registry; take_overlap_waits() collects it
-    bool                 ovl_pending = false;
+    bool                 ovl_pending   = false;
+    bool                 in_remap_fill = false;   // active only during remap_needed's fill loop (Belady touched[] valid)
 
     counters & c() { return decode_phase ? dec : pre; }
     const counters & c() const { return decode_phase ? dec : pre; }
@@ -1188,6 +1200,11 @@ struct llama_moe_stream {
     ggml_backend_t             vf_be = nullptr;       // a second backend instance of the GPU: the uploader's own stream
     ggml_backend_buffer_t      vf_bounce_buf = nullptr;
     uint8_t *                  vf_bounce = nullptr;   // one expert block, pinned (--moe-stream-vram-follow-pinned 1)
+    static constexpr int       VAC_D2H_HALF = 8;      // double-buffered pipelined vacate D2H (8 experts/half = 16 total)
+    ggml_backend_buffer_t      vac_d2h_buf = nullptr;
+    uint8_t *                  vac_d2h_ptr = nullptr;
+    size_t                     vac_d2h_cap = 0;
+    ggml_backend_event_t       vac_d2h_ev[2] = {};
     std::atomic<bool>          vf_in_call{false};     // a call is between set_decode and end_call (the idle line)
     // The tick's wait on the GPU, not on the host. At a tick the engine records vf_ev on the calling context's
     // GPU stream (vf_ctx_be, set by llama-context every call) after the word's graph; every copy INTO a place waits for it (the
@@ -1231,6 +1248,7 @@ struct llama_moe_stream {
     // (mtx held: the I/O threads' settle), and the keep value an expert leaving VRAM has
     void vf_cb_take(vf_job_t & j);
     void cb_claim(llama_moe_stream_layer & B, int32_t v, int32_t e, vf_job_t & j);
+    bool tail_claim_cb_slot(int32_t g, int32_t p, int32_t il, int32_t e, vf_job_t & out_j);
     bool tail_copy_back(int32_t g, int32_t p, int32_t il, int32_t e);
     void vf_cb_copy(vf_job_t & j, bool async);
     void vf_cb_settle(vf_job_t & j);
@@ -1534,6 +1552,17 @@ struct llama_moe_stream {
     };
     ca_job_t ca_job;                   // vf_mtx: the one job out
     ggml_backend_event_t ca_ev_c = nullptr, ca_ev_a = nullptr;   // the compute stream -> the uploader, the uploader -> the compute stream
+    static constexpr size_t H2D_EV_RING = 64;
+    ggml_backend_event_t  tailw_ev_ring[H2D_EV_RING] = {};
+    ggml_backend_event_t  ca_ev_ring[H2D_EV_RING]    = {};
+    std::mutex            h2d_ev_mtx;
+    std::atomic<uint64_t> tailw_h2d_seq{0};
+    std::atomic<uint64_t> tailw_h2d_acked{0};
+    std::atomic<uint64_t> ca_h2d_seq{0};
+    std::atomic<uint64_t> ca_h2d_acked{0};
+    void                  wait_slot_h2d_done(const llama_moe_stream_layer & sl, int32_t slot);
+    void                (*unpin_pool_fn)(void *) = nullptr;
+    std::vector<uint8_t>  pool_pinned;
     int32_t  ca_job_il = -1;           // graph thread: the layer the job's places are for
     int32_t  ca_job_w  = 0;            // graph thread: and the wave (one-set mode: the next wave of the same layer, or wave 0)
     int32_t  ca_job_set = 0;           // graph thread: and the set its places are in (the gather's "mine" check)
@@ -1626,6 +1655,27 @@ struct llama_moe_stream {
         return g >= 0 && i < tailw_tg.size() ? tailw_tg[i][(size_t) k] : tailw_t[k];
     }
     void tailw_gather(llama_moe_stream_layer & sl, int32_t * out, int64_t n, int32_t wave);   // the remap op, after its slot ids are final
+
+    // Pinned H2D staging ring + routed-only mask + CPU hybrid tail co-execution
+    static constexpr int  PRING_SLICES = 4;
+    ggml_backend_buffer_t pring_buf    = nullptr;
+    char *                pring_ptr    = nullptr;
+    size_t                pring_cap    = 0;
+    size_t                pring_head   = 0;
+    int                   pring_slice  = 0;
+    ggml_backend_event_t  pring_ev[PRING_SLICES] = {};
+    bool                  pring_ev_rec[PRING_SLICES] = {};
+    int64_t               pring_wraps = 0, pring_bytes = 0;
+    ggml_backend_buffer_t tailw_zero_pin_buf = nullptr;
+    uint8_t *             tailw_zero_pin_ptr = nullptr;
+    size_t                tailw_zero_pin_cap = 0;
+    void                  pring_ensure();
+    void                  tailw_set_async_staged(ggml_tensor * D, const char * src, size_t dst_off, size_t nbytes);
+
+    std::vector<std::vector<uint8_t>> lm_routed_mask;   // [il][expert]: 1 if routed in lm_phase 1
+    void set_lm_routed_ids(int32_t il, const int32_t * ids_host, int64_t n);
+    void clear_lm_routed_masks() { lm_routed_mask.clear(); }
+
     // Three pieces for --moe-stream-g1-ahead; nothing calls them
     // unless that setting or the test switches below are on
     uint32_t tailw_wave_w = 0;   // (c) the wave width of a tail-wave graph (graph and remap op alike), 0 = the plain width; option A sets the half places
@@ -1895,6 +1945,10 @@ struct llama_moe_stream {
     void     el_start();                           // the first call: the pressure thread
     void     el_stop();
     void     el_loop();                            // the pressure thread
+    bool     slot_is_leased(const llama_moe_stream_layer & sl, int32_t s) const {
+        return sl.keep[s] || sl.vf_mark[s] || (sl.slot_cb[s] & 1) != 0 ||
+               sl.slot_pending[s] != 0 || sl.pl_bound_word[s] >= 0;
+    }
     bool     el_droppable(const llama_moe_stream_layer & sl, int32_t s) const;   // mtx
     int32_t  el_floor(const llama_moe_stream_layer & sl) const;
     int32_t  el_ceil (const llama_moe_stream_layer & sl) const;

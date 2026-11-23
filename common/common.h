@@ -809,6 +809,7 @@ struct common_params {
     int32_t     moe_stream_max_waves = 0;  // cap the expert waves per ubatch and layer, 0 = the safe bound
     int32_t     moe_stream_hugepages = 0;    // 2 MiB-aligned pools + madvise(MADV_HUGEPAGE)
     int32_t     moe_stream_pin = 0;          // cudaHostRegister the pools
+    bool        moe_stream_pin_set = false;
     std::string moe_stream_policy = "";      // "lru" (default), "lfu", "slru"
     int32_t     moe_stream_pred_shared = 0;  // predict from the residual + this layer's shared expert
     int32_t     moe_stream_pred_recall = 0;  // count recall@8 of the layer-ahead guess
@@ -860,7 +861,7 @@ struct common_params {
     int32_t     moe_stream_fused_route = 0;       // 1 = grouped expert selection as one op (router + guesses)
     int32_t     moe_stream_slot_check  = 1;       // 1 = a pair with no RAM slot stops the run, 0 = off (emergency only)
     int32_t     moe_stream_wave_plan   = 0;       // 1 = a multi-wave ubatch's waves from a plan built at wave 0
-    int32_t     moe_stream_wave_victim = 0;       // 1 = wave marks last the call (earlier-wave victims first)
+    int32_t     moe_stream_wave_victim = -1;      // -1 = auto (on with prefill_fast), 0 = off, 1 = wave marks last the call
     int32_t     moe_stream_conv_silu   = 0;       // 1 = KDA conv + SiLU fused on CUDA (same bits)
     int32_t     moe_stream_hc_share    = 0;       // 1 = an FFN hyper-connection combine's weights computed once (same bits)
     int32_t     moe_stream_rs_window   = 0;       // 1 = delta-net state fetch / conv-state write in the GPU window (same bits)
@@ -888,6 +889,15 @@ struct common_params {
     int32_t     moe_stream_prompt_split_places = 128;   // the tail places a prompt call borrows
     int32_t     moe_stream_gpu_wave_skip_zero = 0;  // 1 = GPU prompt matmuls skip the zero-slice pairs (they write 0)
     int32_t     moe_stream_gpu_skip_zero = 0;     // 1 = the GPU mmvq writes 0 for the VRAM pool's zero slices
+    int32_t     moe_stream_prefill_fast  = 0;     // 1 = enable all compatible prefill fast paths
+    int32_t     moe_stream_mmq_moe_opt   = 0;     // 1 = scale CUDA MMQ ncols_opt by per-expert token count
+    int32_t     moe_stream_gpu_moe_fused = 0;     // 1 = fused dual-bucket gate+up+SwiGLU->INT8->down CUDA prefill
+    int64_t     moe_stream_pinned_ring   = 0;     // bytes of pinned host H2D staging ring (1 = 256 MiB, 0 = off)
+    int32_t     moe_stream_lm_bf16       = 0;     // 1 = BF16 layer-major prompt state (lm_hid / lm_moe)
+    int32_t     moe_stream_lend_output   = 0;     // 1 = lend untied VRAM output.weight during layer-major prefill
+    int32_t     moe_stream_qsa_fused     = 0;     // 1 = zero-mask GQA-transposed QSA sparse attention
+    int32_t     moe_stream_hc_fused      = 0;     // 1 = register-fused hyper-connection up + gated pre-mix
+    int32_t     moe_stream_ple_fast      = 0;     // 1 = deduplicated raw-quant GPU PLE gather + fused dilated conv
     int32_t     moe_stream_plan = 0;              // 1 = the waiting list with late binding (decode words)
     int32_t     moe_stream_plan_bind_early = 0;   // test only - every list entry is bound when it is added
     int32_t     moe_stream_drop_stale = 0;        // with plan 1, unpicked entries / started reads dropped at the target

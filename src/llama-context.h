@@ -431,6 +431,7 @@ private:
     // The call's hidden state on the device of the layers (one tensor [n_embd, T]), allocated per call
     ggml_context_ptr          lm_hctx;
     ggml_backend_buffer_ptr   lm_hbuf;
+    std::vector<uint8_t>      lm_output_backup;   // session-level host backup of model.output (--moe-stream-lend-output 1)
     ggml_tensor *             lm_hid  = nullptr;
     int64_t                   lm_row0 = 0;
     // The phase of the graph being built (0 whole layers, 1 phase 1, 2 the expert graph) and the call's other tensors:

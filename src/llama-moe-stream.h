@@ -297,6 +297,7 @@ struct llama_moe_stream_p1 {
     std::vector<int32_t> wl_dev_of;   // per block: the index in wl_devs of the device that holds the layer's experts when whole, -1 = not a GPU
     int64_t              wl_ubatch = 512;   // the physical batch (whether GPU-wave graphs, and so the pool's tail, can run)
     bool                 wl_by_device = false;   // the list came from --moe-stream-gpu-layers-device (the check line names it)
+    bool                 vram_experts_auto = false; // auto-enabled --moe-stream-vram-experts-file model (silent fallback if absent)
 };
 
 // a slot is empty, has a read in flight, or holds the expert it was loaded with

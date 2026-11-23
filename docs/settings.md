@@ -1,6 +1,35 @@
 # Settings
 
-Each mechanism is a flag. Most are off by default, so plain TokenWing behaves like llama.cpp; the autotuner sets the values for your machine and model. `--help` prints the same text, and the rest of llama.cpp's settings.
+Passing `--moe-stream <PATH|model>` automatically activates all 5 feature umbrella groups below (`auto`), sets server defaults (`-np 1`, `--cache-ram 0`, `--backend-sampling`), and budgets whole GPU layers and VRAM expert pools for your hardware. Run `--help` for public flags, or `--help-internal` to inspect all low-level internal overrides documented in the detailed tables below.
+
+## Umbrella feature groups
+
+All 5 groups default to `auto` (`on` whenever `--moe-stream` is active). Pass `0` on any group to disable that subsystem cleanly; explicit internal flags still override individual knobs.
+
+| Flag | Default when `--moe-stream` is set | What it controls |
+|---|---|---|
+| `--moe-stream-fast-prefill 0\|1\|auto` | `on` | Layer-major prompt batching, GPU wave-gather (`512`), wave plan, read-ahead, windowing, prompt-split, copy-ahead, CUDA prefill kernels, and auto `-ub 2048` (`1024` at `-c >= 262144`). |
+| `--moe-stream-fast-decode 0\|1\|auto` | `on` | Overlapped Direct-I/O + router plan lookahead, prediction correction (`model` when `--moe-stream model`), fused GPU routing/norm/conv kernels, ROCm auto-tuning, and GPU backend sampling (`llama-server`). |
+| `--moe-stream-fast-cpu 0\|1\|auto` | `on` | Fused SIMD CPU MoE matmuls (`iqk 8`, `x4`, `mmid-merge`, `cpu-topk`, `cpu-fa`, `small-ops`, `weighted-sum`). |
+| `--moe-stream-vram-cache 0\|1\|auto` | `on` (unless `-ngl 0`, `--moe-stream-uma 1`, or CPU-only) | VRAM expert pool (`vram-free 200MiB`, `vram-follow`, `vram-parallel`, `vram-copyback`, `vram-experts-file model`) and automatic whole-layer budgeting across 1+ GPUs (silent fallback if no GPU exists). |
+| `--moe-stream-ram-cache 0\|1\|auto` | `on` | Decay eviction policy, prompt-end recency retention, startup RAM pool fill (`idle-load 2`), and `--cache-ram 0` on `llama-server`. |
+
+## Public hardware, memory, and diagnostic flags
+
+| Flag | Purpose |
+|---|---|
+| `--moe-stream PATH\|model` | Enable MoE expert streaming (use `model` for TokenWing self-contained GGUFs). |
+| `--moe-stream-io-threads N` | Parallel Direct-I/O reader threads (`autotuner` measures the optimal count). |
+| `--moe-stream-ram SIZE` / `--moe-stream-ram-free SIZE` | Cap RAM expert pool size or keep `SIZE` RAM free outside pools. |
+| `--moe-stream-elastic 0\|1` | Dynamically grow/shrink RAM pools with OS free memory (disables `--moe-stream-window`). |
+| `--moe-stream-vram-free SIZE` / `--moe-stream-vram-device DEV` | Keep `SIZE` VRAM free per GPU or choose the primary VRAM expert pool GPU. |
+| `--moe-stream-uma 0\|1` | Zero-copy unified-memory mode for APUs / Apple Silicon / DGX Spark. |
+| `--moe-stream-gpu-layers N` / `--moe-stream-gpu-layers-device SPEC` | Pin exact whole GPU layer counts or multi-GPU per-device placement. |
+| `--moe-stream-timing 0\|1` / `--moe-stream-plan-only` | Enable per-stage SSD/CPU/GPU timing or print the memory plan and exit. |
+
+## Internal micro-flag reference (`--help-internal`)
+
+Each individual knob below remains available via CLI as an internal override (`--help-internal`) and takes precedence over umbrella group defaults.
 
 ## Model and context
 
@@ -214,6 +243,11 @@ Each mechanism is a flag. Most are off by default, so plain TokenWing behaves li
 | `--moe-stream-pinned-ring SIZE` | stage GPU tail-wave expert copies through a reusable pinned host ring of SIZE bytes (`auto` or `1` = `256MiB`) with routed-only copy-ahead filtering (default: 0 = off) |
 | `--moe-stream-lm-bf16 0\|1` | with `--moe-stream-layer-major 1`: keep the call's inter-group hidden state (`lm_hid` / `lm_moe`) in BF16 instead of F32, halving its device footprint (default: 0) |
 | `--moe-stream-lend-output 0\|1` | with `--moe-stream-layer-major 1`: lend an untied VRAM `output.weight` buffer to the call's layer-major tensors before the final layer group and restore it from a session-level RAM backup (counted in the RAM plan) before logits are computed (default: 0) |
+| `--moe-stream-gpu-layers-floor SIZE` | with `--moe-stream-vram-cache`: minimum VRAM room reserved for the hot expert pool before the automatic whole-layer budget places whole MoE layers on the pool GPU (default: `2500MiB`, `[internal]`) |
+| `--moe-stream-gpu-layers-cap F` | with `--moe-stream-vram-cache`: maximum fraction of available pool-GPU room assigned to whole MoE layers (default: `0.52`, `[internal]`) |
+| `--moe-stream-gpu-layers-uniform-max N` | with `--moe-stream-vram-cache`: maximum whole MoE layers placed on the pool GPU when all MoE layers have uniform expert sizes (`0` = bounded only by `--moe-stream-gpu-layers-cap` and `--moe-stream-gpu-layers-floor`, `-1` = match `--moe-stream-wordstart`, `> 0` = explicit cap; default: `0`, `[internal]`) |
+| `--moe-stream-gpu-layers-lend-reclaim SIZE` | with `--moe-stream-vram-cache`, `--moe-stream-vram-lend-prompt 1`, and `--moe-stream-vram-follow 1`: maximum prompt compute-buffer VRAM credited back to the automatic whole-layer budget (default: `640MiB`, `[internal]`) |
+| `--moe-stream-copy-ahead-one-below SIZE` | total pool-GPU VRAM threshold below which automatic `--moe-stream-copy-ahead` selects one copy set (`2`) instead of two (`1`) (default: `10GiB`, `[internal]`) |
 | `--moe-stream-timing 0\|1` | 1 = measure where the time of every call goes - the host backend's compute, the device's kernels (CUDA events), the copies between backends and the waits for them - and report it per reply word next to the SSD wait, in llama-server's `GET /moe-stream/stats` and in `timings.moe_stream` of a response. It reads the clock around work that runs anyway and records two CUDA events per graph; no copy, wait or order is added. 0 = off, the engine does no timing work (default: 0) |
 
 ## Saved chats

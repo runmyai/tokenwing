@@ -890,6 +890,12 @@ struct common_params {
     int32_t     moe_stream_gpu_wave_skip_zero = 0;  // 1 = GPU prompt matmuls skip the zero-slice pairs (they write 0)
     int32_t     moe_stream_gpu_skip_zero = 0;     // 1 = the GPU mmvq writes 0 for the VRAM pool's zero slices
     int32_t     moe_stream_prefill_fast  = 0;     // 1 = enable all compatible prefill fast paths
+    int32_t     moe_stream_fast_prefill  = -1;    // -1 = auto (on with --moe-stream), 0 = off, 1 = on
+    int32_t     moe_stream_fast_decode   = -1;    // -1 = auto (on with --moe-stream), 0 = off, 1 = on
+    int32_t     moe_stream_fast_cpu      = -1;    // -1 = auto (on with --moe-stream), 0 = off, 1 = on
+    int32_t     moe_stream_vram_cache    = -1;    // -1 = auto (on with --moe-stream on discrete GPU), 0 = off, 1 = on
+    int32_t     moe_stream_ram_cache     = -1;    // -1 = auto (on with --moe-stream), 0 = off, 1 = on
+    uint32_t    moe_stream_auto_mask     = 0;     // bitmask of knobs auto-enabled by umbrella flags
     int32_t     moe_stream_mmq_moe_opt   = 0;     // 1 = scale CUDA MMQ ncols_opt by per-expert token count
     int32_t     moe_stream_gpu_moe_fused = 0;     // 1 = fused dual-bucket gate+up+SwiGLU->INT8->down CUDA prefill
     int64_t     moe_stream_pinned_ring   = 0;     // bytes of pinned host H2D staging ring (1 = 256 MiB, 0 = off)
@@ -898,6 +904,11 @@ struct common_params {
     int32_t     moe_stream_qsa_fused     = 0;     // 1 = zero-mask GQA-transposed QSA sparse attention
     int32_t     moe_stream_hc_fused      = 0;     // 1 = register-fused hyper-connection up + gated pre-mix
     int32_t     moe_stream_ple_fast      = 0;     // 1 = deduplicated raw-quant GPU PLE gather + fused dilated conv
+    int64_t     moe_stream_gpu_layers_floor        = 2500LL << 20; // min VRAM room kept for the pool by auto whole-layer budget
+    int64_t     moe_stream_gpu_layers_lend_reclaim = 640LL << 20;  // max prompt-lend reclaim credited by auto whole-layer budget
+    int64_t     moe_stream_copy_ahead_one_below    = 10LL << 30;   // total VRAM threshold below which auto copy-ahead picks 1 set
+    float       moe_stream_gpu_layers_cap          = 0.52f;        // max fraction of pool-GPU room taken by whole layers
+    int32_t     moe_stream_gpu_layers_uniform_max  = 0;            // max uniform whole layers (0 = bounded by cap & floor, -1 = wordstart, > 0 = cap)
     int32_t     moe_stream_plan = 0;              // 1 = the waiting list with late binding (decode words)
     int32_t     moe_stream_plan_bind_early = 0;   // test only - every list entry is bound when it is added
     int32_t     moe_stream_drop_stale = 0;        // with plan 1, unpicked entries / started reads dropped at the target
@@ -975,6 +986,8 @@ struct common_params {
     std::string tts_speaker_file = "";
 
     bool is_gen_docs = false; // whether we are running inside llama-gen-docs
+    bool usage_internal = false; // --help-internal: include internal moe-stream options in usage
+    std::set<std::string> cli_explicit; // canonical opt.args[0] names explicitly supplied via CLI or env
 };
 
 // call once at the start of a program if it uses libcommon

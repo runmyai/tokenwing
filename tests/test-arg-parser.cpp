@@ -310,6 +310,147 @@ static void test(void) {
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), p, LLAMA_EXAMPLE_COMMON));
     }
 
+    // --moe-stream umbrella groups: default ON when --moe-stream is set, cleanly overridable
+    {
+        common_params p;
+        argv = {"binary_name", "-m", "m.gguf", "--moe-stream", "model"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), p, LLAMA_EXAMPLE_COMMON));
+        assert(p.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
+        assert(p.n_ubatch == 2048);
+        assert(p.moe_stream_prefill_fast == 1);
+        assert(p.moe_stream_layer_major == 1);
+        assert(p.moe_stream_layer_major_batch == 32768);
+        assert(p.moe_stream_wave_plan == 1);
+        assert(p.moe_stream_read_ahead == 1);
+        assert(p.moe_stream_window == 1);
+        assert(p.moe_stream_prompt_defer == 1);
+        assert(p.moe_stream_gpu_waves == 512);
+        assert(p.moe_stream_gpu_wave_skip_zero == 1);
+        assert(p.moe_stream_prompt_split == 1);
+        assert(p.moe_stream_vram_end_fill == 1);
+        assert(p.moe_stream_copy_ahead == 1);
+        assert(p.moe_stream_vram_lend_prompt == 1);
+        assert(p.moe_stream_overlap == 1);
+        assert(p.moe_stream_proj_ready == 1);
+        assert(p.moe_stream_io_wake == 1);
+        assert(p.moe_stream_chunk_prefetch == 512 * 1024);
+        assert(p.moe_stream_promote == 1);
+        assert(p.moe_stream_guess_cap == 2);
+        assert(p.moe_stream_pred_shared == 1);
+        assert(p.moe_stream_plan == 1);
+        assert(p.moe_stream_drop_stale == 1);
+        assert(p.moe_stream_needed_early == 1);
+        assert(p.moe_stream_lookahead == 2);
+        assert(p.moe_stream_guess_combined == 1);
+        assert(p.moe_stream_wordstart == 2);
+        assert(p.moe_stream_protect_named == 1);
+        assert(p.moe_stream_guess_inflight == 4);
+        assert(p.moe_stream_correction == "model");
+        assert(p.moe_stream_cpu_skip_zero == 1);
+        assert(p.moe_stream_cpu_x4 == 1);
+        assert(p.moe_stream_cpu_iqk == 8);
+        assert(p.moe_stream_policy == "decay");
+        assert(p.moe_stream_prompt_end == 1);
+        assert(p.moe_stream_idle_load == 2);
+        assert(p.moe_stream_vram_free == (200LL << 20));
+        assert(p.moe_stream_vram_experts_file == "model");
+        assert(p.moe_stream_vram_follow == 1);
+        assert(p.moe_stream_vram_parallel == 1);
+        assert(p.moe_stream_vram_copyback == 1);
+        assert((p.moe_stream_auto_mask & 0x7Fu) == 0x7Fu);
+        assert(p.moe_stream_gpu_layers_floor == (2500LL << 20));
+        assert(p.moe_stream_gpu_layers_lend_reclaim == (640LL << 20));
+        assert(p.moe_stream_copy_ahead_one_below == (10LL << 30));
+        assert(std::abs(p.moe_stream_gpu_layers_cap - 0.52f) < 1e-6f);
+        assert(p.moe_stream_gpu_layers_uniform_max == 0);
+    }
+
+    // 262k context auto-scales batch/ubatch under --moe-stream model
+    {
+        common_params p;
+        argv = {"binary_name", "-m", "m.gguf", "--moe-stream", "model", "-c", "262144"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), p, LLAMA_EXAMPLE_COMMON));
+        assert(p.n_batch == 1024);
+        assert(p.n_ubatch == 1024);
+    }
+
+    // Server auto-defaults under --moe-stream model (and explicit overrides)
+    {
+        common_params p;
+        argv = {"binary_name", "-m", "m.gguf", "--moe-stream", "model"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), p, LLAMA_EXAMPLE_SERVER));
+        assert(p.n_parallel == 1);
+        assert(p.cache_ram_mib == 0);
+        assert(p.cache_idle_slots == false);
+        assert(p.sampling.backend_sampling == true);
+
+        common_params p2;
+        argv = {"binary_name", "-m", "m.gguf", "--moe-stream", "model", "-np", "4", "-cram", "1024"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), p2, LLAMA_EXAMPLE_SERVER));
+        assert(p2.n_parallel == 4);
+        assert(p2.cache_ram_mib == 1024);
+    }
+
+    // Group disables, internal overrides, and elastic->window guard
+    {
+        common_params p;
+        argv = {"binary_name", "-m", "m.gguf", "--moe-stream", "model",
+                "--moe-stream-fast-prefill", "0", "--moe-stream-vram-cache", "0",
+                "--moe-stream-fast-cpu", "0", "--moe-stream-ram-cache", "0"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), p, LLAMA_EXAMPLE_COMMON));
+        assert(p.moe_stream_prefill_fast == 0);
+        assert(p.moe_stream_layer_major == 0);
+        assert(p.moe_stream_vram_free == 0);
+        assert(p.moe_stream_vram_follow == 0);
+        assert(p.moe_stream_cpu_iqk == 0);
+        assert(p.moe_stream_idle_load == 0);
+        assert((p.moe_stream_auto_mask & (1u << 6)) == 0);
+
+        common_params p_ov;
+        argv = {"binary_name", "-m", "m.gguf", "--moe-stream", "model",
+                "--moe-stream-copy-ahead", "2", "--moe-stream-gpu-layers", "0", "--moe-stream-elastic", "1",
+                "--moe-stream-gpu-layers-floor", "3GiB", "--moe-stream-gpu-layers-cap", "0.40",
+                "--moe-stream-gpu-layers-uniform-max", "4", "--moe-stream-gpu-layers-lend-reclaim", "512MiB",
+                "--moe-stream-copy-ahead-one-below", "12GiB"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), p_ov, LLAMA_EXAMPLE_COMMON));
+        assert(p_ov.moe_stream_copy_ahead == 2);
+        assert(p_ov.moe_stream_gpu_layers == 0);
+        assert(p_ov.moe_stream_elastic == 1);
+        assert(p_ov.moe_stream_window == 0);
+        assert(p_ov.moe_stream_gpu_layers_floor == (3LL << 30));
+        assert(p_ov.moe_stream_gpu_layers_uniform_max == 4);
+        assert(p_ov.moe_stream_gpu_layers_lend_reclaim == (512LL << 20));
+        assert(p_ov.moe_stream_copy_ahead_one_below == (12LL << 30));
+        assert((p_ov.moe_stream_auto_mask & (1u << 1)) == 0);
+    }
+
+    // is_internal flag separation for --help vs --help-internal
+    {
+        common_params p;
+        auto ctx_arg = common_params_parser_init(p, LLAMA_EXAMPLE_COMMON);
+        auto find_internal = [&](const char * name, bool & found, bool & internal) {
+            found = false;
+            for (const auto & opt : ctx_arg.options) {
+                for (const char * a : opt.args) {
+                    if (a && strcmp(a, name) == 0) {
+                        found = true;
+                        internal = opt.is_internal;
+                        return;
+                    }
+                }
+            }
+        };
+        bool f1 = false, i1 = true, f2 = false, i2 = true, f3 = false, i3 = false, f4 = false, i4 = false;
+        find_internal("--moe-stream", f1, i1);
+        find_internal("--moe-stream-fast-prefill", f2, i2);
+        find_internal("--moe-stream-copy-ahead", f3, i3);
+        find_internal("--moe-stream-gpu-layers-floor", f4, i4);
+        assert(f1 && !i1);
+        assert(f2 && !i2);
+        assert(f3 && i3);
+        assert(f4 && i4);
+    }
+
     // --draft cannot be used outside llama-speculative
     argv = {"binary_name", "--spec-draft-n-max", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));

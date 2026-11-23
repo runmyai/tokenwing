@@ -1,8 +1,8 @@
 # Getting started
 
-This page takes you from nothing to a running server: build TokenWing, get a model, start `llama-server` with the command for your PC, and check that it works. The commands are for Linux.
+This page takes you from nothing to a running server: build TokenWing, get a model, start `llama-server` with a clean command for your PC, and check that it works. The commands are for Linux.
 
-**Always start from a full command.** Every mechanism of the engine is a flag, and most flags are off unless you give them. Without its settings the engine runs with most of its speed-ups off: a long prompt on Ling, for example, is several times slower. The commands below set every flag for one kind of PC. Copy one whole, and do not start from a short command and add flags to it.
+Passing `--moe-stream model` now turns on all fast prefill, decode prediction, CPU, RAM cache, and VRAM cache speed-ups automatically and budgets VRAM whole layers for your GPUs and context size. Run `./build/bin/autotuner --file <MODEL.gguf>` if you want hardware-probed CPU thread counts, affinity masks, I/O queue depth, and multi-GPU device selection in JSON `"recommended_args"`.
 
 ## 1. Build
 
@@ -51,212 +51,68 @@ Before you start:
 
 Run the command from the `tokenwing` folder. The server answers on `http://127.0.0.1:8080`: a chat page in the browser, and an OpenAI-compatible API. It listens on this PC only.
 
-Every command is for a context length of 65k (`-c 65536`). The model's K/V cache lives in VRAM and grows with the context length, and what it takes is no longer free for experts. So another length needs other values, not only another `-c`. See [Other context lengths](#other-context-lengths).
+Every command is for a context length of 65k (`-c 65536`). The unified whole-layer budget automatically sizes VRAM whole layers and the GPU expert cache from free VRAM for your chosen `-c`, GPU count, and card size (and falls back silently to CPU/RAM on CPU-only hosts).
 
-### An NVIDIA card with 12 GB of VRAM and 32 GB of RAM
-
-The 12 GB card keeps whole MoE layers and a cache of the most-used experts in VRAM, and the RAM holds the rest.
+### An NVIDIA card (8 GB / 12 GB / 24 GB) or multiple GPUs
 
 Flint 40B:
 
 ```bash
-systemd-run --user --scope -q -p MemoryMax=$CAP -p MemorySwapMax=0 -- env \
-  GGML_CUDA_COPY_KERNEL=65536 GGML_CUDA_POOL1D_ROW=1 GGML_CUDA_FUSE_AMAX=1 \
-  GGML_CUDA_MOE_MARK_IDS=1 GGML_CUDA_FUSE_NORM_QUANT=1 ./build/bin/llama-server -m $HOME/models/flint/flint-UD-Q4_K_XL.tokenwing.gguf \
-  --load-mode dio -fit off -ngl 99 -c 65536 -ctk q8_0 -ctv q8_0 -fa on -np 1 -t 8 -b 2048 -ub 2048 \
-  --cache-ram 0 --ctx-checkpoints 2 --moe-stream model --moe-stream-gpu-layers-list 43,44,45,46,47,48 \
-  --moe-stream-ram-free 0.5GiB --moe-stream-overlap 1 --moe-stream-pred-shared 1 \
-  --moe-stream-chunk-prefetch 512 --moe-stream-io-wake chunk --moe-stream-promote 1 \
-  --moe-stream-guess-cap 2 --moe-stream-policy decay --moe-stream-prompt-end recency \
-  --moe-stream-cpu-skip-zero 1 --moe-stream-cpu-x4 1 --moe-stream-cpu-fuse 1 \
-  --moe-stream-cpu-dispatch 1 --moe-stream-plan 1 --moe-stream-drop-stale 1 \
-  --moe-stream-needed-early 1 --moe-stream-lookahead 2 --moe-stream-guess-combined 1 \
-  --moe-stream-proj-ready 1 --moe-stream-wordstart 2 --moe-stream-protect-named 1 \
-  --moe-stream-guess-inflight 4 --moe-stream-cpu-down-scale 1 --moe-stream-cpu-topk 1 \
-  --moe-stream-cpu-q8-tiled 1 --moe-stream-cpu-fa 1 --moe-stream-cpu-mmid-merge 1 \
-  --moe-stream-cpu-iqk 8 --moe-stream-layer-major 1 --moe-stream-wave-plan 1 \
-  --moe-stream-read-ahead 1 --moe-stream-idle-load 2 --moe-stream-window 1 \
-  --moe-stream-prompt-defer 1 --moe-stream-gpu-waves 512 --moe-stream-gpu-share-q8 1 \
-  --moe-stream-gpu-skip-zero 1 --moe-stream-async-h2d 1 --moe-stream-gpu-wave-skip-zero 1 \
-  --moe-stream-prompt-split 1 --moe-stream-vram-free 200MiB --moe-stream-vram-experts-file model \
-  --moe-stream-vram-follow 1 --moe-stream-vram-parallel 1 --moe-stream-vram-copyback 1 \
-  --moe-stream-vram-end-fill 1 --moe-stream-copy-ahead 1 --moe-stream-vram-lend-prompt 1 \
-  --backend-sampling --host 127.0.0.1 --port 8080
+systemd-run --user --scope -q -p MemoryMax=$CAP -p MemorySwapMax=0 -- \
+  ./build/bin/llama-server -m $HOME/models/flint/flint-UD-Q4_K_XL.tokenwing.gguf \
+  -c 65536 -ctk q8_0 -ctv q8_0 --moe-stream model --moe-stream-ram-free 0.5GiB --backend-sampling
 ```
 
 Ling 3.0 Flash:
 
 ```bash
-systemd-run --user --scope -q -p MemoryMax=$CAP -p MemorySwapMax=0 -- env \
-  GGML_CUDA_COPY_KERNEL=65536 GGML_CUDA_POOL1D_ROW=1 GGML_CUDA_FUSE_AMAX=1 \
-  GGML_CUDA_MOE_MARK_IDS=1 GGML_CUDA_FUSE_NORM_QUANT=1 ./build/bin/llama-server -m $HOME/models/ling/Ling-3.0-flash-MXFP4_MOE.tokenwing.gguf \
-  --load-mode dio -fit off -ngl 99 -c 65536 -ctk q8_0 -ctv q8_0 -np 1 -t 8 -b 2048 -ub 2048 \
-  --cache-ram 0 --ctx-checkpoints 2 --moe-stream model --moe-stream-ram-free 0.5GiB \
-  --moe-stream-overlap 1 --moe-stream-pred-shared 1 --moe-stream-chunk-prefetch 512 \
-  --moe-stream-gpu-waves 512 --moe-stream-gpu-layers-list 2,3 --moe-stream-io-wake chunk \
-  --moe-stream-promote 1 --moe-stream-guess-cap 2 --moe-stream-policy decay \
-  --moe-stream-prompt-end recency --moe-stream-cpu-skip-zero 1 --moe-stream-fused-route 1 \
-  --moe-stream-cpu-x4 1 --moe-stream-cpu-fuse 1 --moe-stream-conv-silu 1 --moe-stream-gpu-share-q8 1 \
-  --moe-stream-cpu-dispatch 1 --moe-stream-plan 1 --moe-stream-drop-stale 1 \
-  --moe-stream-needed-early 1 --moe-stream-lookahead 2 --moe-stream-guess-combined 1 \
-  --moe-stream-proj-ready 1 --moe-stream-wordstart 2 --moe-stream-protect-named 1 \
-  --moe-stream-guess-inflight 4 --moe-stream-vram-free 200MiB --moe-stream-vram-experts-file model \
-  --moe-stream-correction model --moe-stream-gpu-skip-zero 1 --moe-stream-vram-follow 1 \
-  --moe-stream-vram-parallel 1 --moe-stream-vram-copyback 1 --moe-stream-async-h2d 1 \
-  --moe-stream-layer-major 1 --moe-stream-wave-plan 1 --moe-stream-read-ahead 1 \
-  --moe-stream-idle-load 2 --moe-stream-window 1 --moe-stream-vram-end-fill 1 \
-  --moe-stream-prompt-defer 1 --moe-stream-gpu-wave-skip-zero 1 --moe-stream-prompt-split 1 \
-  --moe-stream-vram-lend-prompt 1 --moe-stream-cpu-down-scale 1 --moe-stream-cpu-topk 1 \
-  --moe-stream-cpu-q8-tiled 1 --moe-stream-cpu-fa 1 --moe-stream-cpu-mmid-merge 1 \
-  --moe-stream-cpu-iqk 8 --moe-stream-layer-major-batch 32768 --backend-sampling --host 127.0.0.1 \
-  --port 8080
+systemd-run --user --scope -q -p MemoryMax=$CAP -p MemorySwapMax=0 -- \
+  ./build/bin/llama-server -m $HOME/models/ling/Ling-3.0-flash-MXFP4_MOE.tokenwing.gguf \
+  -c 65536 -ctk q8_0 -ctv q8_0 --moe-stream model --moe-stream-ram-free 0.5GiB --backend-sampling
 ```
 
-### An NVIDIA card with 8 GB of VRAM
+With multiple GPUs, add `--moe-stream-vram-device CUDA0` (or the fastest device reported in `autotuner`'s `"recommended_vram_device"`) to pin the hot expert pool; remaining GPUs automatically pack whole layers into their free VRAM. On 16 GB RAM hosts (or 6 GB VRAM cards), raise `--moe-stream-ram-free` to `1GiB` if the OS needs more headroom.
 
-No whole layers stay in VRAM (`--moe-stream-gpu-layers 0`): the VRAM holds the most-used experts and the RAM the rest.
+### CPU only (or Apple / integrated UMA)
 
-Flint 40B:
+`CUDA_VISIBLE_DEVICES=` (or `--moe-stream-vram-cache 0`) disables the discrete VRAM pool while keeping full CPU, RAM cache, and fast-prefill paths active:
 
 ```bash
-systemd-run --user --scope -q -p MemoryMax=$CAP -p MemorySwapMax=0 -- env \
-  GGML_CUDA_COPY_KERNEL=65536 GGML_CUDA_POOL1D_ROW=1 GGML_CUDA_FUSE_AMAX=1 \
-  GGML_CUDA_MOE_MARK_IDS=1 GGML_CUDA_FUSE_NORM_QUANT=1 ./build/bin/llama-server -m $HOME/models/flint/flint-UD-Q4_K_XL.tokenwing.gguf \
-  --load-mode dio -fit off -ngl 99 -c 65536 -ctk q8_0 -ctv q8_0 -fa on -np 1 -t 8 -b 2048 -ub 2048 \
-  --cache-ram 0 --ctx-checkpoints 2 --moe-stream model --moe-stream-gpu-layers 0 \
-  --moe-stream-ram-free 1GiB --moe-stream-overlap 1 --moe-stream-pred-shared 1 \
-  --moe-stream-chunk-prefetch 512 --moe-stream-io-wake chunk --moe-stream-promote 1 \
-  --moe-stream-guess-cap 2 --moe-stream-policy decay --moe-stream-prompt-end recency \
-  --moe-stream-cpu-skip-zero 1 --moe-stream-cpu-x4 1 --moe-stream-cpu-fuse 1 \
-  --moe-stream-cpu-dispatch 1 --moe-stream-plan 1 --moe-stream-drop-stale 1 \
-  --moe-stream-needed-early 1 --moe-stream-lookahead 2 --moe-stream-guess-combined 1 \
-  --moe-stream-proj-ready 1 --moe-stream-wordstart 2 --moe-stream-protect-named 1 \
-  --moe-stream-guess-inflight 4 --moe-stream-cpu-down-scale 1 --moe-stream-cpu-topk 1 \
-  --moe-stream-cpu-q8-tiled 1 --moe-stream-cpu-fa 1 --moe-stream-cpu-mmid-merge 1 \
-  --moe-stream-cpu-iqk 8 --moe-stream-layer-major 1 --moe-stream-wave-plan 1 \
-  --moe-stream-read-ahead 1 --moe-stream-idle-load 2 --moe-stream-window 1 \
-  --moe-stream-prompt-defer 1 --moe-stream-gpu-waves 512 --moe-stream-gpu-share-q8 1 \
-  --moe-stream-gpu-skip-zero 1 --moe-stream-async-h2d 1 --moe-stream-gpu-wave-skip-zero 1 \
-  --moe-stream-prompt-split 1 --moe-stream-vram-free 200MiB --moe-stream-vram-experts-file model \
-  --moe-stream-vram-follow 1 --moe-stream-vram-parallel 1 --moe-stream-vram-copyback 1 \
-  --moe-stream-vram-end-fill 1 --moe-stream-copy-ahead 2 --moe-stream-vram-lend-prompt 1 \
-  --backend-sampling --host 127.0.0.1 --port 8080
+systemd-run --user --scope -q -p MemoryMax=$CAP -p MemorySwapMax=0 -- env CUDA_VISIBLE_DEVICES= \
+  ./build/bin/llama-server -m $HOME/models/flint/flint-UD-Q4_K_XL.tokenwing.gguf \
+  -c 65536 -ctk q8_0 -ctv q8_0 --moe-stream model --moe-stream-ram-free 0.5GiB
 ```
 
-Ling 3.0 Flash:
+On large-memory integrated GPUs (`>= 24 GiB` shared memory, e.g., GB10 or Strix Halo), add `--moe-stream-uma 1`.
+
+### Hardware tuning with `autotuner`
+
+Measure physical P-cores, NUMA nodes, NVMe queue depth, and per-GPU bandwidth on your host:
 
 ```bash
-systemd-run --user --scope -q -p MemoryMax=$CAP -p MemorySwapMax=0 -- env \
-  GGML_CUDA_COPY_KERNEL=65536 GGML_CUDA_POOL1D_ROW=1 GGML_CUDA_FUSE_AMAX=1 \
-  GGML_CUDA_MOE_MARK_IDS=1 GGML_CUDA_FUSE_NORM_QUANT=1 ./build/bin/llama-server -m $HOME/models/ling/Ling-3.0-flash-MXFP4_MOE.tokenwing.gguf \
-  --load-mode dio -fit off -ngl 99 -c 65536 -ctk q8_0 -ctv q8_0 -np 1 -t 8 -b 2048 -ub 2048 \
-  --cache-ram 0 --ctx-checkpoints 2 --moe-stream model --moe-stream-ram-free 1GiB \
-  --moe-stream-overlap 1 --moe-stream-pred-shared 1 --moe-stream-chunk-prefetch 512 \
-  --moe-stream-gpu-waves 512 --moe-stream-gpu-layers 0 --moe-stream-io-wake chunk \
-  --moe-stream-promote 1 --moe-stream-guess-cap 2 --moe-stream-policy decay \
-  --moe-stream-prompt-end recency --moe-stream-cpu-skip-zero 1 --moe-stream-fused-route 1 \
-  --moe-stream-cpu-x4 1 --moe-stream-cpu-fuse 1 --moe-stream-conv-silu 1 --moe-stream-gpu-share-q8 1 \
-  --moe-stream-cpu-dispatch 1 --moe-stream-plan 1 --moe-stream-drop-stale 1 \
-  --moe-stream-needed-early 1 --moe-stream-lookahead 2 --moe-stream-guess-combined 1 \
-  --moe-stream-proj-ready 1 --moe-stream-wordstart 2 --moe-stream-protect-named 1 \
-  --moe-stream-guess-inflight 4 --moe-stream-vram-free 200MiB --moe-stream-vram-experts-file model \
-  --moe-stream-correction model --moe-stream-gpu-skip-zero 1 --moe-stream-vram-follow 1 \
-  --moe-stream-vram-parallel 1 --moe-stream-vram-copyback 1 --moe-stream-async-h2d 1 \
-  --moe-stream-layer-major 1 --moe-stream-wave-plan 1 --moe-stream-read-ahead 1 \
-  --moe-stream-idle-load 2 --moe-stream-window 1 --moe-stream-vram-end-fill 1 \
-  --moe-stream-prompt-defer 1 --moe-stream-gpu-wave-skip-zero 1 --moe-stream-prompt-split 1 \
-  --moe-stream-vram-lend-prompt 1 --moe-stream-cpu-down-scale 1 --moe-stream-cpu-topk 1 \
-  --moe-stream-cpu-q8-tiled 1 --moe-stream-cpu-fa 1 --moe-stream-cpu-mmid-merge 1 \
-  --moe-stream-cpu-iqk 8 --moe-stream-layer-major-batch 32768 --backend-sampling --host 127.0.0.1 \
-  --port 8080
+./build/bin/autotuner --file $HOME/models/flint/flint-UD-Q4_K_XL.tokenwing.gguf
 ```
 
-### An NVIDIA card with 6 GB of VRAM and 16 GB of RAM
-
-Flint 40B:
-
-```bash
-systemd-run --user --scope -q -p MemoryMax=$CAP -p MemorySwapMax=0 -- env \
-  GGML_CUDA_COPY_KERNEL=65536 GGML_CUDA_POOL1D_ROW=1 GGML_CUDA_FUSE_AMAX=1 \
-  GGML_CUDA_MOE_MARK_IDS=1 GGML_CUDA_FUSE_NORM_QUANT=1 ./build/bin/llama-server -m $HOME/models/flint/flint-UD-Q4_K_XL.tokenwing.gguf \
-  --load-mode dio -fit off -ngl 99 -c 65536 -ctk q8_0 -ctv q8_0 -fa on -np 1 -t 8 -b 2048 -ub 2048 \
-  --cache-ram 0 --ctx-checkpoints 2 --moe-stream model --moe-stream-gpu-layers-list 47,48 \
-  --moe-stream-ram-free 0.5GiB --moe-stream-overlap 1 --moe-stream-pred-shared 1 \
-  --moe-stream-chunk-prefetch 512 --moe-stream-io-wake chunk --moe-stream-promote 1 \
-  --moe-stream-guess-cap 2 --moe-stream-policy decay --moe-stream-prompt-end recency \
-  --moe-stream-cpu-skip-zero 1 --moe-stream-cpu-x4 1 --moe-stream-cpu-fuse 1 \
-  --moe-stream-cpu-dispatch 1 --moe-stream-plan 1 --moe-stream-drop-stale 1 \
-  --moe-stream-needed-early 1 --moe-stream-lookahead 2 --moe-stream-guess-combined 1 \
-  --moe-stream-proj-ready 1 --moe-stream-wordstart 2 --moe-stream-protect-named 1 \
-  --moe-stream-guess-inflight 4 --moe-stream-cpu-down-scale 1 --moe-stream-cpu-topk 1 \
-  --moe-stream-cpu-q8-tiled 1 --moe-stream-cpu-fa 1 --moe-stream-cpu-mmid-merge 1 \
-  --moe-stream-cpu-iqk 8 --moe-stream-layer-major 1 --moe-stream-wave-plan 1 \
-  --moe-stream-read-ahead 1 --moe-stream-idle-load 2 --moe-stream-window 1 \
-  --moe-stream-prompt-defer 1 --moe-stream-gpu-waves 512 --moe-stream-gpu-share-q8 1 \
-  --moe-stream-gpu-skip-zero 1 --moe-stream-async-h2d 1 --moe-stream-gpu-wave-skip-zero 1 \
-  --moe-stream-prompt-split 1 --moe-stream-vram-free 200MiB --moe-stream-vram-experts-file model \
-  --moe-stream-vram-follow 1 --moe-stream-vram-parallel 1 --moe-stream-vram-copyback 1 \
-  --moe-stream-vram-end-fill 1 --moe-stream-copy-ahead 2 --moe-stream-vram-lend-prompt 1 \
-  --backend-sampling --host 127.0.0.1 --port 8080
-```
-
-### CPU only
-
-`CUDA_VISIBLE_DEVICES=` hides the GPU from the engine. The CPU computes every expert, and the RAM also holds the weights a GPU would hold.
-
-Flint 40B:
-
-```bash
-systemd-run --user --scope -q -p MemoryMax=$CAP -p MemorySwapMax=0 -- env CUDA_VISIBLE_DEVICES= ./build/bin/llama-server \
-  -m $HOME/models/flint/flint-UD-Q4_K_XL.tokenwing.gguf --load-mode dio -fit off -ngl 99 -c 65536 \
-  -ctk q8_0 -ctv q8_0 -fa on -np 1 -t 8 -b 2048 -ub 2048 --cache-ram 0 --ctx-checkpoints 2 \
-  --moe-stream model --moe-stream-gpu-layers 0 --moe-stream-ram-free 0.5GiB --moe-stream-overlap 1 \
-  --moe-stream-pred-shared 1 --moe-stream-chunk-prefetch 512 --moe-stream-io-wake chunk \
-  --moe-stream-promote 1 --moe-stream-guess-cap 2 --moe-stream-policy decay \
-  --moe-stream-prompt-end recency --moe-stream-cpu-skip-zero 1 --moe-stream-cpu-x4 1 \
-  --moe-stream-cpu-fuse 1 --moe-stream-cpu-dispatch 1 --moe-stream-plan 1 --moe-stream-drop-stale 1 \
-  --moe-stream-needed-early 1 --moe-stream-lookahead 2 --moe-stream-guess-combined 1 \
-  --moe-stream-proj-ready 1 --moe-stream-wordstart 2 --moe-stream-protect-named 1 \
-  --moe-stream-guess-inflight 4 --moe-stream-cpu-down-scale 1 --moe-stream-cpu-topk 1 \
-  --moe-stream-cpu-q8-tiled 1 --moe-stream-cpu-fa 1 --moe-stream-cpu-mmid-merge 1 \
-  --moe-stream-cpu-iqk 8 --moe-stream-layer-major 1 --moe-stream-wave-plan 1 \
-  --moe-stream-read-ahead 1 --moe-stream-idle-load 2 --moe-stream-window 1 \
-  --moe-stream-prompt-defer 1 --moe-stream-cpu-weighted-sum 1 --moe-stream-cpu-small-ops 1 --host 127.0.0.1 \
-  --port 8080
-```
+Append the returned `"recommended_args"` array (or copy `-t`, `-tb`, `--cpu-mask`, `--moe-stream-io-threads`, and `--moe-stream-vram-device`) to your command.
 
 ### What the flags do
 
-The full list, with what each flag measured, is in [Settings](settings.md). In short:
+The full reference, including internal micro-flags hidden under `--help-internal`, is in [Settings](settings.md). In short:
 
-| Part of the command | What it does |
+| Flag / Group | What it does |
 |---|---|
-| `systemd-run ... env GGML_CUDA_...` | `systemd-run` sets the memory limit. The `GGML_CUDA_` variables switch on small CUDA speed-ups. |
-| `-m`, `--load-mode dio`, `--moe-stream model` | Load the model file with direct reads, and stream the experts from the model file itself. |
-| `-c`, `-ctk q8_0 -ctv q8_0`, `-fa on`, `-np 1`, `-t 8` | Context length, the K/V cache stored as 8-bit values, Flash Attention (in the Flint commands), one server slot, 8 CPU threads. |
-| `-b 2048 -ub 2048`, `--cache-ram 0`, `--ctx-checkpoints 2` | The prompt batch, and how the server keeps chat states in RAM. |
-| `--moe-stream-ram-free`, `--moe-stream-idle-load 2`, `--moe-stream-policy decay`, `--moe-stream-protect-named` | How much RAM stays free, filling the RAM with experts before the model counts as loaded, and which experts stay in RAM. |
-| `--moe-stream-plan`, `-drop-stale`, `-lookahead`, `-needed-early`, `-guess-*`, `-wordstart`, `-pred-shared`, `-correction` | Predicting the experts of the next layers from their own routers, and keeping the useful predictions. |
-| `--moe-stream-overlap`, `-proj-ready`, `-chunk-prefetch`, `-io-wake`, `-promote` | How the SSD reads are issued: a needed read goes before a predicted one, and the CPU starts on experts that have landed. |
-| `--moe-stream-gpu-layers`, `-gpu-layers-list`, `-vram-free`, `-vram-experts-file`, `-vram-follow`, `-vram-parallel`, `-vram-copyback` | What the VRAM holds: whole layers, and a cache of experts sized from the free VRAM that follows the text. |
-| `--moe-stream-gpu-waves`, `-gpu-share-q8`, `-gpu-skip-zero`, `-gpu-wave-skip-zero`, `-async-h2d` | Work on the GPU: the expert matmuls of large prompt batches, and the copies between the CPU's work and the GPU's. |
-| `--moe-stream-cpu-*` | CPU kernels for the experts in RAM. |
-| `--moe-stream-layer-major`, `-wave-plan`, `-read-ahead`, `-window`, `-prompt-defer`, `-prompt-split`, `-copy-ahead`, `-vram-end-fill`, `-vram-lend-prompt` | Prompts: a long prompt passes through one layer before the next starts, so each layer's experts are read about once. |
-| `--backend-sampling` | Tokens are picked on the GPU. |
-| `--host 127.0.0.1 --port 8080` | Where the server listens. |
+| `--moe-stream model` | Enables Direct-I/O streaming, activates all 5 feature umbrella groups below (`auto`), sets server `-np 1` / `-cram 0`, and auto-budgets whole GPU layers + VRAM expert pool. |
+| `--moe-stream-fast-prefill` | Enables layer-major prompt waves, GPU wave-gather (`512` waves), prompt-split, copy-ahead, CUDA prefill fast kernels, and auto `-ub 2048` (`1024` at `-c >= 262144`). |
+| `--moe-stream-fast-decode` | Enables overlapped Direct-I/O + router plan lookahead, prediction correction (`model`), fused routing/norms, and GPU backend sampling (`-bs` on server). |
+| `--moe-stream-fast-cpu` | Enables fused SIMD CPU MoE matmuls (`iqk 8`, `x4`, `mmid-merge`, `cpu-topk`, `cpu-fa`, `small-ops`, `weighted-sum`). |
+| `--moe-stream-vram-cache` | Manages the VRAM hot-expert pool (`vram-free 200MiB`, `vram-follow`, `vram-copyback`, `vram-experts-file model`) and falls back silently on CPU-only runs. |
+| `--moe-stream-ram-cache` | Configures RAM decay eviction, prompt-end recency retention, and startup RAM warm-fill (`--moe-stream-idle-load 2`). |
+| `--moe-stream-ram-free SIZE` | Keeps `SIZE` of system RAM free outside the expert pools (use `0.5GiB` on dedicated servers or `1GiB`–`2GiB` on desktops). |
+| `--moe-stream-timing 1` | Prints per-stage SSD / CPU / GPU / hand-off timing breakdown in stats and logs. |
 
 ### Other context lengths
 
-Change `-c` to the length you want: 4096, 8192, 16384, 32768, 65536, 131072 or 262144. The 12 GB and 6 GB commands change with the length in other places too, because a longer K/V cache takes VRAM from the experts. The table gives the values for each length.
-
-| `-c` | Flint, 12 GB card | Flint, 6 GB card | Ling, 12 GB card |
-|---|---|---|---|
-| 4096 to 32768 | no change | no change | remove `--moe-stream-layer-major-batch 32768` |
-| 65536 | the command above | the command above | the command above |
-| 131072 | `--moe-stream-gpu-layers-list 46,47,48` | `--moe-stream-gpu-layers 0` in place of `--moe-stream-gpu-layers-list 47,48` | no change |
-| 262144 | `--moe-stream-gpu-layers-list 47,48`, `-b 1024 -ub 1024` | `--moe-stream-gpu-layers 0` in place of `--moe-stream-gpu-layers-list 47,48`, `-b 1024 -ub 1024` | `-b 1024 -ub 1024` |
-
-The CPU-only Flint command changes only `-c`, and `-b 1024 -ub 1024` at 262144. The 8 GB commands are given for 65536 only.
+Change `-c` to `4096`, `8192`, `16384`, `32768`, `65536`, `131072`, or `262144`. No manual layer-list edits are needed: `--moe-stream model` automatically recomputes the whole-layer vs. VRAM-pool split for the active KV size and scales `-b 1024 -ub 1024` at `-c 262144`.
 
 ## 4. What you see while it loads
 
@@ -323,7 +179,7 @@ What to expect:
 - Reply speed falls as a chat fills a long context.
 - After a very long prompt (16k tokens and more), the first reply tokens are slower while the RAM cache moves from the prompt's experts to the reply's.
 - On a PC with an 8 GB NVIDIA card and 16 GiB of free RAM, the 8 GB commands gave Flint 45.8 tokens/s (plain llama.cpp: 25.5) and Ling 22.1 tokens/s (plain llama.cpp: 6.7), at 65k context. Speed depends on the machine: with more RAM, the RAM holds more experts.
-- Speed far below that can mean a flag was lost in copying. A missing flag turns a speed-up off and nothing complains. On a laptop, also check that it is plugged in and that the GPU is not held at a low power limit.
+- `--moe-stream model` enables the fast defaults automatically; if speed is lower than expected, check `llama_moe_stream:` startup lines for VRAM/RAM fallbacks, and on a laptop ensure AC power and full GPU power limits.
 
 ## 6. When something fails
 

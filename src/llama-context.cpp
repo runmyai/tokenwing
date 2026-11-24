@@ -2250,7 +2250,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // between two computes) - wait for them first. Between decode words the GPU is already idle here (the logits were read)
         if (ctx_moe_stream() && ctx_moe_stream()->p1.async_h2d && ggml_backend_sched_get_async_host_input(sched.get())) {
             const int64_t t_tt = ctx_moe_stream()->vf_test_tick_timers ? ggml_time_us() : 0;
-            ggml_backend_sched_synchronize(sched.get());   // (only when the scheduler really turned it on)
+            ggml_backend_sched_wait_async_host_inputs(sched.get());   // wait only for pending async_h2d DMAs, not whole GPU stream
             if (t_tt) {
                 ctx_moe_stream()->vf_tt_sync_us += ggml_time_us() - t_tt;   // TEST ONLY (MOE_STREAM_TEST_VF_TICK_TIMERS)
             }

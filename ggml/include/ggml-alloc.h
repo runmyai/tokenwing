@@ -61,11 +61,20 @@ GGML_API void ggml_gallocr_reserve_n_size(
     const int * node_buffer_ids,
     const int * leaf_buffer_ids,
     size_t * sizes);
+typedef void (*ggml_gallocr_before_realloc_fn)(void * user_data);
+
 GGML_API bool ggml_gallocr_reserve_n(
     ggml_gallocr_t galloc,
     struct ggml_cgraph * graph,
     const int * node_buffer_ids,
     const int * leaf_buffer_ids);
+GGML_API bool ggml_gallocr_reserve_n_ex(
+    ggml_gallocr_t galloc,
+    struct ggml_cgraph * graph,
+    const int * node_buffer_ids,
+    const int * leaf_buffer_ids,
+    ggml_gallocr_before_realloc_fn before_realloc,
+    void * before_realloc_user_data);
 // the buffer type of the buffer the last reserve could not allocate, NULL when it allocated everything (or failed for another reason)
 GGML_API ggml_backend_buffer_type_t ggml_gallocr_last_failed_buft(void);
 
@@ -82,6 +91,11 @@ GGML_API void ggml_gallocr_get_realloc_reasons(int why[4]);
 // returns false) instead of growing it
 GGML_API bool ggml_gallocr_set_fixed_chunks(ggml_gallocr_t galloc, int buffer_id, ggml_backend_buffer_t * chunks, int n_chunks, bool own_may_grow);
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
+GGML_API bool ggml_gallocr_alloc_graph_n(
+    ggml_gallocr_t galloc,
+    struct ggml_cgraph * graph,
+    const int * node_buffer_ids,
+    const int * leaf_buffer_ids);
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 // Write zeros over the allocator's buffers that live in host memory (so their pages are resident from now on)

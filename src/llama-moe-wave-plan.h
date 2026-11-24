@@ -71,7 +71,7 @@ static inline int64_t moe_wave_cap(int64_t n_tok, int64_t k, int32_t n_waves, in
 // safe one); err says why.
 static inline bool moe_wave_plan_build(moe_wave_plan & p, const std::vector<int32_t> & uniq, const int32_t * ids, int64_t n,
         const uint8_t * res, const float * pe_w, int32_t n_waves, int64_t width, int64_t cap, int32_t n_expert,
-        std::string & err) {
+        std::string & err, const uint8_t * vram_w0 = nullptr) {
     p.n_waves   = n_waves;
     p.cap       = cap;
     p.n         = n;
@@ -125,6 +125,12 @@ static inline bool moe_wave_plan_build(moe_wave_plan & p, const std::vector<int3
                 p.pin[ord[i]] = 1;
             }
         }
+    }
+    if (vram_w0 != nullptr && n_waves > 1 && n_res > (size_t) width) {
+        // Prioritize residents already placed in VRAM by copy-ahead so wave 0 avoids synchronous PCIe re-copies
+        std::stable_partition(ord.begin(), ord.begin() + (std::ptrdiff_t) n_res, [&](int32_t e) {
+            return vram_w0[e] != 0;
+        });
     }
     {
         int32_t w  = 0;

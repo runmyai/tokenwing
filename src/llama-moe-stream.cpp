@@ -2299,6 +2299,14 @@ llama_moe_stream::llama_moe_stream(
             p1_decay_tbl[d] = std::exp2(-(float) d/p1.evict_halflife);
         }
     }
+    {
+        // 150 half-lives cover the full IEEE-754 float32 dynamic range so runtime loops never call libm exp2 on subnormals
+        const size_t n_pe = (size_t) std::min(150.0*(double) p1.prompt_end_halflife, 1048576.0) + 1;
+        pe_decay_tbl.resize(n_pe);
+        for (size_t d = 0; d < n_pe; d++) {
+            pe_decay_tbl[d] = std::exp2(-(float) d/p1.prompt_end_halflife);
+        }
+    }
 
     if (!file.has_direct_io()) {   // a file system without O_DIRECT - buffered reads (the buffers stay page-aligned), slower
         fprintf(stderr, "llama_moe_stream: '%s' cannot be opened with O_DIRECT here - the experts are read through the page cache (slower, "
@@ -11150,7 +11158,8 @@ void llama_moe_stream::win_check_budget(const char * where) const {
 // T switches on its lowest switched-off slot below its zero block, else raises the zero block by one (T has no graph in flight: it has
 // not run in this call, or the call is over). The pages of A's slot, when it holds RAM, move onto T's slot (the OS layer's page move;
 // where there is none they are returned and T's next read gets fresh pages). false = T is at its cap
-bool llama_moe_stream::win_move_room(llama_moe_stream_layer & A, int32_t a, llama_moe_stream_layer & T) {
+bool llama_moe_stream::win_move_room(llama_moe_stream_layer & A, int32_t a, llama_moe_stream_layer & T,
+                                     std::vector<std::pair<llama_moe_stream_layer *, int32_t>> * defer_rel) {
     int32_t t = -1;
     for (uint32_t s = 0; s < T.n_slots; s++) {
         if (T.slot_off[s]) {
@@ -11203,7 +11212,11 @@ bool llama_moe_stream::win_move_room(llama_moe_stream_layer & A, int32_t a, llam
         A.el_res[a] = 0;   A.el_zero_known[a] = 1;   A.el_land[a] = 0;   // A's range is fresh again
         n_win_pagemoves += 1;
     } else {
-        el_release_slot(A, a);   // (the projections that did move left fresh ranges behind; returning them again is harmless)
+        if (defer_rel != nullptr && !win_check) {
+            defer_rel->push_back({ &A, a });
+        } else {
+            el_release_slot(A, a);   // (the projections that did move left fresh ranges behind; returning them again is harmless)
+        }
         n_win_released += 1;
     }
     n_win_moves += 1;
@@ -11265,7 +11278,9 @@ int64_t llama_moe_stream::win_take(llama_moe_stream_layer & T, int64_t need, boo
         return (size_t) e < u.sl->win_score.size() ? u.sl->win_score[e] : 0.0f; };
     std::stable_sort(c[3].begin(), c[3].end(), [&](const cand & u, const cand & v) { return sc(u) < sc(v); });
     int64_t got = 0;
-    for (int g = 0; g < 4 && got < need; g++) {
+    std::vector<std::pair<llama_moe_stream_layer *, int32_t>> defer_rel;
+    bool stopped_at_cap = false;
+    for (int g = 0; g < 4 && got < need && !stopped_at_cap; g++) {
         for (const cand & u : c[g]) {
             if (got >= need) {
                 break;
@@ -11274,14 +11289,16 @@ int64_t llama_moe_stream::win_take(llama_moe_stream_layer & T, int64_t need, boo
             if (g == 3 && e >= 0) {
                 u.sl->win_refill.push_back(e);   // a kept expert given up for now: read back after the call
             }
-            if (!win_move_room(*u.sl, u.s, T)) {
-                return got;   // T is at its cap
+            if (!win_move_room(*u.sl, u.s, T, &defer_rel)) {
+                stopped_at_cap = true;
+                break;   // T is at its cap
             }
             got += 1;
             n_win_borrowed   += g == 2 ? 1 : 0;
             n_win_keep_taken += g == 3 ? 1 : 0;
         }
     }
+    el_release_slots_batch(defer_rel);
     return got;
 }
 
@@ -11468,7 +11485,7 @@ void llama_moe_stream::win_layer_start(llama_moe_stream_layer & sl, const int32_
         if (sl.win_score[e] == 0.0f && !sl.vx_held(e)) {
             sl.win_union += 1;   // counted on first pick (the floor keeps a picked score above 0); not the VRAM-held ones
         }
-        sl.win_score[e] = win_rule == 0 ? sl.win_score[e] + std::max(std::exp2(-(float) (n_tok - 1 - t)/p1.prompt_end_halflife), 1e-30f)
+        sl.win_score[e] = win_rule == 0 ? sl.win_score[e] + std::max(pe_decay(n_tok - 1 - t), 1e-30f)
                         : win_rule == 1 ? (float) (sl.win_tok + t + 1)
                         :                 sl.win_score[e] + 1.0f;
     }
@@ -11866,6 +11883,7 @@ void llama_moe_stream::win_restore(bool drop_ready) {
     const auto home_of = [&](const llama_moe_stream_layer & x) -> uint32_t {
         return el_on ? (x.win_home > 0 ? x.win_home : x.share) : rest_share();
     };
+    std::vector<std::pair<llama_moe_stream_layer *, int32_t>> defer_rel;
     for (llama_moe_stream_layer * T : L) {
         for (llama_moe_stream_layer * A : L) {
             if (T->share >= home_of(*T)) {
@@ -11878,7 +11896,7 @@ void llama_moe_stream::win_restore(bool drop_ready) {
                 if (A->share <= home_of(*A) || T->share >= home_of(*T)) {
                     break;
                 }
-                win_move_room(*A, s, *T);
+                win_move_room(*A, s, *T, &defer_rel);
             }
         }
     }
@@ -11895,7 +11913,7 @@ void llama_moe_stream::win_restore(bool drop_ready) {
             dz_forget(*x, s);
             x->slot_off[s] = 1; x->gsf_dirty = 1;
             x->share      -= 1;
-            el_release_slot(*x, s);
+            defer_rel.push_back({ x, s });
         }
         on     += x->share;
         hm_sum += hm;
@@ -11903,6 +11921,7 @@ void llama_moe_stream::win_restore(bool drop_ready) {
             x->win_home = 0;
         }
     }
+    el_release_slots_batch(defer_rel);
     win_over = std::max<int64_t>(0, on - hm_sum);
 }
 
@@ -11981,6 +12000,7 @@ void llama_moe_stream::win_compact(llama_moe_stream_layer & sl) {
         }
     }
     size_t il = 0;
+    std::vector<std::pair<llama_moe_stream_layer *, int32_t>> defer_rel;
     for (uint32_t h = n_slots; h < sl.n_slots; h++) {
         if (sl.slot_off[h]) {
             continue;
@@ -12005,9 +12025,10 @@ void llama_moe_stream::win_compact(llama_moe_stream_layer & sl) {
             dz_forget(sl, (int32_t) h);
             sl.slot_off[h] = 1; sl.gsf_dirty = 1;
             sl.share      -= 1;
-            el_release_slot(sl, (int32_t) h);
+            defer_rel.push_back({ &sl, (int32_t) h });
         }
     }
+    el_release_slots_batch(defer_rel);
 }
 
 void llama_moe_stream::win_print_stats() const {
@@ -12460,7 +12481,7 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
         std::fill(sl.p1_pe_w.begin(), sl.p1_pe_w.end(), 0.0f);
         sl.p1_pe_seq = call_seq;
         for (int64_t t = 0; t < n_tok; t++) {
-            const float wt = std::exp2(-(float) (n_tok - 1 - t)/p1.prompt_end_halflife);
+            const float wt = pe_decay(n_tok - 1 - t);
             for (int64_t j = 0; j < k; j++) {
                 sl.p1_pe_w[ids[t*k + j]] += wt;
             }
@@ -12500,9 +12521,24 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
                 const int32_t s = sl.expert_slot[e];
                 wp_res[e] = s >= 0 && !sl.slot_cancel[s] && !(sl.el_low_only && s >= (int32_t) n_slots) ? 1 : 0;
             }
+            std::vector<uint8_t> wp_vram_w0;
+            const uint8_t * vram_w0_ptr = nullptr;
+            if (ca_on && ca_job_il == sl.il && ca_job_w == 0 && !ca_place.empty()) {
+                wp_vram_w0.assign(sl.n_expert, 0);
+                int64_t n_ca_hit = 0;
+                for (const int32_t e : sl.uniq) {
+                    if ((size_t) e < ca_place.size() && ca_place[(size_t) e] >= 0) {
+                        wp_vram_w0[(size_t) e] = 1;
+                        n_ca_hit++;
+                    }
+                }
+                if (n_ca_hit > 0) {
+                    vram_w0_ptr = wp_vram_w0.data();
+                }
+            }
             std::string err;
             bool built = moe_wave_plan_build(wp_tab, sl.uniq, ids, n, wp_res.data(), pe_ub ? sl.p1_pe_w.data() : nullptr, n_waves(n_tok),
-                        wave_w, wave_cap(n_tok), (int32_t) sl.n_expert, err);
+                        wave_w, wave_cap(n_tok), (int32_t) sl.n_expert, err, vram_w0_ptr);
             if (!built && wave_cap(n_tok) < n_tok*(int64_t) n_expert_used) {
                 // A pair cap below the safe one (only MOE_STREAM_TEST_WAVE_SLACK sets one) did not fit - built again without a
                 // cap (each expert in one wave; the wave graph computes every row in every wave, so no index tensor is sized by the cap)
@@ -12512,7 +12548,7 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
                 }
                 err.clear();
                 built = moe_wave_plan_build(wp_tab, sl.uniq, ids, n, wp_res.data(), pe_ub ? sl.p1_pe_w.data() : nullptr, n_waves(n_tok),
-                        wave_w, n_tok*(int64_t) n_expert_used, (int32_t) sl.n_expert, err);
+                        wave_w, n_tok*(int64_t) n_expert_used, (int32_t) sl.n_expert, err, vram_w0_ptr);
             }
             if (!built) {   // (without a cap it always fits - a stop here is a bug)
                 for (const int32_t e : sl.uniq) {
@@ -18979,6 +19015,14 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
                     ca_es.push_back((int32_t) e);   // (a held expert may have a RAM copy now; the VRAM pass computes it)
                 }
             }
+            if ((int32_t) ca_es.size() > Wp2 && (size_t) il2 < us_cnt.size() && !us_cnt[(size_t) il2].empty()) {
+                const auto & uc = us_cnt[(size_t) il2];
+                std::stable_sort(ca_es.begin(), ca_es.end(), [&](int32_t a, int32_t b) {
+                    const uint32_t ca = (size_t) a < uc.size() ? uc[(size_t) a] : 0u;
+                    const uint32_t cb = (size_t) b < uc.size() ? uc[(size_t) b] : 0u;
+                    return ca > cb;
+                });
+            }
         }
         ca_slots.resize(ca_es.size());
         if (!ca_es.empty()) {
@@ -21994,6 +22038,13 @@ int64_t llama_moe_stream::el_drop_layer(llama_moe_stream_layer & sl, int64_t n, 
 
 // mtx held: a switched-off slot's pages back to the system; with every page of its three slices returned it reads as zeros (known zero)
 void llama_moe_stream::el_release_slot(llama_moe_stream_layer & sl, int32_t s) {
+#if !EL_OS_WIN32
+    static const bool test_rel_fail = getenv("MOE_STREAM_TEST_RELEASE_FAIL") != nullptr && atoi(getenv("MOE_STREAM_TEST_RELEASE_FAIL")) != 0;
+    if (!test_rel_fail && sl.el_res[s] == 0 && sl.el_zero_known[s] != 0) {
+        sl.el_land[s] = 0;
+        return;
+    }
+#endif
     bool whole = true;
     for (int p = 0; p < 3; p++) {
         whole = el_os_release_pages((uint8_t *) sl.weights[p].pool->data + (size_t) s*sl.weights[p].size, sl.weights[p].size, sl.slot_off[s] != 0) && whole;
@@ -22001,6 +22052,80 @@ void llama_moe_stream::el_release_slot(llama_moe_stream_layer & sl, int32_t s) {
     sl.el_zero_known[s] = whole ? 1 : 0;
     sl.el_res[s]        = whole ? 0 : 1;   // every page returned = no RAM (a part left = counted as holding RAM)
     sl.el_land[s]       = 0;
+}
+
+void llama_moe_stream::el_release_slots_batch(std::vector<std::pair<llama_moe_stream_layer *, int32_t>> & batch) {
+    if (batch.empty()) {
+        return;
+    }
+#if EL_OS_WIN32
+    for (const auto & item : batch) {
+        el_release_slot(*item.first, item.second);
+    }
+    batch.clear();
+#else
+    static const bool test_rel_fail = getenv("MOE_STREAM_TEST_RELEASE_FAIL") != nullptr && atoi(getenv("MOE_STREAM_TEST_RELEASE_FAIL")) != 0;
+    if (test_rel_fail) {
+        for (const auto & item : batch) {
+            el_release_slot(*item.first, item.second);
+        }
+        batch.clear();
+        return;
+    }
+    size_t keep_n = 0;
+    for (size_t i = 0; i < batch.size(); i++) {
+        llama_moe_stream_layer & sl = *batch[i].first;
+        const int32_t s = batch[i].second;
+        if (sl.el_res[s] == 0 && sl.el_zero_known[s] != 0) {
+            sl.el_land[s] = 0;
+            continue;
+        }
+        batch[keep_n++] = batch[i];
+    }
+    batch.resize(keep_n);
+    if (batch.empty()) {
+        return;
+    }
+    std::sort(batch.begin(), batch.end(), [](const auto & a, const auto & b) {
+        return a.first->il != b.first->il ? a.first->il < b.first->il : a.second < b.second;
+    });
+    batch.erase(std::unique(batch.begin(), batch.end()), batch.end());
+    const size_t pg = os_page_size();
+    size_t i = 0;
+    while (i < batch.size()) {
+        llama_moe_stream_layer & sl = *batch[i].first;
+        const int32_t s0 = batch[i].second;
+        int32_t s1 = s0;
+        size_t j = i + 1;
+        while (j < batch.size() && batch[j].first == &sl && batch[j].second == s1 + 1) {
+            s1 = batch[j].second;
+            j++;
+        }
+        bool aligned = s1 > s0;
+        for (int p = 0; p < 3 && aligned; p++) {
+            aligned = ((uintptr_t) sl.weights[p].pool->data % pg == 0) && (sl.weights[p].size % pg == 0);
+        }
+        if (aligned) {
+            const size_t cnt = (size_t) (s1 - s0 + 1);
+            bool whole = true;
+            for (int p = 0; p < 3; p++) {
+                uint8_t * p0 = (uint8_t *) sl.weights[p].pool->data + (size_t) s0 * sl.weights[p].size;
+                whole = el_os_release_pages(p0, cnt * sl.weights[p].size, true) && whole;
+            }
+            for (int32_t s = s0; s <= s1; s++) {
+                sl.el_zero_known[s] = whole ? 1 : 0;
+                sl.el_res[s]        = whole ? 0 : 1;
+                sl.el_land[s]       = 0;
+            }
+        } else {
+            for (int32_t s = s0; s <= s1; s++) {
+                el_release_slot(sl, s);
+            }
+        }
+        i = j;
+    }
+    batch.clear();
+#endif
 }
 
 // ---- discardable expert slots ----

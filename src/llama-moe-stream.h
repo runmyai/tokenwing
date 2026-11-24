@@ -1908,6 +1908,7 @@ struct llama_moe_stream {
     int64_t  el_low_keep() const;                                                 // the slots below the start size every layer keeps
     bool     el_givable_any() const;                                              // mtx: a slot some layer may give back
     void     el_release_slot(llama_moe_stream_layer & sl, int32_t s);             // mtx: its pages back to the system
+    void     el_release_slots_batch(std::vector<std::pair<llama_moe_stream_layer *, int32_t>> & batch);
     int64_t  el_take_steps = 0, el_take_t0_us = 0, el_take_step_us = 0, el_n_trigger = 0;
     std::atomic<int64_t> el_looks{0};
     double   el_thread_cpu_s = 0.0, el_thread_wall_s = 0.0;
@@ -2997,6 +2998,10 @@ struct llama_moe_stream {
     float p1_decay(int64_t d) const {                  // 0 past the table (64 half-lives)
         return d <= 0 ? 1.0f : d < (int64_t) p1_decay_tbl.size() ? p1_decay_tbl[(size_t) d] : 0.0f;
     }
+    std::vector<float>          pe_decay_tbl;          // 2^(-d/prompt_end_halflife) precomputed to avoid subnormal exp2 traps
+    float pe_decay(int64_t d) const {
+        return d <= 0 ? 1.0f : d < (int64_t) pe_decay_tbl.size() ? pe_decay_tbl[(size_t) d] : 0.0f;
+    }
     // The chance table (--moe-stream-chance-model): the chance that a
     // guess candidate is picked by its layer, by lead, rank, sigmoid score bin and band of layers
     static constexpr int P1_N_CAND = 16;
@@ -3175,7 +3180,8 @@ struct llama_moe_stream {
     void    win_close(bool complete);                                                           // mtx held: the pass is over
     void    win_drain(llama_moe_stream_layer * only, const std::vector<uint8_t> * keep_e);      // mtx held: queued window reads back
     int64_t win_take(llama_moe_stream_layer & sl, int64_t need, bool borrow, bool keep_take);
-    bool    win_move_room(llama_moe_stream_layer & a_sl, int32_t a, llama_moe_stream_layer & t_sl);
+    bool    win_move_room(llama_moe_stream_layer & a_sl, int32_t a, llama_moe_stream_layer & t_sl,
+                          std::vector<std::pair<llama_moe_stream_layer *, int32_t>> * defer_rel = nullptr);
     bool    win_commit_slot(llama_moe_stream_layer & sl, int32_t s);
     bool    win_commit_range(llama_moe_stream_layer & sl, uint32_t a, uint32_t b);
     bool    win_was_decommitted(const llama_moe_stream_layer & sl, int32_t s) const;

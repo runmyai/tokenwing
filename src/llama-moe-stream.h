@@ -188,6 +188,8 @@ struct llama_moe_stream_p1 {
     int64_t     vram_free = 0;      // --moe-stream-vram-free: end-state keep-free that sizes N; 0 = off
     int64_t     vram_scratch = -1;  // --moe-stream-vram-scratch: the op scratch pool mapped before the check, bytes; -1 = derived by llama_context, 0 = not mapped
     int64_t     vram_growth = 0;    // --moe-stream-vram-growth: the fit's reserve for lazy allocations; 0 = derived
+    bool        mtp_on_pool_dev = false;   // --spec-type draft-mtp loads NextN on the pool's GPU; ctx_dft is created after vx_setup
+    int64_t     mtp_ctx_bytes   = 0;       // NextN KV/recurrent bytes ctx_dft allocates on the pool's GPU after vx_setup
     std::string correction_file;   // --moe-stream-correction FILE: the trained correction of the router-trick guess, "" = off
     uint64_t    correction_base = 0, correction_size = 0;   // the file is the `size` bytes at `base` of correction_file (the word `model`: data appended to the model file); 0 = the whole file
     bool        idle_load      = false;   // --moe-stream-idle-load 1 or 2 (idle-time loading)

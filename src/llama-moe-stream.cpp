@@ -16954,17 +16954,24 @@ int64_t llama_moe_stream::vx_growth_bytes(int64_t n_ubatch, int64_t n_ctx_run, s
     // instance per streamed layer for each live shape set (the decode graph, the prompt piece shapes seen in the last 10 s) = ~1.5 MiB per
     // streamed layer (55.5 MiB for Ling's 37, measured maximum ~50 + 10 %); it is not held where the backend does not use CUDA graphs. The
     // scratch is counted here only when it is not mapped at start. --moe-stream-vram-growth replaces the whole sum.
-    (void) n_ubatch; (void) n_ctx_run;
+    (void) n_ctx_run;
     const int64_t modules = (int64_t) 20 << 20;
     const int64_t graphs  = vx_graphs_on ? (int64_t) il_of_moe.size()*1572864 : 0;
     const int64_t scratch = vx_scratch_premapped > 0 ? 0 : vx_scratch_lazy;
+    // With --spec-type draft-mtp, ctx_dft (LLAMA_CONTEXT_TYPE_MTP) is built after ctx_tgt's vx_setup on the same GPU,
+    // taking its NextN KV/recurrent cache plus its own compute buffer / VMM scratch / CUDA graph (~256 MiB at -ub 2048).
+    const int64_t mtp_dft = p1.mtp_on_pool_dev
+            ? p1.mtp_ctx_bytes + std::max<int64_t>((int64_t) 96 << 20,
+                    std::max<int64_t>(1, n_ubatch) * std::max<int64_t>(2048, n_embd) * 64)
+            : 0;
     if (why) {
-        *why = format("derived: 20 MiB modules + %.1f MiB CUDA-graph instances (1.5 MiB x %zu streamed layers%s)%s", graphs/1048576.0, il_of_moe.size(),
+        *why = format("derived: 20 MiB modules + %.1f MiB CUDA-graph instances (1.5 MiB x %zu streamed layers%s)%s%s", graphs/1048576.0, il_of_moe.size(),
                 vx_graphs_on ? "" : "; the backend uses no CUDA graphs",
                 vx_scratch_premapped > 0 ? format("; the %.1f MiB scratch pool is mapped at start and in the check", vx_scratch_premapped/1048576.0).c_str()
-                : scratch > 0 ? format(" + %.1f MiB scratch pool (not mapped at start)", scratch/1048576.0).c_str() : "");
+                : scratch > 0 ? format(" + %.1f MiB scratch pool (not mapped at start)", scratch/1048576.0).c_str() : "",
+                mtp_dft > 0 ? format(" + %.1f MiB MTP draft context", mtp_dft/1048576.0).c_str() : "");
     }
-    return modules + graphs + scratch;
+    return modules + graphs + scratch + mtp_dft;
 }
 
 // Once per request, when its prompt is done (set_decode): the free VRAM now against the load-time check. Printed the first

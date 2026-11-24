@@ -256,6 +256,9 @@ llama_model_bailingmoe3::graph::graph(const llama_model & model, const llm_graph
     ggml_tensor * inpL = params.lm_hid && params.lm_il0 > 0
         ? ggml_view_2d(ctx0, params.lm_hid, n_embd, n_tokens, params.lm_hid->nb[1], params.lm_row0*params.lm_hid->nb[1])
         : build_inp_embd(model.tok_embd);
+    if (inpL->type != GGML_TYPE_F32) {
+        inpL = ggml_cast(ctx0, inpL, GGML_TYPE_F32);
+    }
     cb(inpL, "model.input_embed", -1);
 
     auto * inp = build_inp_mem_hybrid_k();

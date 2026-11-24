@@ -3983,8 +3983,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 if (lm_moe && !lm_h_cur[(size_t) c]) {
                     lm_h_cur[(size_t) c] = ggml_cpy(ctx0, add, dst);
                 } else {
-                    ggml_tensor * prev = lm_h_cur[(size_t) c] ? lm_h_cur[(size_t) c] : dst;
-                    lm_h_cur[(size_t) c] = ggml_cpy(ctx0, ggml_add(ctx0, prev, add), dst);
+                    ggml_tensor * prev     = lm_h_cur[(size_t) c] ? lm_h_cur[(size_t) c] : dst;
+                    ggml_tensor * prev_f32 = prev->type == GGML_TYPE_F32 ? prev : ggml_cast(ctx0, prev, GGML_TYPE_F32);
+                    lm_h_cur[(size_t) c]   = ggml_cpy(ctx0, ggml_add(ctx0, prev_f32, add), dst);
                 }
                 ggml_build_forward_expand(gf, lm_h_cur[(size_t) c]);
             };
@@ -3993,6 +3994,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 *ids_c = ggml_view_2d(ctx0, ids_all, ids_all->ne[0], nc, ids_all->nb[1], c0*ids_all->nb[1]);
                 *x_c   = ggml_view_2d(ctx0, lm_x, n_embd, nc, lm_x->nb[1], c0*lm_x->nb[1]);
                 *w_c   = ggml_view_3d(ctx0, weights, 1, weights->ne[1], nc, weights->nb[1], weights->nb[2], c0*weights->nb[2]);
+                // Expand weights chunk view before build_expert_wave/build_vram_chain so DFS places
+                // (experts * scale_s) and (first * w_c) consecutively for fused MoE weighted reduction.
+                ggml_build_forward_expand(gf, *w_c);
             };
 
             // With GPU waves, each wave's ids (and the VRAM ids) go to the GPU ONCE through a cont on the
@@ -4486,11 +4490,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+        const bool qsa_compact = kq_mask != nullptr && kq_mask->type == GGML_TYPE_I32 && sinks == nullptr;
+        cur = ggml_flash_attn_ext(ctx0, q, k, v, qsa_compact ? nullptr : kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
+        if (qsa_compact) {
+            cur->src[4] = kq_mask;
+        }
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_prec_set_acc(cur, GGML_PREC_F32);

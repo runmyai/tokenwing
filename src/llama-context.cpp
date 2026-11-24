@@ -3380,26 +3380,46 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // the router's picks and weights [k, T], and with hyper-connection streams also the routed-expert sum lm_moe [n_embd, T] and
         // the FFN combine's inject weights lm_inj [hc, T]; with a GPU expert pool that has a tail they all live in the tail's
         // extension (vacated for this call's GPU-wave graphs first), else in a buffer of their own
+        bool lm_output_lent = false;
+        auto restore_lent_output = [&]() {
+            if (lm_output_lent && !lm_output_backup.empty() && model.output) {
+                synchronize();
+                ggml_backend_tensor_set(model.output, lm_output_backup.data(), 0, lm_output_backup.size());
+                lm_output_lent = false;
+            }
+        };
+        struct lent_output_raii_t {
+            decltype(restore_lent_output) & fn;
+            ~lent_output_raii_t() { fn(); }
+        } lent_output_guard{ restore_lent_output };
         if (lm_last0 > 0) {
             auto * ms = ctx_moe_stream();
+            if (ms) { ms->clear_lm_routed_masks(); }
             const int64_t k  = hparams.n_expert_used();
             const int64_t hc = std::max<int64_t>(1, hparams.dsv4_hc_mult);
-            ggml_init_params ip = { 6*ggml_tensor_overhead(), nullptr, true };
-            lm_hctx.reset(ggml_init(ip));
-            lm_hid = ggml_new_tensor_2d(lm_hctx.get(), GGML_TYPE_F32, hparams.n_embd*hc, n_tokens_all);
-            ggml_set_name(lm_hid, "lm_hidden");
-            if (lm_split) {
-                lm_x   = ggml_new_tensor_2d(lm_hctx.get(), GGML_TYPE_F32, hparams.n_embd, n_tokens_all);
-                if (hc > 1) {
-                    lm_moe = ggml_new_tensor_2d(lm_hctx.get(), GGML_TYPE_F32, hparams.n_embd, n_tokens_all);
-                    lm_inj = ggml_new_tensor_2d(lm_hctx.get(), GGML_TYPE_F32, hc, n_tokens_all);
-                    ggml_set_name(lm_moe, "lm_moe_out");
-                    ggml_set_name(lm_inj, "lm_hc_inject");
+            const ggml_type hid_type = (model.prefill_lm_bf16_explicit() &&
+                    ggml_backend_dev_type(model.dev_layer(0)) != GGML_BACKEND_DEVICE_TYPE_CPU)
+                ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+            const auto build_lm_tensors = [&](ggml_type ht) {
+                ggml_init_params ip = { 6*ggml_tensor_overhead(), nullptr, true };
+                lm_hctx.reset(ggml_init(ip));
+                lm_hid = ggml_new_tensor_2d(lm_hctx.get(), ht, hparams.n_embd*hc, n_tokens_all);
+                ggml_set_name(lm_hid, "lm_hidden");
+                lm_x = lm_moe = lm_inj = lm_ids = lm_w = nullptr;
+                if (lm_split) {
+                    lm_x   = ggml_new_tensor_2d(lm_hctx.get(), GGML_TYPE_F32, hparams.n_embd, n_tokens_all);
+                    if (hc > 1) {
+                        lm_moe = ggml_new_tensor_2d(lm_hctx.get(), GGML_TYPE_F32, hparams.n_embd, n_tokens_all);
+                        lm_inj = ggml_new_tensor_2d(lm_hctx.get(), GGML_TYPE_F32, hc, n_tokens_all);
+                        ggml_set_name(lm_moe, "lm_moe_out");
+                        ggml_set_name(lm_inj, "lm_hc_inject");
+                    }
+                    lm_ids = ggml_new_tensor_2d(lm_hctx.get(), GGML_TYPE_I32, k, n_tokens_all);
+                    lm_w   = ggml_new_tensor_2d(lm_hctx.get(), GGML_TYPE_F32, k, n_tokens_all);
+                    ggml_set_name(lm_x, "lm_expert_in"); ggml_set_name(lm_ids, "lm_ids"); ggml_set_name(lm_w, "lm_weights");
                 }
-                lm_ids = ggml_new_tensor_2d(lm_hctx.get(), GGML_TYPE_I32, k, n_tokens_all);
-                lm_w   = ggml_new_tensor_2d(lm_hctx.get(), GGML_TYPE_F32, k, n_tokens_all);
-                ggml_set_name(lm_x, "lm_expert_in"); ggml_set_name(lm_ids, "lm_ids"); ggml_set_name(lm_w, "lm_weights");
-            }
+            };
+            build_lm_tensors(hid_type);
             const auto lm_all_tensors = [&]() {
                 return std::array<ggml_tensor *, 6>{ lm_hid, lm_x, lm_moe, lm_inj, lm_ids, lm_w };
             };
@@ -3447,9 +3467,69 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 }
             }
             ggml_backend_dev_t dev = model.dev_layer(0);
+            const auto try_lend_output = [&]() -> bool {
+                if (!lm_split || !model.prefill_lend_output_on() ||
+                        !model.output || model.output == model.tok_embd ||
+                        !model.output->buffer || ggml_backend_buffer_is_host(model.output->buffer) ||
+                        !ggml_is_contiguous(model.output)) {
+                    return false;
+                }
+                const size_t al = 256;
+                size_t aux_bytes = 0;
+                for (ggml_tensor * t : { lm_x, lm_moe, lm_inj, lm_ids, lm_w }) {
+                    if (t) { aux_bytes += GGML_PAD(ggml_nbytes(t), al); }
+                }
+                const size_t out_bytes = ggml_nbytes(model.output);
+                const size_t hid_bytes = GGML_PAD(ggml_nbytes(lm_hid), al);
+                if (aux_bytes == 0 || aux_bytes > out_bytes) {
+                    return false;
+                }
+                ggml_backend_buffer_ptr hbuf_only(ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(dev), hid_bytes));
+                if (!hbuf_only) {
+                    return false;
+                }
+                char * hbase = (char *) ggml_backend_buffer_get_base(hbuf_only.get());
+                GGML_ASSERT(ggml_backend_tensor_alloc(hbuf_only.get(), lm_hid, hbase) == GGML_STATUS_SUCCESS);
+                synchronize();
+                if (lm_output_backup.size() != out_bytes) {
+                    lm_output_backup.resize(out_bytes);
+                    ggml_backend_tensor_get(model.output, lm_output_backup.data(), 0, out_bytes);
+                }
+                lm_output_lent = true;
+                lm_hbuf = std::move(hbuf_only);
+                size_t off = 0;
+                for (ggml_tensor * t : { lm_x, lm_moe, lm_inj, lm_ids, lm_w }) {
+                    if (t) {
+                        t->buffer = model.output->buffer;
+                        t->data   = (char *) model.output->data + off;
+                        off += GGML_PAD(ggml_nbytes(t), al);
+                    }
+                }
+                return true;
+            };
+            if (!placed && model.prefill_lend_output_explicit()) {
+                placed = try_lend_output();
+            }
             if (!placed) {
                 lm_hbuf.reset(ggml_backend_alloc_ctx_tensors_from_buft(lm_hctx.get(), ggml_backend_dev_buffer_type(dev)));
-                if (!lm_hbuf) {
+                if (lm_hbuf) {
+                    placed = true;
+                }
+            }
+            // Automatic OOM rescue under prefill-fast: shrink lm_hid to BF16 (if not already) and/or lend model.output
+            if (!placed && model.prefill_lm_bf16_on() && lm_hid->type == GGML_TYPE_F32 &&
+                    ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                build_lm_tensors(GGML_TYPE_BF16);
+                lm_hbuf.reset(ggml_backend_alloc_ctx_tensors_from_buft(lm_hctx.get(), ggml_backend_dev_buffer_type(dev)));
+                if (lm_hbuf) {
+                    placed = true;
+                }
+            }
+            if (!placed) {
+                placed = try_lend_output();
+            }
+            if (!placed) {
+                if (true) {
                     LLAMA_LOG_ERROR("%s: layer-major: could not allocate the call's tensors (%.1f MiB of hidden state on %s)\n", __func__,
                             ggml_nbytes(lm_hid)/1048576.0, ggml_backend_dev_name(dev));
                     lm_hid = lm_x = lm_moe = lm_inj = lm_ids = lm_w = nullptr; lm_hctx.reset();
@@ -3591,7 +3671,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (test_dump && lm_hid) {
                 synchronize();
                 std::vector<float> h(ggml_nelements(lm_hid));
-                ggml_backend_tensor_get(lm_hid, h.data(), 0, ggml_nbytes(lm_hid));
+                if (lm_hid->type == GGML_TYPE_BF16) {
+                    std::vector<ggml_bf16_t> hb(ggml_nelements(lm_hid));
+                    ggml_backend_tensor_get(lm_hid, hb.data(), 0, ggml_nbytes(lm_hid));
+                    for (size_t i = 0; i < hb.size(); ++i) { h[i] = ggml_bf16_to_fp32(hb[i]); }
+                } else {
+                    ggml_backend_tensor_get(lm_hid, h.data(), 0, ggml_nbytes(lm_hid));
+                }
                 const int64_t ne0 = lm_hid->ne[0], T = lm_hid->ne[1];
                 for (int64_t r0 = 0; r0 < T; r0 += cparams.n_ubatch) {
                     const int64_t r1 = std::min<int64_t>(T, r0 + cparams.n_ubatch);
@@ -3606,6 +3692,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 }
             }
         }
+        restore_lent_output();
         if (lm_last0 > 0 && !mctx->rewind()) {
             LLAMA_LOG_ERROR("%s: layer-major: the memory cannot go back to the first ubatch\n", __func__);
             const bool cut = lm_remove_call();

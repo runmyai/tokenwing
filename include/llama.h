@@ -603,6 +603,15 @@ extern "C" {
                                                 //      under ROCm/HIP, 0 = off
         int32_t      moe_stream_hip_sync;       // ROCm/HIP CPU-GPU handoff spin-poll before kernel wait (1 = auto 400 us, > 1 = spin window
                                                 //      in us, 0 = off)
+        int32_t      moe_stream_prefill_fast;   // 1 = turn on all compatible prefill fast paths below, 0 = off
+        int32_t      moe_stream_mmq_moe_opt;    // 1 = scale CUDA MMQ ncols_opt by per-expert token count + skip pre-zeroed padding clears, 0 = off
+        int32_t      moe_stream_gpu_moe_fused;  // 1 = fused dual-bucket gate+up+SwiGLU->INT8->down + weighted-sum CUDA prefill engine, 0 = off
+        int64_t      moe_stream_pinned_ring;    // bytes of pinned host H2D staging ring for streamed prompt waves (1 = 256 MiB, 0 = off)
+        int32_t      moe_stream_lm_bf16;        // 1 = store layer-major prompt hidden state (lm_hid / lm_moe) in BF16, 0 = F32
+        int32_t      moe_stream_lend_output;    // 1 = lend untied VRAM output.weight during non-final layer-major groups, 0 = off
+        int32_t      moe_stream_qsa_fused;      // 1 = zero-mask index-gathered GQA-transposed sparse attention on qwen4exp, 0 = off
+        int32_t      moe_stream_hc_fused;       // 1 = register-fused hyper-connection w_up + gated pre-mix on qwen4exp, 0 = off
+        int32_t      moe_stream_ple_fast;       // 1 = deduplicated LBA-sorted raw-quant PLE GPU gather + fused dilated conv, 0 = off
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights

@@ -15096,6 +15096,9 @@ void llama_moe_stream::vx_free_pool() {
     vx_ready = false;
     tail_on = false; tail_preset = false; tail_n = 0; tail_copy_n = 0; tail_first = 0; tail_proj.clear();
     tailw_ready = false; ca_want = false; ca_on = false; ca_p2 = false; ca_one_wave = false; ca_sets = 1;
+    if (loop_end > loop_beg && gpu_waves > 0) {
+        gpu_waves = 0;
+    }
     graph_gen++;
 }
 
@@ -16641,6 +16644,9 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
         }
     }
 
+    if (loop_end > loop_beg && gpu_waves > 0 && (!tail_on || !tailw_ready || tailw_t[0] == nullptr)) {
+        gpu_waves = 0;
+    }
     vx_fill_s = (ggml_time_us() - t0)/1e6;
     vx_ready  = true;
     graph_gen++;   // the graphs carry the device pass from now on
@@ -17569,7 +17575,9 @@ void llama_moe_stream::vf_call_start_t(bool decode, int32_t n_tok) {
     // After a vacate, the first call that is not a GPU-wave call (and needs no room for a prompt) fills the free places
     // of the tail once - from READY RAM copies, behind a GPU fence (the last graph may still read the places as its copy target)
     // (only a one-token word: the marks the fill makes leave 2k free slots per layer, enough for that call and no more - review finding 1)
-    if ((tail_on || !lm_lend_max_g.empty() || !lend_lent_g.empty()) && tail_refill_due && !room_short && vf_call_one && vf_fill_fn != nullptr && !tail_batch(n_tok)) {
+    if ((tail_on || !lm_lend_max_g.empty() || !lend_lent_g.empty()) && tail_refill_due && !room_short &&
+            (vf_call_one || (decode && n_tok > 1 && n_tok <= 8 && loop_end > loop_beg)) &&
+            vf_fill_fn != nullptr && !tail_batch(n_tok)) {
         tail_refill_due = false;
         tail_n_fill_calls += 1;
         (this->*vf_fill_fn)(nullptr);

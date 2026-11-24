@@ -7,15 +7,18 @@
 #include <vector>
 
 #ifdef WV_OBFUSCATE_SYMBOLS
-#define wv_ink_plugin_fwht128_q8_kernel        s_twp_00
-#define wv_ink_plugin_ext3_gemv_kernel         s_twp_01
-#define wv_ink_plugin_ext3_tc_m64_n64_kernel   s_twp_02
-#define wv_ink_plugin_ext012_mm_kernel         s_twp_03
-#define wv_ink_plugin_mmid_zero_and_hist_kernel s_twp_04
-#define wv_ink_plugin_mmid_prefix_kernel       s_twp_05
-#define wv_ink_plugin_mmid_scatter_kernel      s_twp_06
-#define wv_ink_plugin_mmid_smallm_kernel       s_twp_07
-#define wv_ink_plugin_mmid_grouped8_kernel     s_twp_08
+#define wv_ink_plugin_fwht128_q8_kernel         s_twp_00
+#define wv_ink_plugin_ext3_gemv_kernel          s_twp_01
+#define wv_ink_plugin_ext3_multi_gemv_kernel    s_twp_02
+#define wv_ink_plugin_ext3_tc_m64_n64_kernel    s_twp_03
+#define wv_ink_plugin_ext012_mm_kernel          s_twp_04
+#define wv_ink_plugin_ext012_tc_m64_n64_kernel  s_twp_05
+#define wv_ink_plugin_mmid_zero_and_hist_kernel s_twp_06
+#define wv_ink_plugin_mmid_plan_kernel          s_twp_07
+#define wv_ink_plugin_mmid_scatter_kernel       s_twp_08
+#define wv_ink_plugin_mmid_smallm_kernel        s_twp_09
+#define wv_ink_plugin_mmid_grouped8_kernel      s_twp_10
+#define wv_ink_plugin_mmid_tc_m64_n64_kernel    s_twp_11
 #endif
 
 namespace twp_detail {
@@ -32,11 +35,16 @@ struct WvInkPluginDevState {
     float*    d_ysc        = nullptr;
     size_t    y_cap_elems  = 0;
 
-    int32_t*  d_pair_e     = nullptr;
-    int32_t*  d_pair_j     = nullptr;
-    int32_t*  d_pair_t     = nullptr;
-    int32_t*  d_exp_cnt    = nullptr;
-    int32_t*  d_exp_off    = nullptr;
+    int32_t*  d_pair_e     = nullptr; // [pair_cap] (exp_cur scratch)
+    int32_t*  d_pair_j     = nullptr; // [pair_cap]
+    int32_t*  d_pair_t     = nullptr; // [pair_cap]
+    int32_t*  d_exp_cnt    = nullptr; // [exp_cap]
+    int32_t*  d_exp_off    = nullptr; // [exp_cap + 1]
+    int32_t*  d_active_e   = nullptr; // [exp_cap]
+    int32_t*  d_meta_cnt   = nullptr; // [2]: [0] = num_active, [1] = num_tiles64
+    int32_t*  d_tile_exp   = nullptr; // [pair_cap]
+    int32_t*  d_tile_beg   = nullptr; // [pair_cap]
+    int32_t*  d_tile_len   = nullptr; // [pair_cap]
     size_t    pair_cap     = 0;
     size_t    exp_cap      = 0;
 };
@@ -109,22 +117,34 @@ static int32_t ensure_act_workspace_locked(int dev_id, size_t total_elems) {
 
 static int32_t ensure_pair_workspace_locked(int dev_id, size_t n_pairs, size_t n_experts) {
     WvInkPluginDevState & st = g_devs[dev_id];
-    if (n_pairs <= st.pair_cap && n_experts <= st.exp_cap && st.d_pair_e && st.d_exp_cnt && st.d_exp_off) {
+    if (n_pairs <= st.pair_cap && n_experts <= st.exp_cap &&
+        st.d_pair_e && st.d_exp_cnt && st.d_exp_off &&
+        st.d_active_e && st.d_meta_cnt && st.d_tile_exp && st.d_tile_beg && st.d_tile_len) {
         return 0;
     }
     cudaSetDevice(dev_id);
-    if (st.d_pair_e)  { cudaFree(st.d_pair_e);  st.d_pair_e  = nullptr; }
-    if (st.d_pair_j)  { cudaFree(st.d_pair_j);  st.d_pair_j  = nullptr; }
-    if (st.d_pair_t)  { cudaFree(st.d_pair_t);  st.d_pair_t  = nullptr; }
-    if (st.d_exp_cnt) { cudaFree(st.d_exp_cnt); st.d_exp_cnt = nullptr; }
-    if (st.d_exp_off) { cudaFree(st.d_exp_off); st.d_exp_off = nullptr; }
+    if (st.d_pair_e)   { cudaFree(st.d_pair_e);   st.d_pair_e   = nullptr; }
+    if (st.d_pair_j)   { cudaFree(st.d_pair_j);   st.d_pair_j   = nullptr; }
+    if (st.d_pair_t)   { cudaFree(st.d_pair_t);   st.d_pair_t   = nullptr; }
+    if (st.d_exp_cnt)  { cudaFree(st.d_exp_cnt);  st.d_exp_cnt  = nullptr; }
+    if (st.d_exp_off)  { cudaFree(st.d_exp_off);  st.d_exp_off  = nullptr; }
+    if (st.d_active_e) { cudaFree(st.d_active_e); st.d_active_e = nullptr; }
+    if (st.d_meta_cnt) { cudaFree(st.d_meta_cnt); st.d_meta_cnt = nullptr; }
+    if (st.d_tile_exp) { cudaFree(st.d_tile_exp); st.d_tile_exp = nullptr; }
+    if (st.d_tile_beg) { cudaFree(st.d_tile_beg); st.d_tile_beg = nullptr; }
+    if (st.d_tile_len) { cudaFree(st.d_tile_len); st.d_tile_len = nullptr; }
     const size_t ecap = std::max<size_t>(std::max<size_t>(n_experts, st.exp_cap), 4096ull);
     const size_t cap  = std::max<size_t>(std::max<size_t>(n_pairs, st.pair_cap), std::max<size_t>(ecap, 4096ull * 8ull));
-    if (cudaMalloc(&st.d_pair_e,  cap * sizeof(int32_t)) != cudaSuccess) return -1;
-    if (cudaMalloc(&st.d_pair_j,  cap * sizeof(int32_t)) != cudaSuccess) return -1;
-    if (cudaMalloc(&st.d_pair_t,  cap * sizeof(int32_t)) != cudaSuccess) return -1;
-    if (cudaMalloc(&st.d_exp_cnt, ecap * sizeof(int32_t)) != cudaSuccess) return -1;
-    if (cudaMalloc(&st.d_exp_off, (ecap + 1) * sizeof(int32_t)) != cudaSuccess) return -1;
+    if (cudaMalloc(&st.d_pair_e,   cap * sizeof(int32_t)) != cudaSuccess) return -1;
+    if (cudaMalloc(&st.d_pair_j,   cap * sizeof(int32_t)) != cudaSuccess) return -1;
+    if (cudaMalloc(&st.d_pair_t,   cap * sizeof(int32_t)) != cudaSuccess) return -1;
+    if (cudaMalloc(&st.d_exp_cnt,  ecap * sizeof(int32_t)) != cudaSuccess) return -1;
+    if (cudaMalloc(&st.d_exp_off,  (ecap + 1) * sizeof(int32_t)) != cudaSuccess) return -1;
+    if (cudaMalloc(&st.d_active_e, ecap * sizeof(int32_t)) != cudaSuccess) return -1;
+    if (cudaMalloc(&st.d_meta_cnt, 2 * sizeof(int32_t)) != cudaSuccess) return -1;
+    if (cudaMalloc(&st.d_tile_exp, cap * sizeof(int32_t)) != cudaSuccess) return -1;
+    if (cudaMalloc(&st.d_tile_beg, cap * sizeof(int32_t)) != cudaSuccess) return -1;
+    if (cudaMalloc(&st.d_tile_len, cap * sizeof(int32_t)) != cudaSuccess) return -1;
     st.pair_cap = cap;
     st.exp_cap  = ecap;
     return 0;
@@ -138,6 +158,15 @@ __device__ __forceinline__ uint16_t dev_ld_u16(const void * p) {
 __device__ __forceinline__ uint32_t dev_ld_u32(const void * p) {
     const uint8_t * b = static_cast<const uint8_t *>(p);
     return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+
+// Fast 2-byte-aligned 32-bit load for `wv_ink_block_swz8` (`34 B` stride -> `qs + 4*j` is always 2B-aligned when row is 2B-aligned)
+__device__ __forceinline__ uint32_t dev_ld_u32_swz8(const void * p) {
+    if (((uintptr_t)p & 1u) == 0u) {
+        const uint16_t * h = static_cast<const uint16_t *>(p);
+        return (uint32_t)__ldg(h) | ((uint32_t)__ldg(h + 1) << 16);
+    }
+    return dev_ld_u32(p);
 }
 
 __device__ __forceinline__ uint64_t dev_ld_u64(const void * p) {
@@ -263,14 +292,13 @@ __device__ __forceinline__ uint8_t hot_vq12_byte(
     return aux_tail_ptr ? __ldg(aux_tail_ptr + (idx - in_slot_cap)) : 0u;
 }
 
-__device__ __forceinline__ int32_t unpack_hot_vq12_from_ext0_lane(
+__device__ __forceinline__ uint32_t unpack_hot_vq12_idx12_and_ws(
     const uint8_t * ext0_row,
     int b128,
     int lane,
     int K,
     const uint8_t * d_aux_blob,
     size_t aux_bytes,
-    const uint32_t * s_cb4096,
     float & out_ws) {
     const int row_ext0    = (K >> 6) * 18;
     const int in_slot_cap = row_ext0 - 6;
@@ -292,17 +320,41 @@ __device__ __forceinline__ int32_t unpack_hot_vq12_from_ext0_lane(
     const uint32_t b0 = hot_vq12_byte(ext0_row, in_slot_cap, tail_p, off + 0);
     const uint32_t b1 = hot_vq12_byte(ext0_row, in_slot_cap, tail_p, off + 1);
     const uint32_t b2 = hot_vq12_byte(ext0_row, in_slot_cap, tail_p, off + 2);
-    const uint32_t idx12 = ((lane & 1) == 0)
+    return ((lane & 1) == 0)
         ? (b0 | ((b1 & 0x0Fu) << 8))
         : ((b1 >> 4) | (b2 << 4));
+}
+
+__device__ __forceinline__ int32_t unpack_hot_vq12_from_ext0_lane(
+    const uint8_t * ext0_row,
+    int b128,
+    int lane,
+    int K,
+    const uint8_t * d_aux_blob,
+    size_t aux_bytes,
+    const uint32_t * s_cb4096,
+    float & out_ws) {
+    const uint32_t idx12 = unpack_hot_vq12_idx12_and_ws(ext0_row, b128, lane, K, d_aux_blob, aux_bytes, out_ws);
     return (int32_t)s_cb4096[idx12];
 }
 
-__device__ __forceinline__ int32_t unpack_vq12_direct_lane(
+__device__ __forceinline__ int32_t unpack_hot_vq12_from_ext0_ldg(
+    const uint8_t * ext0_row,
+    int b128,
+    int lane,
+    int K,
+    const uint8_t * d_aux_blob,
+    size_t aux_bytes,
+    const uint32_t * d_cb4096,
+    float & out_ws) {
+    const uint32_t idx12 = unpack_hot_vq12_idx12_and_ws(ext0_row, b128, lane, K, d_aux_blob, aux_bytes, out_ws);
+    return (int32_t)__ldg(d_cb4096 + idx12);
+}
+
+__device__ __forceinline__ uint32_t unpack_vq12_direct_idx12_and_ws(
     const uint8_t * row_bytes,
     int b128,
     int lane,
-    const uint32_t * s_cb4096,
     float & out_ws) {
     const uint8_t * bp   = row_bytes + (size_t)b128 * 53;
     const uint16_t d_sup = dev_ld_u16(bp);
@@ -315,10 +367,29 @@ __device__ __forceinline__ int32_t unpack_vq12_direct_lane(
     const uint32_t b0 = bp[5 + 3 * p + 0];
     const uint32_t b1 = bp[5 + 3 * p + 1];
     const uint32_t b2 = bp[5 + 3 * p + 2];
-    const uint32_t idx12 = ((lane & 1) == 0)
+    return ((lane & 1) == 0)
         ? (b0 | ((b1 & 0x0Fu) << 8))
         : ((b1 >> 4) | (b2 << 4));
+}
+
+__device__ __forceinline__ int32_t unpack_vq12_direct_lane(
+    const uint8_t * row_bytes,
+    int b128,
+    int lane,
+    const uint32_t * s_cb4096,
+    float & out_ws) {
+    const uint32_t idx12 = unpack_vq12_direct_idx12_and_ws(row_bytes, b128, lane, out_ws);
     return (int32_t)s_cb4096[idx12];
+}
+
+__device__ __forceinline__ int32_t unpack_vq12_direct_ldg(
+    const uint8_t * row_bytes,
+    int b128,
+    int lane,
+    const uint32_t * d_cb4096,
+    float & out_ws) {
+    const uint32_t idx12 = unpack_vq12_direct_idx12_and_ws(row_bytes, b128, lane, out_ws);
+    return (int32_t)__ldg(d_cb4096 + idx12);
 }
 
 __device__ __forceinline__ int32_t unpack_vq8_sb6_lane(
@@ -405,7 +476,7 @@ __device__ __forceinline__ int32_t unpack_4b38_lane(
 }
 
 // -----------------------------------------------------------------------------
-// 3. `EXT3` (`wv6_swz8_g32`) Fast GEMV (`M < 16`) & INT8 TC GEMM (`M >= 16`)
+// 3. `EXT3` (`wv6_swz8_g32`) Fast GEMV (`M == 1`), Multi-GEMV (`2 <= M < 16`), & INT8 TC GEMM (`M >= 16`)
 // -----------------------------------------------------------------------------
 
 // 4 warps = 4 rows/CTA, 0 SMEM, exact group-32 int32 dp4a accumulation
@@ -439,15 +510,15 @@ void wv_ink_plugin_ext3_gemv_kernel(
     const int32_t * y_i32 = reinterpret_cast<const int32_t *>(Y_q8 + (size_t)vec_id * K);
     const float *   y_sc  = Y_sc + (size_t)vec_id * (K >> 5);
 
-    const int sub  = lane >> 3; // 0..3
-    const int j4   = lane & 7;  // 0..7
+    const int sub   = lane >> 3; // 0..3
+    const int j4    = lane & 7;  // 0..7
     const int nb128 = K >> 7;
     float total_sum = 0.0f;
 
     for (int b = 0; b < nb128; ++b) {
         const int gid = 4 * b + sub;
         const auto & bk = w_row[gid];
-        const int32_t w4 = dev_ld_u32(bk.qs + 4 * j4);
+        const int32_t w4 = (int32_t)dev_ld_u32_swz8(bk.qs + 4 * j4);
         const int32_t y4 = y_i32[b * 32 + lane];
         int32_t dp = __dp4a(w4, y4, 0);
         dp += __shfl_xor_sync(0xffffffffu, dp, 4);
@@ -468,8 +539,75 @@ void wv_ink_plugin_ext3_gemv_kernel(
     }
 }
 
+// Multi-token (`2 <= total_vecs < 16`, e.g. MTP-8 `M=8` verification!) single-read EXT3 GEMV (`0` SMEM, `0.0-ULP` identical to gemv)
+template<int MAX_M>
+__global__ __launch_bounds__(128, 4)
+void wv_ink_plugin_ext3_multi_gemv_kernel(
+    const uint8_t * __restrict__ vx,
+    const int8_t * __restrict__ Y_q8,
+    const float * __restrict__ Y_sc,
+    uint8_t * __restrict__ dst_bytes,
+    int K,
+    int N,
+    int total_vecs,
+    int ne11, int ne12,
+    size_t nb01,
+    size_t nb1, size_t nb2, size_t nb3) {
+    const int lane = threadIdx.x & 31;
+    const int wid  = threadIdx.x >> 5; // 0..3
+    const int row  = blockIdx.x * 4 + wid;
+    if (row >= N) return;
+
+    const auto * w_row = reinterpret_cast<const wv_ink_block_swz8 *>(vx + (size_t)row * nb01);
+    const int sub   = lane >> 3; // 0..3
+    const int j4    = lane & 7;  // 0..7
+    const int nb128 = K >> 7;
+    const int n_g32 = K >> 5;
+
+    float acc[MAX_M];
+    #pragma unroll
+    for (int m = 0; m < MAX_M; ++m) acc[m] = 0.0f;
+
+    for (int b = 0; b < nb128; ++b) {
+        const int gid   = 4 * b + sub;
+        const auto & bk = w_row[gid];
+        const int32_t w4 = (int32_t)dev_ld_u32_swz8(bk.qs + 4 * j4);
+        const float   ws = wv_ink_fp16_to_f32(bk.d127) * WV_INK_INV_127;
+
+        #pragma unroll
+        for (int m = 0; m < MAX_M; ++m) {
+            if (m < total_vecs) {
+                const int32_t y4 = reinterpret_cast<const int32_t *>(Y_q8 + (size_t)m * K)[b * 32 + lane];
+                int32_t dp = __dp4a(w4, y4, 0);
+                dp += __shfl_xor_sync(0xffffffffu, dp, 4);
+                dp += __shfl_xor_sync(0xffffffffu, dp, 2);
+                dp += __shfl_xor_sync(0xffffffffu, dp, 1);
+                float part = (float)dp * (ws * Y_sc[(size_t)m * n_g32 + gid]);
+                part += __shfl_xor_sync(0xffffffffu, part, 16);
+                part += __shfl_xor_sync(0xffffffffu, part, 8);
+                acc[m] += part;
+            }
+        }
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int m = 0; m < MAX_M; ++m) {
+            if (m < total_vecs) {
+                const int i11 = m % ne11;
+                const int t12 = m / ne11;
+                const int i12 = t12 % ne12;
+                const int i13 = t12 / ne12;
+                float * out_p = reinterpret_cast<float *>(
+                    dst_bytes + (size_t)i11 * nb1 + (size_t)i12 * nb2 + (size_t)i13 * nb3);
+                out_p[row] = acc[m];
+            }
+        }
+    }
+}
+
 // CTA_M = 64, CTA_N = 64, K_TILE = 64 INT8 Tensor Core `mma.m16n8k32` GEMM (`9.5 KiB` static SMEM <= 48 KiB!)
-// 4 warps (128 threads): warp_m = wid >> 1 (0..1 -> 32 M rows each), warp_n = wid & 1 (0..1 -> 32 N cols each)
+// Dispatched whenever `total_vecs >= 16 && ne02 == 1 && ne03 == 1`
 __global__ __launch_bounds__(128, 4)
 void wv_ink_plugin_ext3_tc_m64_n64_kernel(
     const uint8_t * __restrict__ vx,
@@ -480,9 +618,8 @@ void wv_ink_plugin_ext3_tc_m64_n64_kernel(
     int N,
     int total_vecs,
     int ne11, int ne12,
-    int r2, int r3,
-    size_t nb01, size_t nb02, size_t nb03,
-    size_t nb1,  size_t nb2,  size_t nb3) {
+    size_t nb01,
+    size_t nb1, size_t nb2, size_t nb3) {
     __shared__ uint32_t s_X[64][17]; // 64 x 64 int8 padded by 1 word (4,352 B)
     __shared__ uint32_t s_W[64][17]; // 64 x 64 int8 padded by 1 word (4,352 B)
     __shared__ float    s_Xsc[64][2];
@@ -497,14 +634,6 @@ void wv_ink_plugin_ext3_tc_m64_n64_kernel(
     const int m_base = blockIdx.y * 64;
     const int n_base = blockIdx.x * 64;
 
-    // Fast path requires uniform batch slice across the 64-token tile (true for all 2D prefill & single-seq calls)
-    const int v_first = m_base;
-    const int v_last  = min(total_vecs - 1, m_base + 63);
-    const int b0_id   = v_first / ne11;
-    const int b1_id   = v_last / ne11;
-    const int i02     = (b0_id % ne12) / r2;
-    const int i03     = (b0_id / ne12) / r3;
-
     float acc[2][4][4];
     #pragma unroll
     for (int mt = 0; mt < 2; ++mt) {
@@ -515,8 +644,8 @@ void wv_ink_plugin_ext3_tc_m64_n64_kernel(
         }
     }
 
-    const int r_grp = lane >> 2; // 0..7
-    const int c_k   = lane & 3;  // 0..3
+    const int r_grp   = lane >> 2; // 0..7
+    const int c_k     = lane & 3;  // 0..3
     const int k_tiles = K / 64;
 
     for (int kt = 0; kt < k_tiles; ++kt) {
@@ -524,12 +653,12 @@ void wv_ink_plugin_ext3_tc_m64_n64_kernel(
         // Cooperative load of s_X [64, 64] + s_Xsc [64, 2] (128 threads: 2 threads per row, 32 bytes each)
         #pragma unroll
         for (int pass = 0; pass < 2; ++pass) {
-            const int idx  = pass * 128 + tid; // 0..255 -> 64 rows x 4 (16-byte chunks)
-            const int lm   = idx >> 2;         // 0..63
-            const int q16  = idx & 3;          // 0..3
-            const int gm   = m_base + lm;
+            const int idx = pass * 128 + tid; // 0..255 -> 64 rows x 4 (16-byte chunks)
+            const int lm  = idx >> 2;         // 0..63
+            const int q16 = idx & 3;          // 0..3
+            const int gm  = m_base + lm;
             if (gm < total_vecs) {
-                const uint4 xv = reinterpret_cast<const uint4 *>(Y_q8 + (size_t)gm * K + kt * 64)[q16];
+                const uint4 xv = reinterpret_cast<const uint4 *>(Y_q8 + (size_t)gm * K + (size_t)kt * 64)[q16];
                 s_X[lm][4 * q16 + 0] = xv.x;
                 s_X[lm][4 * q16 + 1] = xv.y;
                 s_X[lm][4 * q16 + 2] = xv.z;
@@ -551,20 +680,14 @@ void wv_ink_plugin_ext3_tc_m64_n64_kernel(
             const int ln  = tid >> 1; // 0..63
             const int sub = tid & 1;  // 0..1 (32 weights = 1 wv_ink_block_swz8)
             const int gn  = n_base + ln;
-            if (gn < N && b0_id == b1_id) {
-                const auto * wr = reinterpret_cast<const wv_ink_block_swz8 *>(
-                    vx + (size_t)gn * nb01 + (size_t)i02 * nb02 + (size_t)i03 * nb03);
+            if (gn < N) {
+                const auto * wr = reinterpret_cast<const wv_ink_block_swz8 *>(vx + (size_t)gn * nb01);
                 const auto & bk = wr[g0 + sub];
                 s_Wsc[ln][sub] = wv_ink_fp16_to_f32(bk.d127) * WV_INK_INV_127;
                 #pragma unroll
                 for (int w = 0; w < 8; ++w) {
-                    s_W[ln][8 * sub + w] = dev_ld_u32(bk.qs + 4 * w);
+                    s_W[ln][8 * sub + w] = dev_ld_u32_swz8(bk.qs + 4 * w);
                 }
-            } else if (gn < N) {
-                // Multi-batch boundary fallback handled per-element below if b0_id != b1_id; keep zero here
-                s_Wsc[ln][sub] = 0.f;
-                #pragma unroll
-                for (int w = 0; w < 8; ++w) s_W[ln][8 * sub + w] = 0u;
             } else {
                 s_Wsc[ln][sub] = 0.f;
                 #pragma unroll
@@ -573,85 +696,81 @@ void wv_ink_plugin_ext3_tc_m64_n64_kernel(
         }
         __syncthreads();
 
-        if (b0_id == b1_id) {
+        #pragma unroll
+        for (int sub = 0; sub < 2; ++sub) {
+            const int k_w0 = 8 * sub + c_k;
+            const int k_w1 = k_w0 + 4;
+            uint32_t a_frag[2][4];
+            float    x_sc[2][2];
             #pragma unroll
-            for (int sub = 0; sub < 2; ++sub) {
-                const int k_w0 = 8 * sub + c_k;
-                const int k_w1 = k_w0 + 4;
-                uint32_t a_frag[2][4];
-                float    x_sc[2][2];
+            for (int mt = 0; mt < 2; ++mt) {
+                const int m_r0 = warp_m * 32 + mt * 16 + r_grp;
+                const int m_r1 = m_r0 + 8;
+                a_frag[mt][0] = s_X[m_r0][k_w0];
+                a_frag[mt][1] = s_X[m_r1][k_w0];
+                a_frag[mt][2] = s_X[m_r0][k_w1];
+                a_frag[mt][3] = s_X[m_r1][k_w1];
+                x_sc[mt][0]   = s_Xsc[m_r0][sub];
+                x_sc[mt][1]   = s_Xsc[m_r1][sub];
+            }
+            #pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                const int n_col_lane = warp_n * 32 + nt * 8 + r_grp;
+                const uint32_t b0 = s_W[n_col_lane][k_w0];
+                const uint32_t b1 = s_W[n_col_lane][k_w1];
+                const int c_n0 = warp_n * 32 + nt * 8 + 2 * c_k;
+                const float ws0 = s_Wsc[c_n0 + 0][sub];
+                const float ws1 = s_Wsc[c_n0 + 1][sub];
                 #pragma unroll
                 for (int mt = 0; mt < 2; ++mt) {
-                    const int m_r0 = warp_m * 32 + mt * 16 + r_grp;
-                    const int m_r1 = m_r0 + 8;
-                    a_frag[mt][0] = s_X[m_r0][k_w0];
-                    a_frag[mt][1] = s_X[m_r1][k_w0];
-                    a_frag[mt][2] = s_X[m_r0][k_w1];
-                    a_frag[mt][3] = s_X[m_r1][k_w1];
-                    x_sc[mt][0]   = s_Xsc[m_r0][sub];
-                    x_sc[mt][1]   = s_Xsc[m_r1][sub];
-                }
-                #pragma unroll
-                for (int nt = 0; nt < 4; ++nt) {
-                    const int n_col_lane = warp_n * 32 + nt * 8 + r_grp;
-                    const uint32_t b0 = s_W[n_col_lane][k_w0];
-                    const uint32_t b1 = s_W[n_col_lane][k_w1];
-                    const int c_n0 = warp_n * 32 + nt * 8 + 2 * c_k;
-                    const float ws0 = s_Wsc[c_n0 + 0][sub];
-                    const float ws1 = s_Wsc[c_n0 + 1][sub];
-                    #pragma unroll
-                    for (int mt = 0; mt < 2; ++mt) {
-                        int d0, d1, d2, d3;
-                        dev_mma_m16n8k32_s8(
-                            d0, d1, d2, d3,
-                            a_frag[mt][0], a_frag[mt][1], a_frag[mt][2], a_frag[mt][3],
-                            b0, b1);
-                        acc[mt][nt][0] += (float)d0 * (x_sc[mt][0] * ws0);
-                        acc[mt][nt][1] += (float)d1 * (x_sc[mt][0] * ws1);
-                        acc[mt][nt][2] += (float)d2 * (x_sc[mt][1] * ws0);
-                        acc[mt][nt][3] += (float)d3 * (x_sc[mt][1] * ws1);
-                    }
+                    int d0, d1, d2, d3;
+                    dev_mma_m16n8k32_s8(
+                        d0, d1, d2, d3,
+                        a_frag[mt][0], a_frag[mt][1], a_frag[mt][2], a_frag[mt][3],
+                        b0, b1);
+                    acc[mt][nt][0] += (float)d0 * (x_sc[mt][0] * ws0);
+                    acc[mt][nt][1] += (float)d1 * (x_sc[mt][0] * ws1);
+                    acc[mt][nt][2] += (float)d2 * (x_sc[mt][1] * ws0);
+                    acc[mt][nt][3] += (float)d3 * (x_sc[mt][1] * ws1);
                 }
             }
         }
         __syncthreads();
     }
 
-    if (b0_id == b1_id) {
+    #pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+        const int gm0 = m_base + warp_m * 32 + mt * 16 + r_grp;
+        const int gm1 = gm0 + 8;
         #pragma unroll
-        for (int mt = 0; mt < 2; ++mt) {
-            const int gm0 = m_base + warp_m * 32 + mt * 16 + r_grp;
-            const int gm1 = gm0 + 8;
-            #pragma unroll
-            for (int nt = 0; nt < 4; ++nt) {
-                const int gn0 = n_base + warp_n * 32 + nt * 8 + 2 * c_k;
-                if (gm0 < total_vecs && gn0 < N) {
-                    const int i11 = gm0 % ne11;
-                    const int t12 = gm0 / ne11;
-                    const int i12 = t12 % ne12;
-                    const int i13 = t12 / ne12;
-                    float * out0 = reinterpret_cast<float *>(
-                        dst_bytes + (size_t)i11 * nb1 + (size_t)i12 * nb2 + (size_t)i13 * nb3);
-                    out0[gn0] = acc[mt][nt][0];
-                    if (gn0 + 1 < N) out0[gn0 + 1] = acc[mt][nt][1];
-                }
-                if (gm1 < total_vecs && gn0 < N) {
-                    const int i11 = gm1 % ne11;
-                    const int t12 = gm1 / ne11;
-                    const int i12 = t12 % ne12;
-                    const int i13 = t12 / ne12;
-                    float * out1 = reinterpret_cast<float *>(
-                        dst_bytes + (size_t)i11 * nb1 + (size_t)i12 * nb2 + (size_t)i13 * nb3);
-                    out1[gn0] = acc[mt][nt][2];
-                    if (gn0 + 1 < N) out1[gn0 + 1] = acc[mt][nt][3];
-                }
+        for (int nt = 0; nt < 4; ++nt) {
+            const int gn0 = n_base + warp_n * 32 + nt * 8 + 2 * c_k;
+            if (gm0 < total_vecs && gn0 < N) {
+                const int i11 = gm0 % ne11;
+                const int t12 = gm0 / ne11;
+                const int i12 = t12 % ne12;
+                const int i13 = t12 / ne12;
+                float * out0 = reinterpret_cast<float *>(
+                    dst_bytes + (size_t)i11 * nb1 + (size_t)i12 * nb2 + (size_t)i13 * nb3);
+                out0[gn0] = acc[mt][nt][0];
+                if (gn0 + 1 < N) out0[gn0 + 1] = acc[mt][nt][1];
+            }
+            if (gm1 < total_vecs && gn0 < N) {
+                const int i11 = gm1 % ne11;
+                const int t12 = gm1 / ne11;
+                const int i12 = t12 % ne12;
+                const int i13 = t12 / ne12;
+                float * out1 = reinterpret_cast<float *>(
+                    dst_bytes + (size_t)i11 * nb1 + (size_t)i12 * nb2 + (size_t)i13 * nb3);
+                out1[gn0] = acc[mt][nt][2];
+                if (gn0 + 1 < N) out1[gn0 + 1] = acc[mt][nt][3];
             }
         }
     }
 }
 
 // -----------------------------------------------------------------------------
-// 4. Generic `mul_mat_cuda` for `EXT0`, `EXT1`, `EXT2` (`20 KiB` SMEM)
+// 4. Generic `mul_mat_cuda` for `EXT0`, `EXT1`, `EXT2`: Small-M GEMV + INT8 TC GEMM (`M >= 16`)
 // -----------------------------------------------------------------------------
 template<int EXT_SLOT>
 __global__ __launch_bounds__(128)
@@ -734,11 +853,206 @@ void wv_ink_plugin_ext012_mm_kernel(
     }
 }
 
+// CTA_M = 64, CTA_N = 64, K_TILE = 128 INT8 Tensor Core `mma.m16n8k32` GEMM for `EXT0`, `EXT1`, `EXT2`
+// Static SMEM = `23,040 B` (`22.50 KiB <= 24 KiB`, `2+ CTAs/SM` on all `sm_80..sm_120a`, `0` spills!)
+template<int EXT_SLOT>
+__global__ __launch_bounds__(256, 2)
+void wv_ink_plugin_ext012_tc_m64_n64_kernel(
+    const uint8_t * __restrict__ vx,
+    const int8_t * __restrict__ Y_q8,
+    const float * __restrict__ Y_sc,
+    uint8_t * __restrict__ dst_bytes,
+    const uint32_t * __restrict__ d_cb4096,
+    const uint32_t * __restrict__ d_vq8_uv,
+    const uint4 * __restrict__ d_lut4,
+    const uint8_t * __restrict__ d_aux_blob,
+    size_t aux_bytes,
+    int K,
+    int N,
+    int total_vecs,
+    int ne11, int ne12,
+    size_t nb01,
+    size_t nb1, size_t nb2, size_t nb3) {
+    __shared__ uint32_t s_X[64][33];      // 8,448 B
+    __shared__ uint32_t s_W[64][33];      // 8,448 B
+    __shared__ float    s_Xsc[64][4];     // 1,024 B
+    __shared__ float    s_Wsc[64][4];     // 1,024 B
+    __shared__ uint32_t s_vq8_uv[2][512]; // 4,096 B
+
+    const int tid    = threadIdx.x; // 0..255
+    const int wid    = tid >> 5;    // 0..7
+    const int lane   = tid & 31;    // 0..31
+    const int warp_m = wid >> 2;    // 0..1 (32 M-rows/warp)
+    const int warp_n = wid & 3;     // 0..3 (16 N-cols/warp)
+
+    if constexpr (EXT_SLOT == 0) {
+        #pragma unroll
+        for (int i = tid; i < 1024; i += 256) {
+            reinterpret_cast<uint32_t *>(s_vq8_uv)[i] = d_vq8_uv[i];
+        }
+        __syncthreads();
+    }
+
+    const int m_base = blockIdx.y * 64;
+    const int n_base = blockIdx.x * 64;
+
+    uint32_t is_hot_mask = 0u;
+    if constexpr (EXT_SLOT == 0) {
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int gn = n_base + wid * 8 + r;
+            if (gn < N) {
+                const uint8_t * row_p = vx + (size_t)gn * nb01;
+                if ((dev_ld_u16(row_p + WV_INK_HOT_TAG_OFF) >> 12) == 0xFu) {
+                    is_hot_mask |= (1u << r);
+                }
+            }
+        }
+    }
+
+    float acc[2][2][4];
+    #pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+        #pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            acc[mt][nt][0] = 0.f; acc[mt][nt][1] = 0.f;
+            acc[mt][nt][2] = 0.f; acc[mt][nt][3] = 0.f;
+        }
+    }
+
+    const int r_grp = lane >> 2; // 0..7
+    const int c_k   = lane & 3;  // 0..3
+    const int nb128 = K >> 7;
+    const int n_g32 = K >> 5;
+
+    for (int b = 0; b < nb128; ++b) {
+        #pragma unroll
+        for (int pass = 0; pass < 2; ++pass) {
+            const int idx = pass * 256 + tid; // 0..511 -> 64 rows x 8 uint4s
+            const int lm  = idx >> 3;         // 0..63
+            const int q16 = idx & 7;          // 0..7
+            const int gm  = m_base + lm;
+            if (gm < total_vecs) {
+                const uint4 xv = reinterpret_cast<const uint4 *>(Y_q8 + (size_t)gm * K + (size_t)b * 128)[q16];
+                s_X[lm][4 * q16 + 0] = xv.x;
+                s_X[lm][4 * q16 + 1] = xv.y;
+                s_X[lm][4 * q16 + 2] = xv.z;
+                s_X[lm][4 * q16 + 3] = xv.w;
+                if (q16 < 4) {
+                    s_Xsc[lm][q16] = Y_sc[(size_t)gm * n_g32 + 4 * b + q16];
+                }
+            } else {
+                s_X[lm][4 * q16 + 0] = 0u;
+                s_X[lm][4 * q16 + 1] = 0u;
+                s_X[lm][4 * q16 + 2] = 0u;
+                s_X[lm][4 * q16 + 3] = 0u;
+                if (q16 < 4) s_Xsc[lm][q16] = 0.f;
+            }
+        }
+
+        #pragma unroll 2
+        for (int r = 0; r < 8; ++r) {
+            const int ln = wid * 8 + r;
+            const int gn = n_base + ln;
+            if (gn < N) {
+                const uint8_t * row_p = vx + (size_t)gn * nb01;
+                float ws = 0.0f;
+                int32_t w4 = 0;
+                if constexpr (EXT_SLOT == 0) {
+                    w4 = ((is_hot_mask >> r) & 1u)
+                        ? unpack_hot_vq12_from_ext0_ldg(row_p, b, lane, K, d_aux_blob, aux_bytes, d_cb4096, ws)
+                        : unpack_vq8_sb6_lane(row_p, b, lane, s_vq8_uv, ws);
+                } else if constexpr (EXT_SLOT == 1) {
+                    w4 = unpack_vq12_direct_ldg(row_p, b, lane, d_cb4096, ws);
+                } else {
+                    w4 = unpack_4b38_lane(row_p, b, lane, d_lut4, ws);
+                }
+                s_W[ln][lane] = (uint32_t)w4;
+                if ((lane & 7) == 0) s_Wsc[ln][lane >> 3] = ws;
+            } else {
+                s_W[ln][lane] = 0u;
+                if ((lane & 7) == 0) s_Wsc[ln][lane >> 3] = 0.f;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int sub = 0; sub < 4; ++sub) {
+            const int k_w0 = 8 * sub + c_k;
+            const int k_w1 = k_w0 + 4;
+            uint32_t a_frag[2][4];
+            float    x_sc[2][2];
+            #pragma unroll
+            for (int mt = 0; mt < 2; ++mt) {
+                const int m_r0 = warp_m * 32 + mt * 16 + r_grp;
+                const int m_r1 = m_r0 + 8;
+                a_frag[mt][0] = s_X[m_r0][k_w0];
+                a_frag[mt][1] = s_X[m_r1][k_w0];
+                a_frag[mt][2] = s_X[m_r0][k_w1];
+                a_frag[mt][3] = s_X[m_r1][k_w1];
+                x_sc[mt][0]   = s_Xsc[m_r0][sub];
+                x_sc[mt][1]   = s_Xsc[m_r1][sub];
+            }
+            #pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                const int n_col_lane = warp_n * 16 + nt * 8 + r_grp;
+                const uint32_t b0 = s_W[n_col_lane][k_w0];
+                const uint32_t b1 = s_W[n_col_lane][k_w1];
+                const int c_n0 = warp_n * 16 + nt * 8 + 2 * c_k;
+                const float ws0 = s_Wsc[c_n0 + 0][sub];
+                const float ws1 = s_Wsc[c_n0 + 1][sub];
+                #pragma unroll
+                for (int mt = 0; mt < 2; ++mt) {
+                    int d0, d1, d2, d3;
+                    dev_mma_m16n8k32_s8(
+                        d0, d1, d2, d3,
+                        a_frag[mt][0], a_frag[mt][1], a_frag[mt][2], a_frag[mt][3],
+                        b0, b1);
+                    acc[mt][nt][0] += (float)d0 * (x_sc[mt][0] * ws0);
+                    acc[mt][nt][1] += (float)d1 * (x_sc[mt][0] * ws1);
+                    acc[mt][nt][2] += (float)d2 * (x_sc[mt][1] * ws0);
+                    acc[mt][nt][3] += (float)d3 * (x_sc[mt][1] * ws1);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+        const int gm0 = m_base + warp_m * 32 + mt * 16 + r_grp;
+        const int gm1 = gm0 + 8;
+        #pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            const int gn0 = n_base + warp_n * 16 + nt * 8 + 2 * c_k;
+            if (gm0 < total_vecs && gn0 < N) {
+                const int i11 = gm0 % ne11;
+                const int t12 = gm0 / ne11;
+                const int i12 = t12 % ne12;
+                const int i13 = t12 / ne12;
+                float * out0 = reinterpret_cast<float *>(
+                    dst_bytes + (size_t)i11 * nb1 + (size_t)i12 * nb2 + (size_t)i13 * nb3);
+                out0[gn0] = acc[mt][nt][0];
+                if (gn0 + 1 < N) out0[gn0 + 1] = acc[mt][nt][1];
+            }
+            if (gm1 < total_vecs && gn0 < N) {
+                const int i11 = gm1 % ne11;
+                const int t12 = gm1 / ne11;
+                const int i12 = t12 % ne12;
+                const int i13 = t12 / ne12;
+                float * out1 = reinterpret_cast<float *>(
+                    dst_bytes + (size_t)i11 * nb1 + (size_t)i12 * nb2 + (size_t)i13 * nb3);
+                out1[gn0] = acc[mt][nt][2];
+                if (gn0 + 1 < N) out1[gn0 + 1] = acc[mt][nt][3];
+            }
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
-// 5. `mul_mat_id_cuda` (`EXT0` & `EXT1`): Decode (`M <= 8`) + Grouped Multi-Token Prefill!
+// 5. `mul_mat_id_cuda` (`EXT0` & `EXT1`): Decode (`M < 4`), Compact Grouped8 (`4 <= M < 16`), & INT8 TC (`M >= 16`)!
 // -----------------------------------------------------------------------------
 
-// Fast pair-grouped histogram + scatter for `ne12 >= 4` so each expert's weights are unpacked ONCE per 8-token tile!
 __global__ void wv_ink_plugin_mmid_zero_and_hist_kernel(
     const uint8_t * __restrict__ ids_bytes,
     uint8_t * __restrict__ dst_bytes,
@@ -766,19 +1080,97 @@ __global__ void wv_ink_plugin_mmid_zero_and_hist_kernel(
     atomicAdd(&exp_cnt[e], 1);
 }
 
-__global__ void wv_ink_plugin_mmid_prefix_kernel(
+// Parallel 256-thread prefix scan + active-expert compaction + 64-token tile builder (`0` host sync, arbitrary `n_expert <= 65536`)
+__global__ __launch_bounds__(256)
+void wv_ink_plugin_mmid_plan_kernel(
     const int32_t * __restrict__ exp_cnt,
     int32_t * __restrict__ exp_off,
     int32_t * __restrict__ exp_cur,
-    int n_expert) {
-    if (threadIdx.x != 0) return;
-    int32_t acc = 0;
-    for (int e = 0; e < n_expert; ++e) {
-        exp_off[e] = acc;
-        exp_cur[e] = acc;
-        acc += exp_cnt[e];
+    int32_t * __restrict__ active_e,
+    int32_t * __restrict__ tile_exp,
+    int32_t * __restrict__ tile_beg,
+    int32_t * __restrict__ tile_len,
+    int32_t * __restrict__ meta_cnt,
+    int n_expert,
+    int build_tiles64) {
+    __shared__ int32_t s_p[256];
+    __shared__ int32_t s_a[256];
+    __shared__ int32_t s_t[256];
+    __shared__ int32_t s_base_p;
+    __shared__ int32_t s_base_a;
+    __shared__ int32_t s_base_t;
+
+    const int tid = threadIdx.x;
+    if (tid == 0) {
+        s_base_p = 0;
+        s_base_a = 0;
+        s_base_t = 0;
     }
-    exp_off[n_expert] = acc;
+    __syncthreads();
+
+    for (int base = 0; base < n_expert; base += 256) {
+        const int e = base + tid;
+        const int32_t c  = (e < n_expert) ? exp_cnt[e] : 0;
+        const int32_t a  = (c > 0) ? 1 : 0;
+        const int32_t nt = (build_tiles64 && c > 0) ? ((c + 63) >> 6) : 0;
+
+        s_p[tid] = c;
+        s_a[tid] = a;
+        s_t[tid] = nt;
+        __syncthreads();
+
+        #pragma unroll
+        for (int offset = 1; offset < 256; offset <<= 1) {
+            int32_t vp = 0, va = 0, vt = 0;
+            if (tid >= offset) {
+                vp = s_p[tid - offset];
+                va = s_a[tid - offset];
+                vt = s_t[tid - offset];
+            }
+            __syncthreads();
+            if (tid >= offset) {
+                s_p[tid] += vp;
+                s_a[tid] += va;
+                s_t[tid] += vt;
+            }
+            __syncthreads();
+        }
+
+        const int32_t off_p = s_base_p + ((tid > 0) ? s_p[tid - 1] : 0);
+        const int32_t off_a = s_base_a + ((tid > 0) ? s_a[tid - 1] : 0);
+        const int32_t off_t = s_base_t + ((tid > 0) ? s_t[tid - 1] : 0);
+
+        if (e < n_expert) {
+            exp_off[e] = off_p;
+            exp_cur[e] = off_p;
+            if (a) {
+                active_e[off_a] = e;
+            }
+            for (int k = 0; k < nt; ++k) {
+                tile_exp[off_t + k] = e;
+                tile_beg[off_t + k] = off_p + k * 64;
+                const int32_t rem = c - k * 64;
+                tile_len[off_t + k] = (rem < 64) ? rem : 64;
+            }
+        }
+
+        const int32_t chunk_p = s_p[255];
+        const int32_t chunk_a = s_a[255];
+        const int32_t chunk_t = s_t[255];
+        __syncthreads();
+        if (tid == 0) {
+            s_base_p += chunk_p;
+            s_base_a += chunk_a;
+            s_base_t += chunk_t;
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        exp_off[n_expert] = s_base_p;
+        meta_cnt[0]       = s_base_a;
+        meta_cnt[1]       = s_base_t;
+    }
 }
 
 __global__ void wv_ink_plugin_mmid_scatter_kernel(
@@ -891,13 +1283,15 @@ void wv_ink_plugin_mmid_smallm_kernel(
     }
 }
 
-// Grouped Multi-Token (`ne12 >= 4`) `mul_mat_id_cuda`: unpacks each expert row ONCE across up to 8 tokens!
+// Compact Active-Expert Grouped8 (`4 <= ne12 < 16`, e.g. MTP-8!): launches ONLY over active experts (`meta_cnt[0]`)!
 template<int EXT_SLOT>
 __global__ __launch_bounds__(256, 2)
 void wv_ink_plugin_mmid_grouped8_kernel(
     const uint8_t * __restrict__ vx,
     const int8_t * __restrict__ Y_q8,
     const float * __restrict__ Y_sc,
+    const int32_t * __restrict__ active_e,
+    const int32_t * __restrict__ meta_cnt,
     const int32_t * __restrict__ exp_off,
     const int32_t * __restrict__ pair_j,
     const int32_t * __restrict__ pair_t,
@@ -914,83 +1308,305 @@ void wv_ink_plugin_mmid_grouped8_kernel(
     __shared__ uint32_t s_cb4096[4096];
     __shared__ uint32_t s_vq8_uv[2][512];
 
-    const int e   = blockIdx.y;
-    const int p0  = exp_off[e];
-    const int p1  = exp_off[e + 1];
-    if (p0 >= p1) return;
+    const int num_active = meta_cnt[0];
+    if ((int)blockIdx.y >= num_active) return;
 
-    const int tid  = threadIdx.x;
+    const int tid = threadIdx.x;
     for (int i = tid; i < 4096; i += 256) s_cb4096[i] = d_cb4096[i];
     if constexpr (EXT_SLOT == 0) {
         for (int i = tid; i < 1024; i += 256) reinterpret_cast<uint32_t *>(s_vq8_uv)[i] = d_vq8_uv[i];
     }
     __syncthreads();
 
-    const int lane = tid & 31;
-    const int wid  = tid >> 5; // 0..7
-    const int row  = blockIdx.x * 8 + wid;
+    const int lane   = tid & 31;
+    const int wid    = tid >> 5; // 0..7
+    const int row    = blockIdx.x * 8 + wid;
     if (row >= N) return;
 
-    const uint8_t * row_p = vx + (size_t)e * nb02 + (size_t)row * nb01;
-    const bool is_hot = (EXT_SLOT == 0) && ((dev_ld_u16(row_p + WV_INK_HOT_TAG_OFF) >> 12) == 0xFu);
     const int sub   = lane >> 3;
     const int nb128 = K >> 7;
 
-    for (int pb = p0; pb < p1; pb += 8) {
-        const int cnt = min(8, p1 - pb);
-        int vec_ids[8];
-        #pragma unroll
-        for (int m = 0; m < 8; ++m) {
-            if (m < cnt) {
-                const int j = pair_j[pb + m];
-                const int t = pair_t[pb + m];
-                vec_ids[m] = t * ne11 + ((ne11 == 1) ? 0 : j);
-            } else {
-                vec_ids[m] = 0;
-            }
-        }
+    for (int ai = (int)blockIdx.y; ai < num_active; ai += (int)gridDim.y) {
+        const int e  = active_e[ai];
+        const int p0 = exp_off[e];
+        const int p1 = exp_off[e + 1];
+        const uint8_t * row_p = vx + (size_t)e * nb02 + (size_t)row * nb01;
+        const bool is_hot = (EXT_SLOT == 0) && ((dev_ld_u16(row_p + WV_INK_HOT_TAG_OFF) >> 12) == 0xFu);
 
-        float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-        for (int b = 0; b < nb128; ++b) {
-            float ws = 0.0f;
-            int32_t w4 = 0;
-            if constexpr (EXT_SLOT == 0) {
-                w4 = is_hot
-                    ? unpack_hot_vq12_from_ext0_lane(row_p, b, lane, K, d_aux_blob, aux_bytes, s_cb4096, ws)
-                    : unpack_vq8_sb6_lane(row_p, b, lane, s_vq8_uv, ws);
-            } else {
-                w4 = unpack_vq12_direct_lane(row_p, b, lane, s_cb4096, ws);
-            }
-
-            #pragma unroll
-            for (int m = 0; m < 8; ++m) {
-                if (m < cnt) {
-                    const int vid = vec_ids[m];
-                    const int32_t y4 = reinterpret_cast<const int32_t *>(Y_q8 + (size_t)vid * K)[b * 32 + lane];
-                    int32_t dp = __dp4a(w4, y4, 0);
-                    dp += __shfl_xor_sync(0xffffffffu, dp, 4);
-                    dp += __shfl_xor_sync(0xffffffffu, dp, 2);
-                    dp += __shfl_xor_sync(0xffffffffu, dp, 1);
-                    const float ysc = Y_sc[(size_t)vid * (K >> 5) + 4 * b + sub];
-                    float part = (float)dp * (ws * ysc);
-                    part += __shfl_xor_sync(0xffffffffu, part, 16);
-                    part += __shfl_xor_sync(0xffffffffu, part, 8);
-                    acc[m] += part;
-                }
-            }
-        }
-
-        if (lane == 0) {
+        for (int pb = p0; pb < p1; pb += 8) {
+            const int cnt = min(8, p1 - pb);
+            int vec_ids[8];
             #pragma unroll
             for (int m = 0; m < 8; ++m) {
                 if (m < cnt) {
                     const int j = pair_j[pb + m];
                     const int t = pair_t[pb + m];
-                    float * out_p = reinterpret_cast<float *>(dst_bytes + (size_t)j * nb1 + (size_t)t * nb2);
-                    out_p[row] = acc[m];
+                    vec_ids[m] = t * ne11 + ((ne11 == 1) ? 0 : j);
+                } else {
+                    vec_ids[m] = 0;
+                }
+            }
+
+            float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            for (int b = 0; b < nb128; ++b) {
+                float ws = 0.0f;
+                int32_t w4 = 0;
+                if constexpr (EXT_SLOT == 0) {
+                    w4 = is_hot
+                        ? unpack_hot_vq12_from_ext0_lane(row_p, b, lane, K, d_aux_blob, aux_bytes, s_cb4096, ws)
+                        : unpack_vq8_sb6_lane(row_p, b, lane, s_vq8_uv, ws);
+                } else {
+                    w4 = unpack_vq12_direct_lane(row_p, b, lane, s_cb4096, ws);
+                }
+
+                #pragma unroll
+                for (int m = 0; m < 8; ++m) {
+                    if (m < cnt) {
+                        const int vid = vec_ids[m];
+                        const int32_t y4 = reinterpret_cast<const int32_t *>(Y_q8 + (size_t)vid * K)[b * 32 + lane];
+                        int32_t dp = __dp4a(w4, y4, 0);
+                        dp += __shfl_xor_sync(0xffffffffu, dp, 4);
+                        dp += __shfl_xor_sync(0xffffffffu, dp, 2);
+                        dp += __shfl_xor_sync(0xffffffffu, dp, 1);
+                        const float ysc = Y_sc[(size_t)vid * (K >> 5) + 4 * b + sub];
+                        float part = (float)dp * (ws * ysc);
+                        part += __shfl_xor_sync(0xffffffffu, part, 16);
+                        part += __shfl_xor_sync(0xffffffffu, part, 8);
+                        acc[m] += part;
+                    }
+                }
+            }
+
+            if (lane == 0) {
+                #pragma unroll
+                for (int m = 0; m < 8; ++m) {
+                    if (m < cnt) {
+                        const int j = pair_j[pb + m];
+                        const int t = pair_t[pb + m];
+                        float * out_p = reinterpret_cast<float *>(dst_bytes + (size_t)j * nb1 + (size_t)t * nb2);
+                        out_p[row] = acc[m];
+                    }
                 }
             }
         }
+    }
+}
+
+// Grouped INT8 Tensor Core `mma.m16n8k32` `mul_mat_id_cuda` (`ne12 >= 16`)
+// CTA_M = 64 (routed pairs for expert `e`), CTA_N = 64 (expert rows), K_TILE = 128 (`256` threads = `8` warps)
+// Static SMEM = `23,808 B` (`23.25 KiB <= 24 KiB`, `2+ CTAs/SM` on all `sm_80..sm_120a`, `0` spills, `0` host sync!)
+template<int EXT_SLOT>
+__global__ __launch_bounds__(256, 2)
+void wv_ink_plugin_mmid_tc_m64_n64_kernel(
+    const uint8_t * __restrict__ vx,
+    const int8_t * __restrict__ Y_q8,
+    const float * __restrict__ Y_sc,
+    const int32_t * __restrict__ tile_exp,
+    const int32_t * __restrict__ tile_beg,
+    const int32_t * __restrict__ tile_len,
+    const int32_t * __restrict__ meta_cnt,
+    const int32_t * __restrict__ pair_j,
+    const int32_t * __restrict__ pair_t,
+    uint8_t * __restrict__ dst_bytes,
+    const uint32_t * __restrict__ d_cb4096,
+    const uint32_t * __restrict__ d_vq8_uv,
+    const uint8_t * __restrict__ d_aux_blob,
+    size_t aux_bytes,
+    int K,
+    int N,
+    int ne11,
+    size_t nb01, size_t nb02,
+    size_t nb1,  size_t nb2) {
+    __shared__ uint32_t s_X[64][33];      // 8,448 B
+    __shared__ uint32_t s_W[64][33];      // 8,448 B
+    __shared__ float    s_Xsc[64][4];     // 1,024 B
+    __shared__ float    s_Wsc[64][4];     // 1,024 B
+    __shared__ uint32_t s_vq8_uv[2][512]; // 4,096 B
+    __shared__ int32_t  s_vid[64];        //   256 B
+    __shared__ int32_t  s_pair_j[64];     //   256 B
+    __shared__ int32_t  s_pair_t[64];     //   256 B
+
+    const int num_tiles = meta_cnt[1];
+    if ((int)blockIdx.y >= num_tiles) return;
+
+    const int tid    = threadIdx.x; // 0..255
+    const int wid    = tid >> 5;    // 0..7
+    const int lane   = tid & 31;    // 0..31
+    const int warp_m = wid >> 2;    // 0..1 (32 M-rows/warp)
+    const int warp_n = wid & 3;     // 0..3 (16 N-cols/warp)
+    const int n_base = blockIdx.x * 64;
+
+    if constexpr (EXT_SLOT == 0) {
+        #pragma unroll
+        for (int i = tid; i < 1024; i += 256) {
+            reinterpret_cast<uint32_t *>(s_vq8_uv)[i] = d_vq8_uv[i];
+        }
+    }
+
+    const int r_grp = lane >> 2; // 0..7
+    const int c_k   = lane & 3;  // 0..3
+    const int nb128 = K >> 7;
+    const int n_g32 = K >> 5;
+
+    for (int tile_id = (int)blockIdx.y; tile_id < num_tiles; tile_id += (int)gridDim.y) {
+        const int e     = tile_exp[tile_id];
+        const int p_beg = tile_beg[tile_id];
+        const int t_cnt = tile_len[tile_id];
+
+        if (tid < 64) {
+            if (tid < t_cnt) {
+                const int j = pair_j[p_beg + tid];
+                const int t = pair_t[p_beg + tid];
+                s_pair_j[tid] = j;
+                s_pair_t[tid] = t;
+                s_vid[tid]    = t * ne11 + ((ne11 == 1) ? 0 : j);
+            } else {
+                s_pair_j[tid] = 0;
+                s_pair_t[tid] = 0;
+                s_vid[tid]    = -1;
+            }
+        }
+        __syncthreads();
+
+        uint32_t is_hot_mask = 0u;
+        if constexpr (EXT_SLOT == 0) {
+            #pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int gn = n_base + wid * 8 + r;
+                if (gn < N) {
+                    const uint8_t * row_p = vx + (size_t)e * nb02 + (size_t)gn * nb01;
+                    if ((dev_ld_u16(row_p + WV_INK_HOT_TAG_OFF) >> 12) == 0xFu) {
+                        is_hot_mask |= (1u << r);
+                    }
+                }
+            }
+        }
+
+        float acc[2][2][4];
+        #pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+            #pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                acc[mt][nt][0] = 0.f; acc[mt][nt][1] = 0.f;
+                acc[mt][nt][2] = 0.f; acc[mt][nt][3] = 0.f;
+            }
+        }
+
+        for (int b = 0; b < nb128; ++b) {
+            #pragma unroll
+            for (int pass = 0; pass < 2; ++pass) {
+                const int idx = pass * 256 + tid; // 0..511 -> 64 rows x 8 uint4s
+                const int lm  = idx >> 3;         // 0..63
+                const int q16 = idx & 7;          // 0..7
+                const int vid = s_vid[lm];
+                if (vid >= 0) {
+                    const uint4 xv = reinterpret_cast<const uint4 *>(Y_q8 + (size_t)vid * K + (size_t)b * 128)[q16];
+                    s_X[lm][4 * q16 + 0] = xv.x;
+                    s_X[lm][4 * q16 + 1] = xv.y;
+                    s_X[lm][4 * q16 + 2] = xv.z;
+                    s_X[lm][4 * q16 + 3] = xv.w;
+                    if (q16 < 4) {
+                        s_Xsc[lm][q16] = Y_sc[(size_t)vid * n_g32 + 4 * b + q16];
+                    }
+                } else {
+                    s_X[lm][4 * q16 + 0] = 0u;
+                    s_X[lm][4 * q16 + 1] = 0u;
+                    s_X[lm][4 * q16 + 2] = 0u;
+                    s_X[lm][4 * q16 + 3] = 0u;
+                    if (q16 < 4) s_Xsc[lm][q16] = 0.f;
+                }
+            }
+
+            #pragma unroll 2
+            for (int r = 0; r < 8; ++r) {
+                const int ln = wid * 8 + r;
+                const int gn = n_base + ln;
+                if (gn < N) {
+                    const uint8_t * row_p = vx + (size_t)e * nb02 + (size_t)gn * nb01;
+                    float ws = 0.0f;
+                    int32_t w4 = 0;
+                    if constexpr (EXT_SLOT == 0) {
+                        w4 = ((is_hot_mask >> r) & 1u)
+                            ? unpack_hot_vq12_from_ext0_ldg(row_p, b, lane, K, d_aux_blob, aux_bytes, d_cb4096, ws)
+                            : unpack_vq8_sb6_lane(row_p, b, lane, s_vq8_uv, ws);
+                    } else {
+                        w4 = unpack_vq12_direct_ldg(row_p, b, lane, d_cb4096, ws);
+                    }
+                    s_W[ln][lane] = (uint32_t)w4;
+                    if ((lane & 7) == 0) s_Wsc[ln][lane >> 3] = ws;
+                } else {
+                    s_W[ln][lane] = 0u;
+                    if ((lane & 7) == 0) s_Wsc[ln][lane >> 3] = 0.f;
+                }
+            }
+            __syncthreads();
+
+            #pragma unroll
+            for (int sub = 0; sub < 4; ++sub) {
+                const int k_w0 = 8 * sub + c_k;
+                const int k_w1 = k_w0 + 4;
+                uint32_t a_frag[2][4];
+                float    x_sc[2][2];
+                #pragma unroll
+                for (int mt = 0; mt < 2; ++mt) {
+                    const int m_r0 = warp_m * 32 + mt * 16 + r_grp;
+                    const int m_r1 = m_r0 + 8;
+                    a_frag[mt][0] = s_X[m_r0][k_w0];
+                    a_frag[mt][1] = s_X[m_r1][k_w0];
+                    a_frag[mt][2] = s_X[m_r0][k_w1];
+                    a_frag[mt][3] = s_X[m_r1][k_w1];
+                    x_sc[mt][0]   = s_Xsc[m_r0][sub];
+                    x_sc[mt][1]   = s_Xsc[m_r1][sub];
+                }
+                #pragma unroll
+                for (int nt = 0; nt < 2; ++nt) {
+                    const int n_col_lane = warp_n * 16 + nt * 8 + r_grp;
+                    const uint32_t b0 = s_W[n_col_lane][k_w0];
+                    const uint32_t b1 = s_W[n_col_lane][k_w1];
+                    const int c_n0 = warp_n * 16 + nt * 8 + 2 * c_k;
+                    const float ws0 = s_Wsc[c_n0 + 0][sub];
+                    const float ws1 = s_Wsc[c_n0 + 1][sub];
+                    #pragma unroll
+                    for (int mt = 0; mt < 2; ++mt) {
+                        int d0, d1, d2, d3;
+                        dev_mma_m16n8k32_s8(
+                            d0, d1, d2, d3,
+                            a_frag[mt][0], a_frag[mt][1], a_frag[mt][2], a_frag[mt][3],
+                            b0, b1);
+                        acc[mt][nt][0] += (float)d0 * (x_sc[mt][0] * ws0);
+                        acc[mt][nt][1] += (float)d1 * (x_sc[mt][0] * ws1);
+                        acc[mt][nt][2] += (float)d2 * (x_sc[mt][1] * ws0);
+                        acc[mt][nt][3] += (float)d3 * (x_sc[mt][1] * ws1);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        #pragma unroll
+        for (int mt = 0; mt < 2; ++mt) {
+            const int lm0 = warp_m * 32 + mt * 16 + r_grp;
+            const int lm1 = lm0 + 8;
+            #pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                const int gn0 = n_base + warp_n * 16 + nt * 8 + 2 * c_k;
+                if (lm0 < t_cnt && gn0 < N) {
+                    const int j = s_pair_j[lm0];
+                    const int t = s_pair_t[lm0];
+                    float * out0 = reinterpret_cast<float *>(dst_bytes + (size_t)j * nb1 + (size_t)t * nb2);
+                    out0[gn0] = acc[mt][nt][0];
+                    if (gn0 + 1 < N) out0[gn0 + 1] = acc[mt][nt][1];
+                }
+                if (lm1 < t_cnt && gn0 < N) {
+                    const int j = s_pair_j[lm1];
+                    const int t = s_pair_t[lm1];
+                    float * out1 = reinterpret_cast<float *>(dst_bytes + (size_t)j * nb1 + (size_t)t * nb2);
+                    out1[gn0] = acc[mt][nt][2];
+                    if (gn0 + 1 < N) out1[gn0 + 1] = acc[mt][nt][3];
+                }
+            }
+        }
+        __syncthreads();
     }
 }
 
@@ -1019,17 +1635,22 @@ void wv_ink_cuda_free_aux(void) {
         WvInkPluginDevState & st = g_devs[d];
         if (!st.tables_ready && !st.d_yq8 && !st.d_pair_e) continue;
         cudaSetDevice(d);
-        if (st.d_cb4096)  cudaFree(st.d_cb4096);
-        if (st.d_vq8_uv)  cudaFree(st.d_vq8_uv);
-        if (st.d_lut4)    cudaFree(st.d_lut4);
+        if (st.d_cb4096)   cudaFree(st.d_cb4096);
+        if (st.d_vq8_uv)   cudaFree(st.d_vq8_uv);
+        if (st.d_lut4)     cudaFree(st.d_lut4);
         if (st.d_aux_blob) cudaFree(st.d_aux_blob);
-        if (st.d_yq8)     cudaFree(st.d_yq8);
-        if (st.d_ysc)     cudaFree(st.d_ysc);
-        if (st.d_pair_e)  cudaFree(st.d_pair_e);
-        if (st.d_pair_j)  cudaFree(st.d_pair_j);
-        if (st.d_pair_t)  cudaFree(st.d_pair_t);
-        if (st.d_exp_cnt) cudaFree(st.d_exp_cnt);
-        if (st.d_exp_off) cudaFree(st.d_exp_off);
+        if (st.d_yq8)      cudaFree(st.d_yq8);
+        if (st.d_ysc)      cudaFree(st.d_ysc);
+        if (st.d_pair_e)   cudaFree(st.d_pair_e);
+        if (st.d_pair_j)   cudaFree(st.d_pair_j);
+        if (st.d_pair_t)   cudaFree(st.d_pair_t);
+        if (st.d_exp_cnt)  cudaFree(st.d_exp_cnt);
+        if (st.d_exp_off)  cudaFree(st.d_exp_off);
+        if (st.d_active_e) cudaFree(st.d_active_e);
+        if (st.d_meta_cnt) cudaFree(st.d_meta_cnt);
+        if (st.d_tile_exp) cudaFree(st.d_tile_exp);
+        if (st.d_tile_beg) cudaFree(st.d_tile_beg);
+        if (st.d_tile_len) cudaFree(st.d_tile_len);
         st = WvInkPluginDevState{};
         g_dev_epoch[d] = 0;
     }
@@ -1084,15 +1705,30 @@ int32_t wv_ink_mul_mat_cuda(
 
     const int r2 = (int)(ne12 / ne02);
     const int r3 = (int)(ne13 / ne03);
+    const bool single_w_slice = (ne02 == 1 && ne03 == 1);
 
     if (ext_slot == 3) {
-        if (total_vecs >= 16 && ne12 == 1 && ne13 == 1) {
+        if (total_vecs >= 16 && single_w_slice) {
             dim3 grid((N + 63) / 64, (total_vecs + 63) / 64);
             wv_ink_plugin_ext3_tc_m64_n64_kernel<<<grid, 128, 0, stream>>>(
                 reinterpret_cast<const uint8_t *>(vx), d_yq8, d_ysc,
                 reinterpret_cast<uint8_t *>(dst),
-                K, N, total_vecs, (int)ne11, (int)ne12, r2, r3,
-                nb01, nb02, nb03, nb1, nb2, nb3);
+                K, N, total_vecs, (int)ne11, (int)ne12,
+                nb01, nb1, nb2, nb3);
+        } else if (total_vecs >= 2 && total_vecs <= 8 && single_w_slice) {
+            dim3 grid((N + 3) / 4, 1);
+            wv_ink_plugin_ext3_multi_gemv_kernel<8><<<grid, 128, 0, stream>>>(
+                reinterpret_cast<const uint8_t *>(vx), d_yq8, d_ysc,
+                reinterpret_cast<uint8_t *>(dst),
+                K, N, total_vecs, (int)ne11, (int)ne12,
+                nb01, nb1, nb2, nb3);
+        } else if (total_vecs >= 9 && total_vecs < 16 && single_w_slice) {
+            dim3 grid((N + 3) / 4, 1);
+            wv_ink_plugin_ext3_multi_gemv_kernel<15><<<grid, 128, 0, stream>>>(
+                reinterpret_cast<const uint8_t *>(vx), d_yq8, d_ysc,
+                reinterpret_cast<uint8_t *>(dst),
+                K, N, total_vecs, (int)ne11, (int)ne12,
+                nb01, nb1, nb2, nb3);
         } else {
             dim3 grid((N + 3) / 4, total_vecs);
             wv_ink_plugin_ext3_gemv_kernel<<<grid, 128, 0, stream>>>(
@@ -1102,26 +1738,53 @@ int32_t wv_ink_mul_mat_cuda(
                 nb01, nb02, nb03, nb1, nb2, nb3);
         }
     } else if (ext_slot == 0) {
-        dim3 grid((N + 3) / 4, total_vecs);
-        wv_ink_plugin_ext012_mm_kernel<0><<<grid, 128, 0, stream>>>(
-            reinterpret_cast<const uint8_t *>(vx), d_yq8, d_ysc,
-            reinterpret_cast<uint8_t *>(dst),
-            snap.d_cb4096, snap.d_vq8_uv, snap.d_lut4, snap.d_aux_blob, snap.aux_bytes,
-            K, N, (int)ne11, (int)ne12, r2, r3, nb01, nb02, nb03, nb1, nb2, nb3);
+        if (total_vecs >= 16 && single_w_slice) {
+            dim3 grid((N + 63) / 64, (total_vecs + 63) / 64);
+            wv_ink_plugin_ext012_tc_m64_n64_kernel<0><<<grid, 256, 0, stream>>>(
+                reinterpret_cast<const uint8_t *>(vx), d_yq8, d_ysc,
+                reinterpret_cast<uint8_t *>(dst),
+                snap.d_cb4096, snap.d_vq8_uv, snap.d_lut4, snap.d_aux_blob, snap.aux_bytes,
+                K, N, total_vecs, (int)ne11, (int)ne12, nb01, nb1, nb2, nb3);
+        } else {
+            dim3 grid((N + 3) / 4, total_vecs);
+            wv_ink_plugin_ext012_mm_kernel<0><<<grid, 128, 0, stream>>>(
+                reinterpret_cast<const uint8_t *>(vx), d_yq8, d_ysc,
+                reinterpret_cast<uint8_t *>(dst),
+                snap.d_cb4096, snap.d_vq8_uv, snap.d_lut4, snap.d_aux_blob, snap.aux_bytes,
+                K, N, (int)ne11, (int)ne12, r2, r3, nb01, nb02, nb03, nb1, nb2, nb3);
+        }
     } else if (ext_slot == 1) {
-        dim3 grid((N + 3) / 4, total_vecs);
-        wv_ink_plugin_ext012_mm_kernel<1><<<grid, 128, 0, stream>>>(
-            reinterpret_cast<const uint8_t *>(vx), d_yq8, d_ysc,
-            reinterpret_cast<uint8_t *>(dst),
-            snap.d_cb4096, snap.d_vq8_uv, snap.d_lut4, snap.d_aux_blob, snap.aux_bytes,
-            K, N, (int)ne11, (int)ne12, r2, r3, nb01, nb02, nb03, nb1, nb2, nb3);
+        if (total_vecs >= 16 && single_w_slice) {
+            dim3 grid((N + 63) / 64, (total_vecs + 63) / 64);
+            wv_ink_plugin_ext012_tc_m64_n64_kernel<1><<<grid, 256, 0, stream>>>(
+                reinterpret_cast<const uint8_t *>(vx), d_yq8, d_ysc,
+                reinterpret_cast<uint8_t *>(dst),
+                snap.d_cb4096, snap.d_vq8_uv, snap.d_lut4, snap.d_aux_blob, snap.aux_bytes,
+                K, N, total_vecs, (int)ne11, (int)ne12, nb01, nb1, nb2, nb3);
+        } else {
+            dim3 grid((N + 3) / 4, total_vecs);
+            wv_ink_plugin_ext012_mm_kernel<1><<<grid, 128, 0, stream>>>(
+                reinterpret_cast<const uint8_t *>(vx), d_yq8, d_ysc,
+                reinterpret_cast<uint8_t *>(dst),
+                snap.d_cb4096, snap.d_vq8_uv, snap.d_lut4, snap.d_aux_blob, snap.aux_bytes,
+                K, N, (int)ne11, (int)ne12, r2, r3, nb01, nb02, nb03, nb1, nb2, nb3);
+        }
     } else {
-        dim3 grid((N + 3) / 4, total_vecs);
-        wv_ink_plugin_ext012_mm_kernel<2><<<grid, 128, 0, stream>>>(
-            reinterpret_cast<const uint8_t *>(vx), d_yq8, d_ysc,
-            reinterpret_cast<uint8_t *>(dst),
-            snap.d_cb4096, snap.d_vq8_uv, snap.d_lut4, snap.d_aux_blob, snap.aux_bytes,
-            K, N, (int)ne11, (int)ne12, r2, r3, nb01, nb02, nb03, nb1, nb2, nb3);
+        if (total_vecs >= 16 && single_w_slice) {
+            dim3 grid((N + 63) / 64, (total_vecs + 63) / 64);
+            wv_ink_plugin_ext012_tc_m64_n64_kernel<2><<<grid, 256, 0, stream>>>(
+                reinterpret_cast<const uint8_t *>(vx), d_yq8, d_ysc,
+                reinterpret_cast<uint8_t *>(dst),
+                snap.d_cb4096, snap.d_vq8_uv, snap.d_lut4, snap.d_aux_blob, snap.aux_bytes,
+                K, N, total_vecs, (int)ne11, (int)ne12, nb01, nb1, nb2, nb3);
+        } else {
+            dim3 grid((N + 3) / 4, total_vecs);
+            wv_ink_plugin_ext012_mm_kernel<2><<<grid, 128, 0, stream>>>(
+                reinterpret_cast<const uint8_t *>(vx), d_yq8, d_ysc,
+                reinterpret_cast<uint8_t *>(dst),
+                snap.d_cb4096, snap.d_vq8_uv, snap.d_lut4, snap.d_aux_blob, snap.aux_bytes,
+                K, N, (int)ne11, (int)ne12, r2, r3, nb01, nb02, nb03, nb1, nb2, nb3);
+        }
     }
 
     cudaError_t err = cudaGetLastError();
@@ -1195,32 +1858,65 @@ int32_t wv_ink_mul_mat_id_cuda(
                 nb01, nb02, ids_nb0, ids_nb1, nb1, nb2, first_zero);
         }
     } else {
-        cudaMemsetAsync(snap.d_exp_cnt, 0, (size_t)ne02 * sizeof(int32_t), stream);
+        const int active_lim = (first_zero >= 0 && first_zero < (int)ne02) ? first_zero : (int)ne02;
+        if (active_lim > 0) {
+            cudaMemsetAsync(snap.d_exp_cnt, 0, (size_t)active_lim * sizeof(int32_t), stream);
+        }
         const int p_blocks = ((int)total_pairs + 255) / 256;
         wv_ink_plugin_mmid_zero_and_hist_kernel<<<p_blocks, 256, 0, stream>>>(
             reinterpret_cast<const uint8_t *>(ids), reinterpret_cast<uint8_t *>(dst),
             snap.d_exp_cnt, N, (int)ne02, (int)n_expert_used, (int)ne12,
             ids_nb0, ids_nb1, nb1, nb2, first_zero);
-        wv_ink_plugin_mmid_prefix_kernel<<<1, 32, 0, stream>>>(
-            snap.d_exp_cnt, snap.d_exp_off, snap.d_pair_e, (int)ne02);
-        wv_ink_plugin_mmid_scatter_kernel<<<p_blocks, 256, 0, stream>>>(
-            reinterpret_cast<const uint8_t *>(ids), snap.d_pair_e,
-            snap.d_pair_j, snap.d_pair_t,
-            (int)ne02, (int)n_expert_used, (int)ne12, ids_nb0, ids_nb1, first_zero);
 
-        dim3 grid((N + 7) / 8, (int)ne02);
-        if (ext_slot == 0) {
-            wv_ink_plugin_mmid_grouped8_kernel<0><<<grid, 256, 0, stream>>>(
-                reinterpret_cast<const uint8_t *>(vx), snap.d_yq8, snap.d_ysc,
-                snap.d_exp_off, snap.d_pair_j, snap.d_pair_t, reinterpret_cast<uint8_t *>(dst),
-                snap.d_cb4096, snap.d_vq8_uv, snap.d_aux_blob, snap.aux_bytes,
-                K, N, (int)ne11, nb01, nb02, nb1, nb2);
-        } else {
-            wv_ink_plugin_mmid_grouped8_kernel<1><<<grid, 256, 0, stream>>>(
-                reinterpret_cast<const uint8_t *>(vx), snap.d_yq8, snap.d_ysc,
-                snap.d_exp_off, snap.d_pair_j, snap.d_pair_t, reinterpret_cast<uint8_t *>(dst),
-                snap.d_cb4096, snap.d_vq8_uv, snap.d_aux_blob, snap.aux_bytes,
-                K, N, (int)ne11, nb01, nb02, nb1, nb2);
+        if (active_lim > 0) {
+            const bool use_tc = (ne12 >= 16);
+            wv_ink_plugin_mmid_plan_kernel<<<1, 256, 0, stream>>>(
+                snap.d_exp_cnt, snap.d_exp_off, snap.d_pair_e,
+                snap.d_active_e, snap.d_tile_exp, snap.d_tile_beg, snap.d_tile_len,
+                snap.d_meta_cnt, active_lim, use_tc ? 1 : 0);
+            wv_ink_plugin_mmid_scatter_kernel<<<p_blocks, 256, 0, stream>>>(
+                reinterpret_cast<const uint8_t *>(ids), snap.d_pair_e,
+                snap.d_pair_j, snap.d_pair_t,
+                (int)ne02, (int)n_expert_used, (int)ne12, ids_nb0, ids_nb1, first_zero);
+
+            const int max_active = (active_lim < (int)total_pairs) ? active_lim : (int)total_pairs;
+            if (!use_tc) {
+                dim3 grid((N + 7) / 8, std::min(max_active, 65535));
+                if (ext_slot == 0) {
+                    wv_ink_plugin_mmid_grouped8_kernel<0><<<grid, 256, 0, stream>>>(
+                        reinterpret_cast<const uint8_t *>(vx), snap.d_yq8, snap.d_ysc,
+                        snap.d_active_e, snap.d_meta_cnt,
+                        snap.d_exp_off, snap.d_pair_j, snap.d_pair_t, reinterpret_cast<uint8_t *>(dst),
+                        snap.d_cb4096, snap.d_vq8_uv, snap.d_aux_blob, snap.aux_bytes,
+                        K, N, (int)ne11, nb01, nb02, nb1, nb2);
+                } else {
+                    wv_ink_plugin_mmid_grouped8_kernel<1><<<grid, 256, 0, stream>>>(
+                        reinterpret_cast<const uint8_t *>(vx), snap.d_yq8, snap.d_ysc,
+                        snap.d_active_e, snap.d_meta_cnt,
+                        snap.d_exp_off, snap.d_pair_j, snap.d_pair_t, reinterpret_cast<uint8_t *>(dst),
+                        snap.d_cb4096, snap.d_vq8_uv, snap.d_aux_blob, snap.aux_bytes,
+                        K, N, (int)ne11, nb01, nb02, nb1, nb2);
+                }
+            } else {
+                const int64_t max_tiles64 = (int64_t)max_active + ((total_pairs - (int64_t)max_active) / 64);
+                const int grid_y = (int)std::min<int64_t>(std::max<int64_t>(1, max_tiles64), 65535);
+                dim3 grid((N + 63) / 64, grid_y);
+                if (ext_slot == 0) {
+                    wv_ink_plugin_mmid_tc_m64_n64_kernel<0><<<grid, 256, 0, stream>>>(
+                        reinterpret_cast<const uint8_t *>(vx), snap.d_yq8, snap.d_ysc,
+                        snap.d_tile_exp, snap.d_tile_beg, snap.d_tile_len, snap.d_meta_cnt,
+                        snap.d_pair_j, snap.d_pair_t, reinterpret_cast<uint8_t *>(dst),
+                        snap.d_cb4096, snap.d_vq8_uv, snap.d_aux_blob, snap.aux_bytes,
+                        K, N, (int)ne11, nb01, nb02, nb1, nb2);
+                } else {
+                    wv_ink_plugin_mmid_tc_m64_n64_kernel<1><<<grid, 256, 0, stream>>>(
+                        reinterpret_cast<const uint8_t *>(vx), snap.d_yq8, snap.d_ysc,
+                        snap.d_tile_exp, snap.d_tile_beg, snap.d_tile_len, snap.d_meta_cnt,
+                        snap.d_pair_j, snap.d_pair_t, reinterpret_cast<uint8_t *>(dst),
+                        snap.d_cb4096, snap.d_vq8_uv, snap.d_aux_blob, snap.aux_bytes,
+                        K, N, (int)ne11, nb01, nb02, nb1, nb2);
+                }
+            }
         }
     }
 

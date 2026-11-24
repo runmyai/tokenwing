@@ -2014,6 +2014,13 @@ struct llama_moe_stream {
     uint32_t    np_off = 0;                // slots per layer switched off at the start check (never taken back)
     bool        np_pinned = false;         // --moe-stream-slots N: the check reports, it gives nothing back
     void        np_start(int64_t kv_host, int64_t compute_host);   // llama_context, after the first reserve
+    int64_t     start_give_back(int64_t bytes);                    // slots switched off before any is filled (np_start, cap_settle)
+    int64_t     cap_margin_b = 0;                                  // the plan's margin under a process memory cap
+    bool        cap_settled  = false;
+    bool        cap_pinned   = false;                              // --moe-stream-slots N: the check gives nothing back
+    uint32_t    cap_off      = 0;                                  // slots per layer cap_settle gave back
+    bool        cap_settle_due() const;                            // llama_context: fixed pools under a process memory cap, not checked yet
+    void        cap_settle();                                      // llama_context, before the start fill: the pools get what the cap really has left
     void        np_call_start(bool decode);                        // set_decode
     int64_t     np_pool_ram();                                     // the pools' pages that hold RAM
     void        np_print() const;

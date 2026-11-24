@@ -806,24 +806,11 @@ static const int64_t MOE_STREAM_CAP_MARGIN = (int64_t) 1 << 30;
 static int64_t os_plan_cap_margin() { return MOE_STREAM_CAP_MARGIN; }
 #else
 static const int64_t MOE_STREAM_CAP_MARGIN = (int64_t) 256 << 20;
-// At startup (before libggml-cuda code pages, CUDA host structures, and pinned H2D staging rings are faulted in),
-// a Linux cgroup without swap needs ~1.5 GiB of margin above pools + other_bytes to avoid direct-reclaim thrashing.
+// The plan's margin under a process memory cap. Memory that is only taken after the plan (the GPU libraries' code pages, the
+// driver's host structures, staging buffers) differs by build and by system, so it is not guessed here: the first context
+// measures the cap's real room and gives slots back when the pools do not fit (llama_moe_stream::cap_settle)
 static int64_t os_plan_cap_margin() {
 #if defined(__linux__) && !defined(MOE_STREAM_TEST_NO_LINUX)
-    FILE * f = fopen("/proc/meminfo", "r");
-    if (f != nullptr) {
-        char ln[128];
-        long long sw_kb = -1;
-        while (fgets(ln, sizeof(ln), f)) {
-            if (sscanf(ln, "SwapTotal: %lld kB", &sw_kb) == 1) {
-                break;
-            }
-        }
-        fclose(f);
-        if (sw_kb == 0) {
-            return (int64_t) 3584 << 20;
-        }
-    }
     return (int64_t) 512 << 20;
 #else
     return MOE_STREAM_CAP_MARGIN;
@@ -3023,6 +3010,7 @@ llama_moe_stream::llama_moe_stream(
     const int64_t cap_zero = 0;
 #endif
     const int64_t plan_cap_margin = own_cap.has ? os_plan_cap_margin() : MOE_STREAM_CAP_MARGIN;
+    cap_margin_b = plan_cap_margin;
     const int64_t zero_cap_room = own_cap.has ? std::max<int64_t>(0, (int64_t) ((double) (own_cap.room() - plan_cap_margin - cap_gpu - cap_zero)/(1.0 + pt_frac))) : -1;
     if (n_streamed > 0 && mem_available > 0) {
         fprintf(stderr, "%s: RAM limit: MemAvailable %lld MiB - keep-free %lld MiB = %lld MiB; %s; decided by: %s\n", __func__,
@@ -14727,7 +14715,7 @@ void llama_moe_stream::print_stats() const {
             int64_t un = 0, ca = 0;
             const bool now = llama_moe_stream_cap_now(&un, &ca) && ca >= OS_CG_CACHE_SHOWN;
             fprintf(stderr, "moe-stream: process memory cap %lld MiB, peak use %lld MiB, margin to the cap %lld MiB (planned margin %lld MiB)%s\n",
-                    (long long) (mx >> 20), (long long) (pk >> 20), (long long) (mg >> 20), (long long) (MOE_STREAM_CAP_MARGIN >> 20),
+                    (long long) (mx >> 20), (long long) (pk >> 20), (long long) (mg >> 20), (long long) ((cap_margin_b > 0 ? cap_margin_b : MOE_STREAM_CAP_MARGIN) >> 20),
                     now ? format("; the peak counts file cache: in use now %lld MiB without %lld MiB of file cache the kernel can free, room now %lld MiB",
                                  (long long) (un >> 20), (long long) (ca >> 20), (long long) ((mx - un) >> 20)).c_str() : "");
         }
@@ -25632,6 +25620,76 @@ int64_t llama_moe_stream::np_pool_ram() {
     return b;
 }
 
+// mtx not held. Before any slot holds an expert: `bytes` more are needed outside the pools - that many slots (rounded up, the
+// same count in every layer, never under the kept minimum) are switched off and their pages returned. Returns the count per layer
+int64_t llama_moe_stream::start_give_back(int64_t bytes) {
+    std::unique_lock<std::mutex> lock(mtx);
+    int64_t row = 0;
+    for (const int32_t il : il_of_moe) {
+        row += (int64_t) layers[il]->block_bytes;
+    }
+    if (row <= 0 || bytes <= 0) {
+        return 0;
+    }
+    const uint32_t keep = (uint32_t) std::min<int64_t>(rest_share(), el_low_keep());
+    const int64_t  n    = std::max<int64_t>(0, std::min<int64_t>((bytes + row - 1)/row, (int64_t) rest_share() - keep));
+    for (const int32_t il : il_of_moe) {
+        auto & sl = *layers[il];
+        int64_t left = n;
+        for (int32_t s = (int32_t) std::min(sl.n_slots, n_slots) - 1; s >= 0 && left > 0; s--) {
+            if (!sl.slot_off[s] && sl.slot_state[s] == MOE_STREAM_SLOT_EMPTY) {
+                dz_forget(sl, s);
+                sl.slot_off[s] = 1;
+                sl.share      -= 1;
+                el_release_slot(sl, s);
+                left--;
+            }
+        }
+    }
+    np_off += (uint32_t) n;
+    el_recount();
+    return n;
+}
+
+// Is the cap check below due? (fixed pools under a process memory cap, slots not pinned, not done yet)
+bool llama_moe_stream::cap_settle_due() const {
+#if defined(__linux__) && !defined(MOE_STREAM_TEST_NO_LINUX)
+    return !cap_settled && !el_on && !cap_pinned && !np_pinned && !il_of_moe.empty() && n_slots > 0 && os_mem_cap_get().has;
+#else
+    return false;
+#endif
+}
+
+// The first context, after its first reserve, with the host KV cache and compute buffers written (so the cap's count holds them),
+// before the pools are filled: the pools get what the process's memory cap really has left. What the cap charges beyond the plan
+// (program pages of the GPU libraries, driver memory, staging buffers; in some containers also file cache) is in its count by now,
+// whatever the build or the system. When the empty slots plus the plan's margin do not fit, slots are given back; else nothing.
+void llama_moe_stream::cap_settle() {
+    cap_settled = true;
+    const os_mem_cap c = os_mem_cap_get();
+    if (!c.has) {
+        return;
+    }
+    int64_t row = 0;
+    for (const int32_t il : il_of_moe) {
+        row += (int64_t) layers[il]->block_bytes;
+    }
+    static const int64_t test_extra = getenv("MOE_STREAM_TEST_CAP_SETTLE_EXTRA") ? atoll(getenv("MOE_STREAM_TEST_CAP_SETTLE_EXTRA")) : 0;   // TEST ONLY: the cap "has" this much less
+    const double  M       = 1024.0*1024.0;
+    const int64_t to_come = (int64_t) rest_share()*row - np_pool_ram();   // the switched-on slots that hold no RAM yet
+    const int64_t room    = c.room() - test_extra;
+    const int64_t short_b = to_come + cap_margin_b - room;
+    if (short_b <= 0) {
+        fprintf(stderr, "llama_moe_stream: process memory cap at the start: room %.0f MiB, the pools still take %.0f MiB + the %.0f MiB margin: fits\n",
+                room/M, to_come/M, cap_margin_b/M);
+        return;
+    }
+    const int64_t n = start_give_back(short_b);
+    cap_off = (uint32_t) n;
+    fprintf(stderr, "llama_moe_stream: process memory cap at the start: room %.0f MiB, the pools still take %.0f MiB + the %.0f MiB margin: %.0f MiB short - "
+            "%lld slots per layer given back (%u of %u on), the run goes on\n", room/M, to_come/M, cap_margin_b/M, short_b/M, (long long) n, rest_share(), n_slots);
+}
+
 // the first context, after its first reserve: the real need against the plan, before any slot holds an expert
 void llama_moe_stream::np_start(int64_t kv_host, int64_t compute_host) {
     np_started = true;
@@ -25654,28 +25712,7 @@ void llama_moe_stream::np_start(int64_t kv_host, int64_t compute_host) {
         fprintf(stderr, "llama_moe_stream: non-pool memory: this run needs %.1f MiB more than planned; the slots are pinned (--moe-stream-slots), nothing is given back\n", (real - np_planned)/M);
         return;
     }
-    std::unique_lock<std::mutex> lock(mtx);
-    int64_t row = 0;
-    for (const int32_t il : il_of_moe) {
-        row += (int64_t) layers[il]->block_bytes;
-    }
-    const uint32_t keep = (uint32_t) std::min<int64_t>(rest_share(), el_low_keep());
-    const int64_t  n    = std::min<int64_t>((real - np_planned + row - 1)/row, (int64_t) rest_share() - keep);
-    for (const int32_t il : il_of_moe) {
-        auto & sl = *layers[il];
-        int64_t left = n;
-        for (int32_t s = (int32_t) std::min(sl.n_slots, n_slots) - 1; s >= 0 && left > 0; s--) {
-            if (!sl.slot_off[s] && sl.slot_state[s] == MOE_STREAM_SLOT_EMPTY) {
-                dz_forget(sl, s);
-                sl.slot_off[s] = 1;
-                sl.share      -= 1;
-                el_release_slot(sl, s);
-                left--;
-            }
-        }
-    }
-    np_off += (uint32_t) n;
-    el_recount();
+    const int64_t n = start_give_back(real - np_planned);
     fprintf(stderr, "llama_moe_stream: non-pool memory: this run needs %.1f MiB more than planned: %lld slots per layer given back (%u of %u on), the run goes on\n",
             (real - np_planned)/M, (long long) n, rest_share(), n_slots);
 }

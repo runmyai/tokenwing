@@ -2962,6 +2962,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             ms.np_cache_ram = params.moe_stream_nonpool->cache_ram;
             ms.np_pinned  = params.moe_stream_nonpool->pinned;
         }
+        if (params.moe_stream_slots > 0) {
+            pimpl->moe_stream->cap_pinned = true;   // a slot count given by hand is kept as it is by the memory-cap check
+        }
     }
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;

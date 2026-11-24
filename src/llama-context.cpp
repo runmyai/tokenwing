@@ -814,6 +814,23 @@ llama_context::llama_context(
             }
             ms->el_note_ctx_host(kv_host, compute_host);
         }
+        if (!model.no_alloc() && ms->cap_settle_due()) {
+            // Fixed pools under a process memory cap: the host KV cache and compute buffers are written once, so the cap's count
+            // holds them, then the pools get what the cap really has left (before the start fill)
+            if (memory && !ms->np_started) {
+                int64_t kv_host = 0;
+                for (const auto & [buft, size] : memory->memory_breakdown()) {
+                    kv_host += ggml_backend_buft_is_host(buft) ? (int64_t) size : 0;
+                }
+                if (kv_host > 0) {
+                    memory->clear(true);
+                }
+            }
+            if (!ms->np_started && sched) {
+                ggml_backend_sched_clear_host_buffers(sched.get());
+            }
+            ms->cap_settle();
+        }
         ms->idle_arm(/* may_fill = */ !model.no_alloc());
     }
 }

@@ -1670,8 +1670,17 @@ struct llama_moe_stream {
     ggml_backend_buffer_t tailw_zero_pin_buf = nullptr;
     uint8_t *             tailw_zero_pin_ptr = nullptr;
     size_t                tailw_zero_pin_cap = 0;
+    ggml_backend_buffer_t vf_pring_buf       = nullptr;
+    char *                vf_pring_ptr       = nullptr;
+    size_t                vf_pring_cap       = 0;
+    size_t                vf_pring_head      = 0;
+    int                   vf_pring_slice     = 0;
+    ggml_backend_event_t  vf_pring_ev[PRING_SLICES] = {};
+    bool                  vf_pring_ev_rec[PRING_SLICES] = {};
     void                  pring_ensure();
     void                  tailw_set_async_staged(ggml_tensor * D, const char * src, size_t dst_off, size_t nbytes);
+    void                  vf_pring_ensure();
+    void                  vf_set_async_staged(ggml_tensor * D, const char * src, size_t dst_off, size_t nbytes);
 
     std::vector<std::vector<uint8_t>> lm_routed_mask;   // [il][expert]: 1 if routed in lm_phase 1
     void set_lm_routed_ids(int32_t il, const int32_t * ids_host, int64_t n);

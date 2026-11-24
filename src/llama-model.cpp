@@ -2709,7 +2709,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.prefill_fast        = pf_fast;
         p1.mmq_moe_opt         = pf_fast || params.moe_stream_mmq_moe_opt   == 1;
         p1.gpu_moe_fused       = pf_fast || params.moe_stream_gpu_moe_fused == 1;
-        p1.pinned_ring         = params.moe_stream_pinned_ring > 0 ? params.moe_stream_pinned_ring : 0;
+        p1.pinned_ring         = params.moe_stream_pinned_ring > 0 ? params.moe_stream_pinned_ring : (pf_fast ? ((int64_t) 64 << 20) : 0);
         p1.lm_bf16             = pf_fast || params.moe_stream_lm_bf16      == 1;
         p1.lend_output         = params.moe_stream_lend_output == 1;
         p1.qsa_fused           = pf_fast || params.moe_stream_qsa_fused    == 1;

@@ -126,6 +126,26 @@ struct ggml_quant_plugin_api {
 
 typedef const struct ggml_quant_plugin_api * (*ggml_quant_plugin_get_api_t)(void);
 
+// Optional ABI-v2 extension symbol resolved via dlsym/GetProcAddress (keeps struct layouts 100% unchanged):
+// Computes dst_ptrs[m][r] = dot(row(vx + r * bx), vy_ptrs[m]) for r in 0..n_rows-1 (n_rows >= 4, n_rows % 4 == 0)
+// and m in 0..m_cnt-1 (1 <= m_cnt <= 16). Unpacks each weight row once across all m_cnt tokens.
+// Returns 0 on success, non-zero to fall back to vec_dot_x4 / vec_dot.
+#define GGML_QUANT_PLUGIN_VEC_DOT_X4_M_NAME "ggml_quant_plugin_vec_dot_x4_m"
+typedef int32_t (*ggml_quant_plugin_vec_dot_x4_m_t)(
+        int32_t ext_idx,
+        int n,
+        int n_rows,
+        int m_cnt,
+        float * const * dst_ptrs,
+        const void * vx,
+        size_t bx,
+        const float * const * vy_ptrs,
+        int pf);
+
+#ifdef GGML_API
+GGML_API ggml_quant_plugin_vec_dot_x4_m_t ggml_quant_plugin_get_vec_dot_x4_m(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

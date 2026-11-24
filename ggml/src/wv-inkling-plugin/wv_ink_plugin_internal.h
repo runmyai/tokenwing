@@ -1,10 +1,6 @@
 #pragma once
 
-#if defined(__has_include) && __has_include("ggml-quant-plugin.h")
 #include "ggml-quant-plugin.h"
-#else
-#include "../../include/ggml-quant-plugin.h"
-#endif
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -228,6 +224,10 @@ ggml_quant_plugin_vec_dot_x4_t wv_ink_get_vec_dot_x4_ext3(void);
 
 int32_t wv_ink_repack_expert_slot_cpu(
     int32_t ggml_type_id, void * dst_slot, const void * src_plain, int64_t ne0, int64_t ne1);
+
+int32_t wv_ink_vec_dot_x4_m_cpu(
+    int32_t ext_idx, int n, int n_rows, int m_cnt, float * const * dst_ptrs,
+    const void * vx, size_t bx, const float * const * vy_ptrs, int pf);
 
 #ifdef WV_INK_PLUGIN_ENABLE_CUDA
 int32_t wv_ink_cuda_load_aux(const uint8_t * aux_data, size_t aux_size, const wv_ink_host_tables * htab);

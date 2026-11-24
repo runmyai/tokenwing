@@ -201,3 +201,16 @@ void wv_ink_set_error(const char * msg) {
 WV_INK_EXPORT const struct ggml_quant_plugin_api * ggml_quant_plugin_get_api(void) {
     return &g_wv_ink_api;
 }
+
+WV_INK_EXPORT int32_t ggml_quant_plugin_vec_dot_x4_m(
+        int32_t ext_idx,
+        int n,
+        int n_rows,
+        int m_cnt,
+        float * const * dst_ptrs,
+        const void * vx,
+        size_t bx,
+        const float * const * vy_ptrs,
+        int pf) {
+    return wv_ink_vec_dot_x4_m_cpu(ext_idx, n, n_rows, m_cnt, dst_ptrs, vx, bx, vy_ptrs, pf);
+}

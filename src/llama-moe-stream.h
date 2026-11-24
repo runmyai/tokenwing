@@ -457,6 +457,7 @@ struct llama_moe_stream_layer {
     // features off: cap = n_slots, share = n_slots, nothing is ever off (the plain layout).
     uint32_t              cap   = 0;
     uint32_t              share = 0;
+    uint32_t              el_self_lent = 0;  // mtx: slots temporarily lent for the engine's own prompt working memory (restored at call end)
     std::vector<uint8_t>  slot_off;       // [cap + n_zero]
     std::vector<int32_t>  el_drop_e;      // experts a give-back dropped (refill candidates; most recent last)
     std::vector<float>    el_drop_v;      // their keep values when dropped
@@ -1250,6 +1251,7 @@ struct llama_moe_stream {
     void vf_cb_take(vf_job_t & j);
     void cb_claim(llama_moe_stream_layer & B, int32_t v, int32_t e, vf_job_t & j);
     bool tail_claim_cb_slot(int32_t g, int32_t p, int32_t il, int32_t e, vf_job_t & out_j);
+    int32_t run_vacate_cb_jobs(int32_t g, std::deque<vf_job_t> & cb_jobs);
     bool tail_copy_back(int32_t g, int32_t p, int32_t il, int32_t e);
     void vf_cb_copy(vf_job_t & j, bool async);
     void vf_cb_settle(vf_job_t & j);
@@ -1553,7 +1555,7 @@ struct llama_moe_stream {
     };
     ca_job_t ca_job;                   // vf_mtx: the one job out
     ggml_backend_event_t ca_ev_c = nullptr, ca_ev_a = nullptr;   // the compute stream -> the uploader, the uploader -> the compute stream
-    static constexpr size_t H2D_EV_RING = 64;
+    static constexpr size_t H2D_EV_RING = 256;
     ggml_backend_event_t  tailw_ev_ring[H2D_EV_RING] = {};
     ggml_backend_event_t  ca_ev_ring[H2D_EV_RING]    = {};
     std::mutex            h2d_ev_mtx;
@@ -1803,7 +1805,7 @@ struct llama_moe_stream {
     int64_t  dz_age_used = 0;                      // the age the last upkeep used (in the layer's expert uses; the stats line)
     double   dz_probe_ms_sum = 0.0, dz_probe_ms_max = 0.0, dz_hold_ms_max = 0.0, dz_lock_us_sum = 0.0, dz_unlock_us_sum = 0.0;
     int64_t  el_n_settle_wait = 0;                 // idle looks a take-back waited for the settle rule
-    int64_t  el_others_last = -1;                  // the other programs' memory at the last look (the settle rule)
+    int64_t  el_others_last = INT64_MIN;           // the other programs' memory at the last look (INT64_MIN = unread/unavailable)
     int      el_own_cg = -1;                       // our cgroup holds only this process (1), not (0), not read yet (-1)
     int64_t  el_os_others();                       // OS layer: MemTotal - MemFree - our own                       // the free RAM at the last look (a fall = an app growing - no take-back)
     int64_t  el_settle_fall = (int64_t) 64 << 20;  // opts settlefall=: a fall between two looks that counts as "free RAM falling"
@@ -1965,7 +1967,20 @@ struct llama_moe_stream {
     int64_t  el_os_memfree();
     int64_t  el_old_file_cache();   // Linux: file cache the kernel drops without a write (0 elsewhere)
     void     el_at_call_start(bool decode, int32_t n_tok);                        // set_decode
-    void     el_at_call_end(bool complete);                                       // end_call, mtx held
+    void     el_at_call_end(bool complete, const el_mem & end_mem);               // end_call, mtx held
+    std::atomic<bool>    el_ctx_ready{false};                                     // first context's host KV + compute buffers accounted before idle_arm
+    std::atomic<int64_t> el_self_budget{0};                                       // running prompt call's own ephemeral host working memory (bytes)
+    std::atomic<bool>    el_self_lent_any{false};                                 // at least one layer holds el_self_lent > 0
+    int64_t  el_n_ctx_trim = 0, el_ctx_trim_slots = 0;                            // EMPTY slots switched off for unbudgeted host KV/compute before fill
+    int64_t  el_n_self_lend = 0, el_n_self_restore = 0, el_self_lent_slots = 0;   // prompt working-memory lends & immediate restores (0 settle freeze)
+    void     el_note_ctx_host(int64_t kv_host, int64_t compute_host);             // llama_context, before idle_arm
+    void     el_self_call_start(int64_t need, const el_mem & m);                  // mtx held, boundary: lend for prompt working memory without cooldown
+    void     el_self_release(const el_mem & m);                                   // mtx held, boundary: restore self-lent slots right after ~lm_reset_t
+    void     el_add_self_budget(int64_t extra_bytes) {
+        if (extra_bytes > 0) {
+            el_self_budget.fetch_add(extra_bytes, std::memory_order_relaxed);
+        }
+    }
     void     el_at_layer(llama_moe_stream_layer & sl, bool decode, int32_t wave, int64_t n_tok);   // remap_needed, mtx: a prompt's give-back
     void     el_finish_prompt_gives();                                            // mtx, boundary
     void     el_reply_end();                                                      // API: llama_moe_stream_idle

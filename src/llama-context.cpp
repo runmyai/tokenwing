@@ -790,6 +790,30 @@ llama_context::llama_context(
     // The context (and the VRAM expert pool) is built - idle-time loading may start after its pause (off: nothing); with
     // --moe-stream-idle-load 2 the RAM pools are filled here first (not for a model loaded without memory)
     if (auto * ms = ctx_moe_stream()) {
+        if (!model.no_alloc() && ms->el_on && !ms->el_ctx_ready.load(std::memory_order_relaxed)) {
+            int64_t kv_host = 0, compute_host = 0;
+            if (memory) {
+                for (const auto & [buft, size] : memory->memory_breakdown()) {
+                    kv_host += ggml_backend_buft_is_host(buft) ? (int64_t) size : 0;
+                }
+                if (!ms->np_started && kv_host > 0) {
+                    memory->clear(true);   // fault pageable host KV pages before idle_arm / el_note_ctx_host so prefill never drains MemFree
+                }
+            }
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                compute_host += ggml_backend_buft_is_host(backend_buft[i])
+                    ? (int64_t) ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]) : 0;
+            }
+            if (!ms->np_started && sched) {
+                ggml_backend_sched_clear_host_buffers(sched.get());
+            }
+            if (backend_cpu != nullptr && sched &&
+                    ggml_backend_sched_get_buffer_type(sched.get(), backend_cpu) == ggml_backend_cpu_buffer_type()) {
+                rg_cb_counted = std::max<int64_t>(rg_cb_counted,
+                    (int64_t) ggml_backend_sched_get_buffer_size(sched.get(), backend_cpu));
+            }
+            ms->el_note_ctx_host(kv_host, compute_host);
+        }
         ms->idle_arm(/* may_fill = */ !model.no_alloc());
     }
 }
@@ -1210,6 +1234,11 @@ void llama_context::sched_reserve() {
             compute_host += ggml_backend_buft_is_host(backend_buft[i]) ? (int64_t) ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]) : 0;
         }
         ggml_backend_sched_clear_host_buffers(sched.get());
+        if (backend_cpu != nullptr &&
+                ggml_backend_sched_get_buffer_type(sched.get(), backend_cpu) == ggml_backend_cpu_buffer_type()) {
+            rg_cb_counted = std::max<int64_t>(rg_cb_counted,
+                (int64_t) ggml_backend_sched_get_buffer_size(sched.get(), backend_cpu));
+        }
         ms->np_start(kv_host, compute_host);
     }
 
@@ -2670,7 +2699,9 @@ int64_t llama_context::rg_call_need(uint32_t n_tokens_all, const llama_memory_co
     const auto & hparams = model.hparams;
     const size_t elt = cparams.flash_attn ? 2 : 4;   // the mask's element (build_attn_inp_kq_mask)
     int64_t need = 0;
-    if (lm_layer_major_ok(n_tokens_all) && ggml_backend_dev_type(model.dev_layer(0)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+    const bool host_lm = ggml_backend_dev_type(model.dev_layer(0)) == GGML_BACKEND_DEVICE_TYPE_CPU ||
+                         llama_moe_stream_dev_is_uma(model.dev_layer(0));
+    if (lm_layer_major_ok(n_tokens_all) && host_lm) {
         need += (int64_t) n_tokens_all * lm_call_bytes_sum(hparams, !lm_group_test());
     }
     need += (int64_t) mctx.replay_keep_bytes(elt);
@@ -3385,6 +3416,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (lm_output_lent && !lm_output_backup.empty() && model.output) {
                 synchronize();
                 ggml_backend_tensor_set(model.output, lm_output_backup.data(), 0, lm_output_backup.size());
+                std::vector<uint8_t>().swap(lm_output_backup);
                 lm_output_lent = false;
             }
         };
@@ -3492,6 +3524,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT(ggml_backend_tensor_alloc(hbuf_only.get(), lm_hid, hbase) == GGML_STATUS_SUCCESS);
                 synchronize();
                 if (lm_output_backup.size() != out_bytes) {
+                    if (auto * ms = ctx_moe_stream(); ms && ms->el_on && out_bytes > lm_output_backup.size()) {
+                        ms->el_add_self_budget((int64_t) (out_bytes - lm_output_backup.size()));
+                    }
                     lm_output_backup.resize(out_bytes);
                     ggml_backend_tensor_get(model.output, lm_output_backup.data(), 0, out_bytes);
                 }

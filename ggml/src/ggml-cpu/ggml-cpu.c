@@ -1864,6 +1864,10 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 #ifdef GGML_CPU_HAVE_MXFP4_X4
     const ggml_vec_dot_x4_t x4fn = x4 ? ggml_cpu_vec_dot_x4(type) : NULL;   // the type's 4-row kernel, if it has one
 #endif
+    const ggml_quant_plugin_vec_dot_x4_m_t x4m_fn =
+        (type >= GGML_TYPE_EXT0 && type <= GGML_TYPE_EXT5 && vec_dot_type == GGML_TYPE_F32)
+            ? ggml_quant_plugin_get_vec_dot_x4_m()
+            : NULL;
 
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
@@ -1871,6 +1875,50 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     float tmp[16];
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+        const int64_t ir1_lim = MIN(iir1 + blck_1, ir1_end);
+        const int     m_cnt   = (int) (ir1_lim - iir1);
+        if (x4m_fn != NULL && m_cnt >= 2) {
+            const float * vy_ptrs[16];
+            float *       dst_cols[16];
+            for (int m = 0; m < m_cnt; ++m) {
+                struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, iir1 + m);
+                const int     id  = rm.i1;
+                const int64_t i11 = id % ne11;
+                const int64_t i12 = rm.i2;
+                const char *  s1c = (const char *) wdata +
+                    (src1_cont || src1->type != vec_dot_type
+                    ? (i11      + i12*ne11)*row_size
+                    : (i11*nb11 + i12*nb12));
+                vy_ptrs[m]  = (const float *) s1c;
+                dst_cols[m] = (float *) ((char *) dst->data + (id*nb1 + i12*nb2));
+            }
+            const int n_r4 = (int) ((ir0_end - ir0_start) & ~(int64_t) 3);
+            bool x4m_handled = true;
+            if (n_r4 >= 4) {
+                float * dst_sub[16];
+                for (int m = 0; m < m_cnt; ++m) {
+                    dst_sub[m] = dst_cols[m] + ir0_start;
+                }
+                const int x4m_pf =
+#ifdef GGML_CPU_HAVE_MXFP4_X4
+                    x4_pf;
+#else
+                    0;
+#endif
+                if (x4m_fn((int32_t) (type - GGML_TYPE_EXT0), (int) ne00, n_r4, m_cnt,
+                           dst_sub, src0_cur + ir0_start*nb01, nb01, vy_ptrs, x4m_pf) != 0) {
+                    x4m_handled = false;
+                }
+            }
+            if (x4m_handled) {
+                for (int64_t ir0 = ir0_start + n_r4; ir0 < ir0_end; ++ir0) {
+                    for (int m = 0; m < m_cnt; ++m) {
+                        vec_dot(ne00, &dst_cols[m][ir0], 0, src0_cur + ir0*nb01, 0, vy_ptrs[m], 0, 1);
+                    }
+                }
+                continue;
+            }
+        }
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
                 const int64_t _i12 = ir1; // logical row index for this expert

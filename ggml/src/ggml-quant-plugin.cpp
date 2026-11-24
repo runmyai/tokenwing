@@ -32,9 +32,10 @@ static_assert(GGML_TYPE_EXT5 + 1 == GGML_TYPE_COUNT, "the plugin types are the l
 
 namespace {
 
-std::mutex                                  g_plugin_mu;
-std::atomic<const ggml_quant_plugin_api *>  g_plugin_api{ nullptr };
-std::string                                 g_plugin_path;
+std::mutex                                         g_plugin_mu;
+std::atomic<const ggml_quant_plugin_api *>         g_plugin_api{ nullptr };
+std::atomic<ggml_quant_plugin_vec_dot_x4_m_t>      g_plugin_vec_dot_x4_m{ nullptr };
+std::string                                        g_plugin_path;
 bool                                        g_ext_has_cuda[GGML_QUANT_PLUGIN_MAX_TYPES] = {};
 std::vector<void (*)(const ggml_quant_plugin_api *)> g_cpu_hooks;
 
@@ -225,8 +226,12 @@ bool ggml_quant_plugin_load(const char * path) {
             g_ext_has_cuda[i] = (info.has_cuda != 0);
         }
 
+        const auto opt_x4m = reinterpret_cast<ggml_quant_plugin_vec_dot_x4_m_t>(
+            resolve_sym(h, GGML_QUANT_PLUGIN_VEC_DOT_X4_M_NAME));
+
         g_plugin_handle = h;
         g_plugin_path   = path;
+        g_plugin_vec_dot_x4_m.store(opt_x4m, std::memory_order_release);
         g_plugin_api.store(api, std::memory_order_release);
         loaded_api   = api;
         hooks_to_run = g_cpu_hooks;
@@ -246,6 +251,10 @@ bool ggml_quant_plugin_load(const char * path) {
 
 const struct ggml_quant_plugin_api * ggml_quant_plugin_get(void) {
     return g_plugin_api.load(std::memory_order_acquire);
+}
+
+ggml_quant_plugin_vec_dot_x4_m_t ggml_quant_plugin_get_vec_dot_x4_m(void) {
+    return g_plugin_vec_dot_x4_m.load(std::memory_order_acquire);
 }
 
 bool ggml_quant_plugin_has_cuda(enum ggml_type type, bool is_id) {

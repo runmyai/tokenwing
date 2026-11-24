@@ -200,11 +200,18 @@ static std::vector<llama_token> generate_lctx_m1(
         const std::vector<llama_token> & prompt_ids,
         int32_t max_new_tokens,
         int32_t n_batch,
-        double * out_decode_sec = nullptr) {
+        double * out_decode_sec = nullptr,
+        double * out_prefill_sec = nullptr) {
     const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(lctx)));
     llama_memory_clear(llama_get_memory(lctx), true);
+    sync_gpu_dev();
+    const double tp0 = now_sec();
     if (eval_tokens_chunked(lctx, prompt_ids, 0, n_batch, true) != 0) {
         throw std::runtime_error("generate_lctx_m1: prefill failed");
+    }
+    sync_gpu_dev();
+    if (out_prefill_sec) {
+        *out_prefill_sec = now_sec() - tp0;
     }
     std::vector<llama_token> out;
     out.reserve((size_t) max_new_tokens);
@@ -1237,10 +1244,11 @@ static int run_side_b_stream(common_params & params, const Ink2BenchArgs & bargs
     const double prefill_dt  = now_sec() - tp0;
     const double prefill_tps = 512.0 / prefill_dt;
 
-    // 64-token M=1 streaming decode on `code_cont_512` & `math`
-    double m1_cc_sec = 0.0, m1_ma_sec = 0.0;
-    auto m1_cc = generate_lctx_m1(lctx, p512,    65, params.n_batch, &m1_cc_sec);
+    // 64-token M=1 streaming decode on `code_cont_512` & `math` (also captures warmed RAM-pool S=512 prefill!)
+    double m1_cc_sec = 0.0, m1_ma_sec = 0.0, prefill_warm_dt = 0.0;
+    auto m1_cc = generate_lctx_m1(lctx, p512,    65, params.n_batch, &m1_cc_sec, &prefill_warm_dt);
     auto m1_ma = generate_lctx_m1(lctx, pids_ma, 65, params.n_batch, &m1_ma_sec);
+    const double prefill_warm_tps = prefill_warm_dt > 0.0 ? 512.0 / prefill_warm_dt : 0.0;
 
     // 64-token MTP-8 speculative streaming decode on `code_cont_512` & `math`
     LctxSpecStats st_cc {}, st_ma {};
@@ -1278,6 +1286,10 @@ static int run_side_b_stream(common_params & params, const Ink2BenchArgs & bargs
         { "prefill_s512", {
             { "ms",    round2(prefill_dt * 1000.0) },
             { "tok_s", round2(prefill_tps) },
+        }},
+        { "prefill_s512_warm", {
+            { "ms",    round2(prefill_warm_dt * 1000.0) },
+            { "tok_s", round2(prefill_warm_tps) },
         }},
         { "code_cont_512", {
             { "m1_tok_s",            round2(64.0 / m1_cc_sec) },

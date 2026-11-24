@@ -15145,6 +15145,10 @@ void llama_moe_stream::vx_load_list() {
         if (from_model) {
             std::string blob;
             if (!model_file_blob("vram_experts", blob)) {
+                if (p1.vram_experts_auto) {
+                    vx_lists_by_id("not in model file");
+                    return;
+                }
                 throw std::runtime_error("the model file has no vram_experts data (tokenwing-tools/experts/make_model_file.py --vram-list)");
             }
             j = json::parse(blob);

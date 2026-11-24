@@ -1128,6 +1128,14 @@ static common_chat_params_init_fn common_chat_template_detect_params_init(const 
         return common_chat_params_init_gpt_oss;
     }
 
+    // Thinking Machines Inkling-2-Mini - <|message_model|><|content_thinking|>/<|content_text|>/<|content_invoke_tool_json|>
+    if (src.find("<|message_model|>") != std::string::npos &&
+        src.find("<|content_thinking|>") != std::string::npos &&
+        src.find("<|content_invoke_tool_json|>") != std::string::npos) {
+        LOG_DBG("Using specialized template: Inkling-2\n");
+        return common_chat_params_init_inkling2;
+    }
+
     // Muse Glimmer format using " to=<recipient>" recipients and <|eom|>/<|eot|> message terminators.
     if (src.find("<atem:function_calls>") != std::string::npos && src.find("<|eom|>") != std::string::npos) {
         LOG_DBG("Using specialized template: Muse Glimmer\n");

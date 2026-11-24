@@ -1326,8 +1326,20 @@ bool llama_memory_recurrent_context::apply() {
     r.n    = mem->n;
     r.rs_z = mem->rs_z;
     r.src0.resize(mem->n);
+    r.s_copy.resize(mem->n);
     for (uint32_t i = 0; i < mem->n; ++i) {
-        r.src0[i] = mem->cells[mem->head + i].src0;
+        const uint32_t cell_idx = mem->head + i;
+        const int32_t  src0     = mem->cells[cell_idx].src0;
+        r.src0[i] = src0;
+        uint32_t idx = 0;
+        if (mem->n_rs_seq != 0 && !mem->cells[cell_idx].seq_id.empty()) {
+            const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
+            if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
+                idx = mem->rs_idx[seq];
+                mem->rs_idx[seq] = 0;
+            }
+        }
+        r.s_copy[i] = (int32_t)(idx * mem->size) + src0;
     }
 
     return true;
@@ -1397,6 +1409,11 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
+    if (!ubatches.empty() && i_next < slot_rec.size() && slot_rec[i_next].ok &&
+        i >= 0 && (size_t) i < slot_rec[i_next].s_copy.size()) {
+        return slot_rec[i_next].s_copy[(size_t) i];
+    }
+
     const uint32_t cell_idx = i + mem->head;
     const int32_t  src0     = mem->cells[cell_idx].src0;
 

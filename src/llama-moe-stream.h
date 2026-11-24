@@ -2991,6 +2991,12 @@ struct llama_moe_stream {
     std::deque<llama_moe_stream_job> q_idle;   // idle-time loads, taken only when nothing else waits
     std::deque<llama_moe_stream_job> q_refill; // elastic RAM's refill reads: after every needed and guessed read, el_refill_io at a time
     std::vector<std::thread>    io_threads;
+    std::vector<std::unique_ptr<llama_file>> io_files;
+    int io_fd(int ith) const {
+        return ith >= 0 && (size_t) ith < io_files.size() && io_files[(size_t) ith]
+            ? io_files[(size_t) ith]->file_id()
+            : file.file_id();
+    }
     bool                        io_stop = false;
     int32_t                     n_inflight = 0;      // reads in flight right now
     // Measured: a needed read takes 0.76 ms on an idle drive and ~4.7 ms with

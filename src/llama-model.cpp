@@ -2823,6 +2823,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.wl_dev_of            = std::move(wl_dev_of);
         p1.wl_ubatch            = params.moe_stream_ubatch > 0 ? params.moe_stream_ubatch : 512;
         p1.wl_by_device         = wl_spec || !auto_devs.empty();
+        uint32_t eff_gpu_waves  = (!is_looped_moe && params.moe_stream_gpu_waves > 0) ? (uint32_t) params.moe_stream_gpu_waves : 0;
+        if (is_looped_moe && params.moe_stream_gpu_waves > 0 && ms_pool_dev != nullptr &&
+                p1.vram_free > 0 && p1.vram_follow && !params.moe_stream_cpu_repack && !p1.elastic && !p1.shares) {
+            eff_gpu_waves = ((params.moe_stream_auto_mask & (1u << 6)) != 0 && params.moe_stream_gpu_waves >= 64)
+                          ? 64u : (uint32_t) params.moe_stream_gpu_waves;
+            if (p1.tail_wave_w <= 0) {
+                p1.tail_wave_w = 64;
+            }
+            if (p1.pinned_ring <= 0 && pf_fast && !params.moe_stream_pin) {
+                p1.pinned_ring = (int64_t) 256 << 20;
+            }
+        }
         pimpl->moe_stream = std::make_unique<llama_moe_stream>(
                 params.moe_stream,
                 params.moe_stream_log ? params.moe_stream_log : "",
@@ -2839,7 +2851,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 params.moe_stream_oracle_lead >= 0 ? (uint32_t) params.moe_stream_oracle_lead : 1,
                 params.moe_stream_chunk > 0 ? (uint32_t) params.moe_stream_chunk : 0,
                 params.moe_stream_chunk_prefetch > 0 ? (uint32_t) params.moe_stream_chunk_prefetch : 0,
-                (!is_looped_moe && params.moe_stream_gpu_waves > 0) ? (uint32_t) params.moe_stream_gpu_waves : 0,
+                eff_gpu_waves,
                 gpu_layers_n > 0 ? (uint32_t) gpu_layers_n : 0,
                 gl_list_eff,
                 /* gpu_layers_auto = */ gpu_layers_n < 0,

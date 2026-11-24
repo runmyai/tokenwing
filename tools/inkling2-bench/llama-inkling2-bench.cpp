@@ -1228,7 +1228,7 @@ static int run_side_b_stream(common_params & params, const Ink2BenchArgs & bargs
         : 0.0;
 
     auto tmpls   = common_chat_templates_init(model, params.chat_template);
-    auto ids_2k  = make_long_ids(model, 1024);
+    auto ids_2k  = make_long_ids(model, 2048);
     std::vector<llama_token> p512(ids_2k.begin(), ids_2k.begin() + 512);
     auto pids_ma = encode_chat_prompt(model, tmpls.get(),
         "Prove that for every prime p > 3, p^2 - 1 is divisible by 24, and generalize to twin primes.");
@@ -1254,6 +1254,17 @@ static int run_side_b_stream(common_params & params, const Ink2BenchArgs & bargs
     LctxSpecStats st_cc {}, st_ma {};
     auto sp_cc = generate_lctx_mtp8(lctx, p512,    65, 7, params.n_batch, &st_cc);
     auto sp_ma = generate_lctx_mtp8(lctx, pids_ma, 65, 7, params.n_batch, &st_ma);
+
+    // Timed warmed S=2048 prefill (sustained multi-chunk / long-prompt prefill throughput)
+    llama_memory_clear(llama_get_memory(lctx), true);
+    sync_gpu_dev();
+    const double tp2k = now_sec();
+    if (eval_tokens_chunked(lctx, ids_2k, 0, params.n_batch, true) != 0) {
+        return 1;
+    }
+    sync_gpu_dev();
+    const double prefill_2k_dt  = now_sec() - tp2k;
+    const double prefill_2k_tps = 2048.0 / prefill_2k_dt;
 
     const bool cc_exact = (m1_cc == sp_cc);
     const bool ma_exact = (m1_ma == sp_ma);
@@ -1290,6 +1301,10 @@ static int run_side_b_stream(common_params & params, const Ink2BenchArgs & bargs
         { "prefill_s512_warm", {
             { "ms",    round2(prefill_warm_dt * 1000.0) },
             { "tok_s", round2(prefill_warm_tps) },
+        }},
+        { "prefill_s2048", {
+            { "ms",    round2(prefill_2k_dt * 1000.0) },
+            { "tok_s", round2(prefill_2k_tps) },
         }},
         { "code_cont_512", {
             { "m1_tok_s",            round2(64.0 / m1_cc_sec) },

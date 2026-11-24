@@ -1067,7 +1067,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             if (!has("--moe-stream-prompt-defer") && params.moe_stream_overlap == 1) {
                 params.moe_stream_prompt_defer = 1;
             }
-            if (!has("--moe-stream-gpu-waves"))          { params.moe_stream_gpu_waves          = 512; }
+            if (!has("--moe-stream-gpu-waves"))          { params.moe_stream_gpu_waves = 512; params.moe_stream_auto_mask |= (1u << 6); }
             if (!has("--moe-stream-gpu-wave-skip-zero")) { params.moe_stream_gpu_wave_skip_zero = 1; }
             if (params.moe_stream_vram_free > 0 || params.moe_stream_vram_experts > 0) {
                 if (!has("--moe-stream-prompt-split") && params.moe_stream_vram_parallel >= 1 &&

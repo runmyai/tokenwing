@@ -911,6 +911,13 @@ struct mtmd_context {
                     img_end = "\n";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_granite>(ctx_v);
                 } break;
+            case PROJECTOR_TYPE_INKLING2:
+                {
+                    // Inkling-2-Mini inserts tile embeddings directly at `<|unused_200054|>` / `<__media__>` with no wrapper tokens
+                    img_beg = "";
+                    img_end = "";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_inkling2>(ctx_v);
+                } break;
             default:
                 throw std::runtime_error(string_format("%s: unexpected vision projector type %d\n", __func__, proj));
         }
@@ -1152,10 +1159,16 @@ struct mtmd_tokenizer {
         input_text.assign(text->text, text->text_len);
 
         std::vector<const mtmd_bitmap *> bitmaps(bmps, bmps + n_bitmaps);
-        auto parts_str = split_text(input_text, ctx->media_marker);
+        std::string active_marker = ctx->media_marker;
+        if (ctx->proj_type_v() == PROJECTOR_TYPE_INKLING2 &&
+            input_text.find(active_marker) == std::string::npos &&
+            input_text.find("<|unused_200054|>") != std::string::npos) {
+            active_marker = "<|unused_200054|>";
+        }
+        auto parts_str = split_text(input_text, active_marker);
         size_t i_bm = 0;
         for (const auto & part : parts_str) {
-            if (part == ctx->media_marker) {
+            if (part == active_marker) {
                 if (i_bm >= bitmaps.size()) {
                     throw std::runtime_error(string_format("number of media markers in text (%zu) exceeds number of bitmaps (%zu)", i_bm + 1, bitmaps.size()));
                 }

@@ -117,6 +117,8 @@ struct ggml_quant_plugin_api {
     // vec_dot_x4, at any row, one or four rows at a time. Called from several I/O threads at once.
     // When dst_slot == NULL and src_plain == NULL, probes whether (ggml_type_id, ne0, ne1)
     // supports equal-byte in-slot repacking (returns 0 if supported, non-zero otherwise).
+    // Extended probe: when dst_slot == NULL, src_plain == NULL, ne0 == -1, ne1 == 0, returns 1 if
+    // the plugin's CUDA kernels (mul_mat_cuda / mul_mat_id_cuda) also natively read the repacked layout.
     int32_t  (*repack_expert_slot)(
             int32_t ggml_type_id, void * dst_slot, const void * src_plain,
             int64_t ne0, int64_t ne1);

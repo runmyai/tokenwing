@@ -217,6 +217,58 @@ struct common_speculative_impl {
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
 };
 
+// Embedded Inkling-2-Mini 4-tap MTP-8 (`DSpark`) speculative drafter running directly on `ctx_tgt`
+struct common_speculative_impl_inkling2_mtp8 : public common_speculative_impl {
+    llama_context * ctx_tgt = nullptr;
+
+    common_speculative_impl_inkling2_mtp8(
+            const common_params_speculative & params,
+            uint32_t n_seq,
+            common_speculative_type type_in = COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
+        : common_speculative_impl(
+                type_in,
+                n_seq,
+                std::min<int32_t>(7, params.draft.n_max > 0 ? params.draft.n_max : 7))
+        , ctx_tgt(params.draft.ctx_tgt) {
+        if (!ctx_tgt || !llama_model_has_inkling2_mtp(llama_get_model(ctx_tgt))) {
+            throw std::runtime_error("inkling2 mtp8 speculative drafter requires an inkling2 target context with embedded MTP weights");
+        }
+        SPC_INF("adding embedded Inkling-2-Mini MTP-8 ('%s') drafter (n_max=%d)\n",
+                common_speculative_type_to_str(type_in).c_str(), this->n_max);
+    }
+
+    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {}
+
+    bool process(const common_batch & /*batch*/) override {
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        GGML_ASSERT(dparams.size() == n_seq);
+        if (dparams.empty() || !dparams[0].drafting) {
+            return;
+        }
+        auto & dp = dparams[0];
+        int32_t k_req = this->n_max;
+        if (dp.n_max > 0 && dp.n_max < k_req) {
+            k_req = dp.n_max;
+        }
+        if (k_req <= 0) {
+            return;
+        }
+        if (dp.result_q) {
+            dp.result_q->clear();
+        }
+        llama_token draft_buf[7];
+        const int32_t n_out = llama_inkling2_mtp_draft(ctx_tgt, dp.pos0, dp.id_last, k_req, draft_buf);
+        if (n_out > 0 && dp.result) {
+            dp.result->assign(draft_buf, draft_buf + n_out);
+        }
+    }
+
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {}
+};
+
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
     common_params_speculative_draft params;
 
@@ -2469,6 +2521,12 @@ std::vector<common_speculative_type> common_speculative_types_from_gguf(const st
     }
 
     const std::string arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
+    if (arch == "inkling2") {
+        if (gguf_find_tensor(gguf_ctx.get(), "mtp.fuse_alpha.weight") >= 0) {
+            return { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        }
+        return {};
+    }
     if (arch != "dflash") {
         const uint32_t block_count = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), (arch + ".block_count").c_str()));
 
@@ -2713,6 +2771,14 @@ common_speculative_init_result::common_speculative_init_result(
     const bool spec_mtp = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const bool spec_dspark = std::find(params.speculative.types.begin(),
+                                       params.speculative.types.end(),
+                                       COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
+
+    if (!has_draft && (spec_mtp || spec_dspark) && model_tgt && llama_model_has_inkling2_mtp(model_tgt)) {
+        LOG_INF("%s: using embedded Inkling-2-Mini MTP-8 drafter on target context\n", __func__);
+        return;
+    }
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
@@ -2792,6 +2858,9 @@ common_speculative_output_limits common_speculative_get_output_limits(
 // initialization of the speculative decoding system
 //
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
+    const bool has_ink2_mtp = params.draft.ctx_tgt != nullptr &&
+                              llama_model_has_inkling2_mtp(llama_get_model(params.draft.ctx_tgt));
+
     // Compute the implementations to use based on the config and their order of preference
     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
     {
@@ -2816,9 +2885,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
-        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr || has_ink2_mtp);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
-        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr || has_ink2_mtp);
     }
 
     std::vector<std::unique_ptr<common_speculative_impl>> impls = {};
@@ -2836,7 +2905,12 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
-                impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                if (config.params.draft.ctx_dft == nullptr && has_ink2_mtp) {
+                    impls.push_back(std::make_unique<common_speculative_impl_inkling2_mtp8>(
+                            config.params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_MTP));
+                } else {
+                    impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                }
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
@@ -2844,8 +2918,13 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK: {
-                impls.push_back(std::make_unique<common_speculative_impl_draft_dflash>(
-                        config.params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK));
+                if (config.params.draft.ctx_dft == nullptr && has_ink2_mtp) {
+                    impls.push_back(std::make_unique<common_speculative_impl_inkling2_mtp8>(
+                            config.params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK));
+                } else {
+                    impls.push_back(std::make_unique<common_speculative_impl_draft_dflash>(
+                            config.params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK));
+                }
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {

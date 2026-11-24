@@ -216,6 +216,11 @@ uint32_t llama_hparams::n_embd_r() const {
         return n_embd * (n_shortconv_l_cache - 1);
     }
 
+    if (ink2_sconv_kernel > 1) {
+        // Inkling-2 causal ShortConvolution state per visit: (k - 1) * (K + V + attn_out + mlp_out)
+        return (ink2_sconv_kernel - 1) * (2 * n_embd_k_gqa() + 2 * n_embd);
+    }
+
     if (n_embd_head_kda != 0) {
         // for Kimi KDA layers
         // Conv state for Q, K, V: 3 * (d_conv - 1) * n_head * head_dim

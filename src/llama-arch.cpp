@@ -137,6 +137,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_APERTUS,          "apertus"          },
     { LLM_ARCH_MINIMAX_01,       "minimax-01"       },
     { LLM_ARCH_HRM_TEXT,         "hrm_text"         },
+    { LLM_ARCH_INKLING2,         "inkling2"         },
     { LLM_ARCH_MINIMAX_M2,       "minimax-m2"       },
     { LLM_ARCH_MINIMAX_M3,       "minimax-m3"       },
     { LLM_ARCH_COGVLM,           "cogvlm"           },
@@ -391,6 +392,29 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DENSE_2_FEAT_OUT,       "%s.dense_2_feat_out" },
     { LLM_KV_DENSE_3_FEAT_IN,        "%s.dense_3_feat_in"  },
     { LLM_KV_DENSE_3_FEAT_OUT,       "%s.dense_3_feat_out" },
+
+    // inkling2
+    { LLM_KV_INK2_UNPADDED_VOCAB_SIZE,    "%s.unpadded_vocab_size"         },
+    { LLM_KV_INK2_PADDED_HEAD_VOCAB_SIZE, "%s.padded_head_vocab_size"      },
+    { LLM_KV_INK2_IMAGE_TOKEN_ID,         "%s.image_token_id"              },
+    { LLM_KV_INK2_PHYS_BLOCK_COUNT,       "%s.phys_block_count"            },
+    { LLM_KV_INK2_LOOP_START,             "%s.loop_start"                  },
+    { LLM_KV_INK2_LOOP_END,               "%s.loop_end"                    },
+    { LLM_KV_INK2_LOOP_PASSES,            "%s.loop_passes"                 },
+    { LLM_KV_INK2_LOOP_GATE_RANK,         "%s.loop_gate_rank"              },
+    { LLM_KV_INK2_D_REL,                  "%s.attention.d_rel"             },
+    { LLM_KV_INK2_REL_EXTENT,             "%s.attention.rel_extent"        },
+    { LLM_KV_INK2_QK_L2_CLIP,             "%s.attention.qk_l2_clip"        },
+    { LLM_KV_INK2_REL_L2_CLIP,            "%s.attention.rel_l2_clip"       },
+    { LLM_KV_INK2_LOG_SCALING_FLOOR,      "%s.attention.log_scaling_floor" },
+    { LLM_KV_INK2_LOG_SCALING_ALPHA,      "%s.attention.log_scaling_alpha" },
+    { LLM_KV_INK2_SCONV_KERNEL,           "%s.sconv_kernel"                },
+    { LLM_KV_INK2_MTP_LAYER_COUNT,        "%s.mtp.layer_count"             },
+    { LLM_KV_INK2_MTP_FF_LENGTH,          "%s.mtp.feed_forward_length"     },
+    { LLM_KV_INK2_MTP_BLOCK_SIZE,         "%s.mtp.block_size"              },
+    { LLM_KV_INK2_MTP_MARKOV_RANK,        "%s.mtp.markov_rank"             },
+    { LLM_KV_INK2_MTP_ROPE_THETA,         "%s.mtp.rope_theta"              },
+    { LLM_KV_INK2_MTP_TAP_VISITS,         "%s.mtp.tap_visits"              },
 
     { LLM_KV_TOKENIZER_MODEL,                    "tokenizer.ggml.model"                    },
     { LLM_KV_TOKENIZER_PRE,                      "tokenizer.ggml.pre"                      },
@@ -741,6 +765,62 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_LILICORR_OUT_HEAD,                      "lilicorr.out_head" },
     { LLM_TENSOR_LILICORR_IN_HEAD,                       "lilicorr.in_head" },
     { LLM_TENSOR_LILICORR_ANCHOR_OUT_HEAD,               "lilicorr.anchor_out_head" },
+
+    // inkling2
+    { LLM_TENSOR_INK2_OUTPUT_RES_QUERY,                  "output_res_query" },
+    { LLM_TENSOR_INK2_LOOP_MSG_QUERIES,                  "loop_msg_queries" },
+    { LLM_TENSOR_INK2_MLP_RES_QUERIES,                   "mlp_res_queries" },
+    { LLM_TENSOR_INK2_ATTN_RES_QUERY,                    "blk.%d.attn_res_query" },
+    { LLM_TENSOR_INK2_ATTN_REL,                          "blk.%d.attn_rel" },
+    { LLM_TENSOR_INK2_ATTN_SINK,                         "blk.%d.attn_sink" },
+    { LLM_TENSOR_INK2_ATTN_Q_CLIP,                       "blk.%d.attn_q_clip" },
+    { LLM_TENSOR_INK2_ATTN_R_CLIP,                       "blk.%d.attn_r_clip" },
+    { LLM_TENSOR_INK2_ATTN_REL_PROJ,                     "blk.%d.attn_rel_proj" },
+    { LLM_TENSOR_INK2_ATTN_SCONV,                        "blk.%d.attn_sconv" },
+    { LLM_TENSOR_INK2_FFN_SCONV,                         "blk.%d.ffn_sconv" },
+    { LLM_TENSOR_INK2_ATTN_K_SCONV,                      "blk.%d.attn_k_sconv" },
+    { LLM_TENSOR_INK2_ATTN_V_SCONV,                      "blk.%d.attn_v_sconv" },
+    { LLM_TENSOR_INK2_ATTN_Q_IN_NORM,                    "blk.%d.attn_q_in_norm" },
+    { LLM_TENSOR_INK2_ATTN_K_IN_NORM,                    "blk.%d.attn_k_in_norm" },
+    { LLM_TENSOR_INK2_ATTN_V_IN_NORM,                    "blk.%d.attn_v_in_norm" },
+    { LLM_TENSOR_INK2_ATTN_K_STATIC_W,                   "blk.%d.attn_k_static_w" },
+    { LLM_TENSOR_INK2_ATTN_K_WPROJ,                      "blk.%d.attn_k_wproj" },
+    { LLM_TENSOR_INK2_ATTN_V_STATIC_W,                   "blk.%d.attn_v_static_w" },
+    { LLM_TENSOR_INK2_ATTN_V_WPROJ,                      "blk.%d.attn_v_wproj" },
+    { LLM_TENSOR_INK2_CTRL_ATTN_DOWN,                    "blk.%d.ctrl_attn_down" },
+    { LLM_TENSOR_INK2_CTRL_ATTN_FORGET,                  "blk.%d.ctrl_attn_forget" },
+    { LLM_TENSOR_INK2_CTRL_ATTN_GAIN,                    "blk.%d.ctrl_attn_gain" },
+    { LLM_TENSOR_INK2_CTRL_K_DOWN,                       "blk.%d.ctrl_k_down" },
+    { LLM_TENSOR_INK2_CTRL_K_FORGET,                     "blk.%d.ctrl_k_forget" },
+    { LLM_TENSOR_INK2_CTRL_K_GAIN,                       "blk.%d.ctrl_k_gain" },
+    { LLM_TENSOR_INK2_CTRL_V_DOWN,                       "blk.%d.ctrl_v_down" },
+    { LLM_TENSOR_INK2_CTRL_V_FORGET,                     "blk.%d.ctrl_v_forget" },
+    { LLM_TENSOR_INK2_CTRL_V_GAIN,                       "blk.%d.ctrl_v_gain" },
+    { LLM_TENSOR_INK2_CTRL_MLP_DOWN,                     "blk.%d.ctrl_mlp_down" },
+    { LLM_TENSOR_INK2_CTRL_MLP_FORGET,                   "blk.%d.ctrl_mlp_forget" },
+    { LLM_TENSOR_INK2_CTRL_MLP_GAIN,                     "blk.%d.ctrl_mlp_gain" },
+    { LLM_TENSOR_INK2_MTP_FUSE_ALPHA,                    "mtp.fuse_alpha" },
+    { LLM_TENSOR_INK2_MTP_MASK_EMBED,                    "mtp.mask_embed" },
+    { LLM_TENSOR_INK2_MTP_NORM,                          "mtp.norm" },
+    { LLM_TENSOR_INK2_MTP_MH_DFLARE_NORM,                "mtp.mh_dflare_norm" },
+    { LLM_TENSOR_INK2_MTP_RNN,                           "mtp.rnn" },
+    { LLM_TENSOR_INK2_MTP_FOLD,                          "mtp.fold" },
+    { LLM_TENSOR_INK2_MTP_MH_W1,                         "mtp.mh_w1" },
+    { LLM_TENSOR_INK2_MTP_BLK_DFLARE_NORM,               "mtp.blk.%d.dflare_norm" },
+    { LLM_TENSOR_INK2_MTP_BLK_IN_NORM,                   "mtp.blk.%d.in_norm" },
+    { LLM_TENSOR_INK2_MTP_BLK_POST_NORM,                 "mtp.blk.%d.post_norm" },
+    { LLM_TENSOR_INK2_MTP_BLK_Q_NORM,                    "mtp.blk.%d.q_norm" },
+    { LLM_TENSOR_INK2_MTP_BLK_K_NORM,                    "mtp.blk.%d.k_norm" },
+    { LLM_TENSOR_INK2_MTP_BLK_K_NORM_CTX,                "mtp.blk.%d.k_norm_ctx" },
+    { LLM_TENSOR_INK2_MTP_BLK_ATTN_Q,                    "mtp.blk.%d.attn_q" },
+    { LLM_TENSOR_INK2_MTP_BLK_ATTN_K,                    "mtp.blk.%d.attn_k" },
+    { LLM_TENSOR_INK2_MTP_BLK_ATTN_V,                    "mtp.blk.%d.attn_v" },
+    { LLM_TENSOR_INK2_MTP_BLK_ATTN_K_CTX,                "mtp.blk.%d.attn_k_ctx" },
+    { LLM_TENSOR_INK2_MTP_BLK_ATTN_V_CTX,                "mtp.blk.%d.attn_v_ctx" },
+    { LLM_TENSOR_INK2_MTP_BLK_ATTN_OUT,                  "mtp.blk.%d.attn_output" },
+    { LLM_TENSOR_INK2_MTP_BLK_FFN_GATE,                  "mtp.blk.%d.ffn_gate" },
+    { LLM_TENSOR_INK2_MTP_BLK_FFN_UP,                    "mtp.blk.%d.ffn_up" },
+    { LLM_TENSOR_INK2_MTP_BLK_FFN_DOWN,                  "mtp.blk.%d.ffn_down" },
 };
 
 // declare information about the model weight tensors:
@@ -1055,6 +1135,62 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_LILICORR_IN_HEAD,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_LILICORR_ANCHOR_OUT_HEAD,   {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
 
+    // inkling2
+    {LLM_TENSOR_INK2_OUTPUT_RES_QUERY,      {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_LOOP_MSG_QUERIES,      {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_MLP_RES_QUERIES,       {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_ATTN_RES_QUERY,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_ATTN_REL,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INK2_ATTN_SINK,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INK2_ATTN_Q_CLIP,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_ATTN_R_CLIP,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_ATTN_REL_PROJ,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_ATTN_SCONV,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_FFN_SCONV,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_ATTN_K_SCONV,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_ATTN_V_SCONV,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_ATTN_Q_IN_NORM,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_ATTN_K_IN_NORM,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_ATTN_V_IN_NORM,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_ATTN_K_STATIC_W,       {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_ATTN_K_WPROJ,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INK2_ATTN_V_STATIC_W,       {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_ATTN_V_WPROJ,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INK2_CTRL_ATTN_DOWN,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INK2_CTRL_ATTN_FORGET,      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_CTRL_ATTN_GAIN,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_CTRL_K_DOWN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INK2_CTRL_K_FORGET,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_CTRL_K_GAIN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_CTRL_V_DOWN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INK2_CTRL_V_FORGET,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_CTRL_V_GAIN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_CTRL_MLP_DOWN,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INK2_CTRL_MLP_FORGET,       {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_CTRL_MLP_GAIN,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_MTP_FUSE_ALPHA,        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_MTP_MASK_EMBED,        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_ADD}},
+    {LLM_TENSOR_INK2_MTP_NORM,              {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_MTP_MH_DFLARE_NORM,    {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_MTP_RNN,               {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INK2_MTP_FOLD,              {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INK2_MTP_MH_W1,             {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
+    {LLM_TENSOR_INK2_MTP_BLK_DFLARE_NORM,   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_MTP_BLK_IN_NORM,       {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_MTP_BLK_POST_NORM,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_MTP_BLK_Q_NORM,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_MTP_BLK_K_NORM,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_MTP_BLK_K_NORM_CTX,    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INK2_MTP_BLK_ATTN_Q,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INK2_MTP_BLK_ATTN_K,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INK2_MTP_BLK_ATTN_V,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INK2_MTP_BLK_ATTN_K_CTX,    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INK2_MTP_BLK_ATTN_V_CTX,    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INK2_MTP_BLK_ATTN_OUT,      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INK2_MTP_BLK_FFN_GATE,      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INK2_MTP_BLK_FFN_UP,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INK2_MTP_BLK_FFN_DOWN,      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}
@@ -1151,6 +1287,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
         case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_MINIMAX_01:
+        case LLM_ARCH_INKLING2:
             return true;
         default:
             return false;
@@ -1181,6 +1318,7 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
         case LLM_ARCH_LFM2:
         case LLM_ARCH_LFM2MOE:
         case LLM_ARCH_BAILINGMOE3:
+        case LLM_ARCH_INKLING2:
             return true;
         default:
             return false;
@@ -1196,6 +1334,7 @@ bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
         case LLM_ARCH_EAGLE3:
         case LLM_ARCH_DFLASH:
         case LLM_ARCH_GEMMA4_ASSISTANT:
+        case LLM_ARCH_INKLING2:
             return false;
         default:
             return true;
@@ -1204,6 +1343,7 @@ bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
 
 bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
     switch (arch) {
+        case LLM_ARCH_INKLING2:
         case LLM_ARCH_GROK:
         case LLM_ARCH_MPT:
         case LLM_ARCH_PLAMO2:

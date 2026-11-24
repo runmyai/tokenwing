@@ -1,0 +1,7 @@
+set(TARGET llama-inkling2-bench)
+add_executable(${TARGET} llama-inkling2-bench.cpp)
+if (LLAMA_TOOLS_INSTALL)
+    install(TARGETS ${TARGET} RUNTIME)
+endif()
+target_link_libraries(${TARGET} PRIVATE llama-common llama mtmd ggml Threads::Threads ${CMAKE_DL_LIBS})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)

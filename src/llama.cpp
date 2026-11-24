@@ -405,11 +405,14 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     const uint64_t aux_off = gguf_get_val_u64(ml.metadata, k_off);
                     const uint64_t aux_sz  = gguf_get_val_u64(ml.metadata, k_sz);
                     if (aux_sz > 0) {
-                        const std::string blob = llama_moe_os_read_file_range(ml.file_paths[0], aux_off, aux_sz);
+                        std::string blob = llama_moe_os_read_file_range(ml.file_paths[0], aux_off, aux_sz);
                         const int32_t rc = api->load_aux_blob(blob.data(), blob.size());
                         if (rc != 0) {
                             const char * why = api->last_error ? api->last_error() : "load_aux_blob failed";
                             throw std::runtime_error(format("quant plugin load_aux_blob failed (%d): %s", (int) rc, why ? why : ""));
+                        }
+                        if (model->arch == LLM_ARCH_INKLING2) {
+                            model->ink2_quant_aux_blob = std::move(blob);
                         }
                     }
                 }

@@ -4335,7 +4335,7 @@ void llama_moe_stream::print_repack_state() const {
     fprintf(stderr, "%s: cpu-repack %s: %lld of %lld expert pool tensors hold the repacked layout%s, "
             "%lld do not (that type or shape has no repacked kernel on this CPU: IQ4_XS has none on x86); "
             "the sidecar stores '%s', so reads are %s\n", __func__,
-            cpu_repack_on ? "on" : (cpu_repack ? "OFF (no kernel)" : "off"),
+            cpu_repack_on ? "on" : (plugin_repack_on ? "on (CPU + GPU)" : (cpu_repack ? "OFF (no kernel)" : "off")),
             (long long) n_rep, (long long) n_pool,
             n_plug > 0 ? format(" (%lld of them the quant plugin's)", (long long) n_plug).c_str() : "",
             (long long) (n_pool - n_rep), sidecar_layout.c_str(),
@@ -4363,6 +4363,12 @@ void llama_moe_stream::ne_set_router_gpu(const std::vector<uint8_t> & router_gpu
         n_with_guess++;
         // Only a layer whose guess is built (prefetch on); the graph also needs the next layer's router (bailingmoe3
         // passes it) - without it no guess is built, no mark is set, and the remap op does not mark (ne_guess_left stays false)
+        if (loop_end > loop_beg && slp->il >= loop_beg && slp->il < loop_end) {
+            // Looped-core physical layers execute multiple passes per forward graph; keep direct per-visit remap op
+            slp->ne_post_on = false;
+            slp->ne_ingraph = false;
+            continue;
+        }
         slp->ne_post_on = prefetch_on() && (size_t) first < router_gpu.size() && router_gpu[(size_t) first] != 0;
         if (slp->ne_post_on) {
             posting += format("%s%d", n_post++ > 0 ? "," : "", slp->il);
@@ -4833,11 +4839,15 @@ ggml_tensor * llama_moe_stream::create_pool(int32_t il, const std::string & name
                     const bool ext_type = pool->type >= GGML_TYPE_EXT0 && pool->type <= GGML_TYPE_EXT5;
                     const ggml_quant_plugin_api * qapi = cpu_repack && ext_type ? ggml_quant_plugin_get() : nullptr;
                     const bool gpu_kernel = ext_type && (ggml_quant_plugin_has_cuda(pool->type, false) || ggml_quant_plugin_has_cuda(pool->type, true));
-                    if (qapi && qapi->repack_expert_slot && !gpu_kernel &&
+                    const bool gpu_reads_repacked = qapi && qapi->repack_expert_slot &&
+                            qapi->repack_expert_slot((int32_t) pool->type, nullptr, nullptr, -1, 0) == 1;
+                    if (qapi && qapi->repack_expert_slot && (!gpu_kernel || gpu_reads_repacked) &&
                             qapi->repack_expert_slot((int32_t) pool->type, nullptr, nullptr, pool->ne[0], pool->ne[1]) == 0) {
                         plugin_repack    = true;
                         plugin_repack_on = true;
-                        cpu_repack_on    = true;
+                        if (!gpu_reads_repacked) {
+                            cpu_repack_on = true;
+                        }
                         convert_on_read  = true;
                     } else if (n_repacked_blocks > 0) {
                         throw std::runtime_error(format(
@@ -12972,7 +12982,10 @@ void llama_moe_stream::remap_guess(llama_moe_stream_layer & sl, const int32_t * 
         // Only a decode call of ONE token (ne_call_one) - in a call of several 1-token
         // ubatches the word number does not move between them, so a second ubatch's guesses would meet the first one's marks;
         // every other call shape takes the direct 1-ahead path (column 0 = the 1-ahead guess; no target = nothing)
-        if (la_on && plan_on && decode_phase && ne_call_one && n_tok == 1 && !correction) {
+        if (cur_pred_il_override >= -1) {
+            prefetch_next(sl, pred, n_tok > 0 ? (int32_t) width : 0, n_tok, cur_pred_il_override, (int32_t) width,
+                          correction ? 2 : 0);
+        } else if (la_on && plan_on && decode_phase && ne_call_one && n_tok == 1 && !correction) {
             if (sl.ne_post_on && ne_gpu && sl.ne_guess_marked) {
                 ne_mark(sl);   // the GPU wrote the guess (all its columns); the helper waits for its event
             } else if (sl.ne_post_on) {
@@ -14389,7 +14402,9 @@ void llama_moe_stream_remap2(ggml_tensor * dst, const ggml_tensor * a, const ggm
 
     const int32_t * ids  = (const int32_t *) a->data;
 
+    mgr->cur_pred_il_override = w->pred_il_override;
     mgr->remap(*sl, (const int32_t *) a->data, (const int32_t *) b->data, n, n_tok, w->w, (int32_t *) dst->data, t0_op);
+    mgr->cur_pred_il_override = -2;
     mgr->psplit_after_remap(*sl, n_tok, w->w);
     if (dst->flags & LLAMA_MOE_STREAM_TENSOR_TAIL) {
         mgr->tailw_gather(*sl, (int32_t *) dst->data, n, w->w);

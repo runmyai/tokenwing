@@ -28,6 +28,7 @@
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fwht.cuh"
+#include "ggml-cuda/inkling2-fusions.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
@@ -2988,6 +2989,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 ggml_cuda_op_top_k_mask(ctx, dst);
             }
             break;
+        case GGML_OP_CUSTOM:
+            if (ggml_cuda_inkling2_supports_op(dst)) {
+                ggml_cuda_inkling2_compute_forward(ctx, dst);
+                break;
+            }
+            return false;
         default:
             return false;
     }
@@ -3184,6 +3191,14 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 if (ggml_cuda_graph_debug_enabled()) {
                     GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
                 }
+            }
+        }
+
+        if (node->op == GGML_OP_CUSTOM && ggml_cuda_inkling2_supports_op(node)) {
+            const int32_t ik = node->op_params[9];
+            if (ik == GGML_CUDA_INK2_OP_FUSED_TRUNK || ik == GGML_CUDA_INK2_OP_MTP_STASH_TAP) {
+                // FUSED_TRUNK manages its own internal M=1 CUDA graph, and MTP_STASH_TAP updates stateful MTP pos0
+                use_cuda_graph = false;
             }
         }
 
@@ -6998,6 +7013,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_GATED_DELTA_NET:
             return true;
+        case GGML_OP_CUSTOM:
+            return ggml_cuda_inkling2_supports_op(op);
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
@@ -7066,6 +7083,10 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+
+    if (op->op == GGML_OP_MUL_MAT_ID && op->src[0] && ggml_cuda_is_ext_type(op->src[0]->type)) {
+        return false;
+    }
 
     return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
 }
@@ -7355,6 +7376,9 @@ static bool ggml_backend_cuda_async_h2d_ok(void) {
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_cuda_inkling2_api") == 0) {
+        return (void *) ggml_cuda_inkling2_api;
+    }
     if (strcmp(name, "ggml_backend_cuda_async_h2d_ok") == 0) {   // --moe-stream-async-h2d: a CUDA 13 build?
         return (void *)ggml_backend_cuda_async_h2d_ok;
     }

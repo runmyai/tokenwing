@@ -1333,8 +1333,20 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
         // the draft context is created from the same base params and follows the main context, fit both together
         const bool has_draft = params.speculative.has_dft();
-        const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+        bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
             COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        if (!has_draft && spec_mtp && !params.model.path.empty()) {
+            struct gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+            gguf_context_ptr gctx(gguf_init_from_file(params.model.path.c_str(), gp));
+            if (gctx) {
+                const int64_t aid = gguf_find_key(gctx.get(), "general.architecture");
+                if (aid >= 0 && gguf_get_kv_type(gctx.get(), aid) == GGUF_TYPE_STRING &&
+                    std::strcmp(gguf_get_val_str(gctx.get(), aid), "inkling2") == 0) {
+                    // Inkling-2-Mini runs embedded MTP-8 directly on ctx_tgt without a duplicate MTP context
+                    spec_mtp = false;
+                }
+            }
+        }
 
         common_params params_dft = common_base_params_to_speculative(params);
 

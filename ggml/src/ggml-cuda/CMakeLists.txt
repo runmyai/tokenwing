@@ -126,6 +126,7 @@ if (CUDAToolkit_FOUND)
 
     ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
+    list(APPEND GGML_SOURCES_CUDA "inkling2_kernels/inkling2_fusions_core.cu")
 
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}

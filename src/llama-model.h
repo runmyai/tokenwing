@@ -624,6 +624,46 @@ struct llama_layer {
     struct llama_layer_nextn nextn;
 
     struct llama_layer_switch_lora switch_lora;
+
+    // inkling2 per-layer tensors
+    struct ggml_tensor * ink2_attn_res_query = nullptr;
+    struct ggml_tensor * ink2_attn_rel       = nullptr;
+    struct ggml_tensor * ink2_attn_sink      = nullptr;
+    struct ggml_tensor * ink2_attn_q_clip    = nullptr;
+    struct ggml_tensor * ink2_attn_r_clip    = nullptr;
+    struct ggml_tensor * ink2_attn_rel_proj  = nullptr;
+    struct ggml_tensor * ink2_attn_sconv     = nullptr;
+    struct ggml_tensor * ink2_ffn_sconv      = nullptr;
+    struct ggml_tensor * ink2_attn_k_sconv   = nullptr;
+    struct ggml_tensor * ink2_attn_v_sconv   = nullptr;
+    struct ggml_tensor * ink2_attn_q_in_norm = nullptr;
+    struct ggml_tensor * ink2_attn_k_in_norm = nullptr;
+    struct ggml_tensor * ink2_attn_v_in_norm = nullptr;
+    struct ggml_tensor * ink2_attn_k_static_w = nullptr;
+    struct ggml_tensor * ink2_attn_k_wproj    = nullptr;
+    struct ggml_tensor * ink2_attn_v_static_w = nullptr;
+    struct ggml_tensor * ink2_attn_v_wproj    = nullptr;
+    struct ggml_tensor * ink2_ctrl_down[4]   = { nullptr, nullptr, nullptr, nullptr };
+    struct ggml_tensor * ink2_ctrl_forget[4] = { nullptr, nullptr, nullptr, nullptr };
+    struct ggml_tensor * ink2_ctrl_gain[4]   = { nullptr, nullptr, nullptr, nullptr };
+};
+
+struct llama_ink2_mtp_layer {
+    struct ggml_tensor * dflare_norm = nullptr;
+    struct ggml_tensor * in_norm     = nullptr;
+    struct ggml_tensor * post_norm   = nullptr;
+    struct ggml_tensor * q_norm      = nullptr;
+    struct ggml_tensor * k_norm      = nullptr;
+    struct ggml_tensor * k_norm_ctx  = nullptr;
+    struct ggml_tensor * wq          = nullptr;
+    struct ggml_tensor * wk          = nullptr;
+    struct ggml_tensor * wv          = nullptr;
+    struct ggml_tensor * wk_ctx      = nullptr;
+    struct ggml_tensor * wv_ctx      = nullptr;
+    struct ggml_tensor * wo          = nullptr;
+    struct ggml_tensor * ffn_gate    = nullptr;
+    struct ggml_tensor * ffn_up      = nullptr;
+    struct ggml_tensor * ffn_down    = nullptr;
 };
 
 struct llama_device {
@@ -701,6 +741,22 @@ struct llama_model {
 
     // hrm-text initial low-cycle state
     struct ggml_tensor * hrm_z_l_init = nullptr;
+
+    // inkling2 global + embedded MTP-8 (`DSpark`) tensors
+    struct ggml_tensor * ink2_output_res_query = nullptr;
+    struct ggml_tensor * ink2_loop_msg_queries = nullptr;
+    struct ggml_tensor * ink2_mlp_res_queries  = nullptr;
+    struct ggml_tensor * ink2_mtp_fuse_alpha   = nullptr;
+    struct ggml_tensor * ink2_mtp_mask_embed   = nullptr;
+    struct ggml_tensor * ink2_mtp_norm         = nullptr;
+    struct ggml_tensor * ink2_mtp_mh_dflare    = nullptr;
+    struct ggml_tensor * ink2_mtp_rnn_w        = nullptr;
+    struct ggml_tensor * ink2_mtp_rnn_b        = nullptr;
+    struct ggml_tensor * ink2_mtp_fold_w       = nullptr;
+    struct ggml_tensor * ink2_mtp_fold_b       = nullptr;
+    struct ggml_tensor * ink2_mtp_mh_w1        = nullptr;
+    std::vector<llama_ink2_mtp_layer> ink2_mtp_layers;
+    std::string ink2_quant_aux_blob;
 
     // DeepSeek-V4
     struct ggml_tensor * hc_head_fn    = nullptr;

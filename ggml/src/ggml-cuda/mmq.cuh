@@ -1000,7 +1000,8 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx,
+        const int2 * __restrict__ work_tiles = nullptr, const int * __restrict__ n_work_tiles = nullptr) {
 
 #ifdef TURING_MMA_AVAILABLE
     constexpr bool fusion_available = true;
@@ -1025,6 +1026,50 @@ static __global__ void mul_mat_q(
     // For regular matrix multiplications this is never changed.
     // For MoE the correct indices are loaded from ids_dst.
     extern __shared__ int ids_dst_shared[]; // Stored at beginning of shared memory.
+
+    if (work_tiles != nullptr) {
+        const int total_w = *n_work_tiles;
+        if ((int) blockIdx.x >= total_w) {
+            return;
+        }
+        constexpr int I_dst = has_fusion ? I/2 : I;
+        const int it = blockIdx.y;
+        const int wt = blockIdx.z;
+        for (int w = blockIdx.x; w < total_w; w += gridDim.x) {
+            const int2 zj = work_tiles[w];
+            const int  zt = zj.x;
+            const int  jt = zj.y;
+            const int  col_low  = expert_bounds[zt + 0];
+            const int  col_high = expert_bounds[zt + 1];
+            const int  col_diff = col_high - col_low;
+            if (w != (int) blockIdx.x) {
+                __syncthreads();
+            }
+#pragma unroll
+            for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
+                const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+                if (j0 + nwarps*warp_size > J && j >= J) {
+                    break;
+                }
+                ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+            }
+            __syncthreads();
+            const int offset_y   = (col_low + jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
+            const int offset_dst = it*I_dst;
+            const float * y_scale_tile = nullptr;
+            if constexpr (type == GGML_TYPE_NVFP4) {
+                y_scale_tile = y_scale ? y_scale + col_low + jt*J : nullptr;
+            }
+            const int tile_x_max_i = nrows_x  - it*I_dst - 1;
+            const int tile_y_max_j = col_diff - jt*J - 1;
+            const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I_dst*stride_row_x;
+            mul_mat_q_process_tile<type, J, fallback, /*fixup=*/false, prec_src1, has_fusion>
+                (x, x_gate, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, nullptr, y_scale_tile,
+                 glu_op, glu_limit, stride_row_x, ncols_y, stride_col_dst,
+                 tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+        }
+        return;
+    }
 #pragma unroll
     for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
         const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
@@ -1435,6 +1480,9 @@ struct mmq_args {
     int64_t ncols_max;
     int J_best; // Tile width in ne11(dense)/ne12(MoE) direction to use for optimal performance.
     ggml_cuda_mm_fusion_args_device fusion = {}; // gate != nullptr selects the fused gate/up/GLU path
+    const int2 * work_tiles     = nullptr;
+    const int  * n_work_tiles   = nullptr;
+    int          max_work_tiles = 0;
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1481,6 +1529,19 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 nsamples_y_fd      = init_fastdiv_values(args.nsamples_y);
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
+
+    if (args.work_tiles != nullptr && args.n_work_tiles != nullptr && args.max_work_tiles > 0) {
+        GGML_ASSERT(nty <= 65535);
+        const int grid_x = std::min<int>(args.max_work_tiles, std::max<int>(512, (16 * nsm + nty - 1) / nty));
+        const dim3 block_nums_work(grid_x, nty, args.nsamples_y);
+        mul_mat_q<type, J, fallback, prec_src1, has_fusion><<<block_nums_work, block_dims, nbytes_shared, stream>>>
+            (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale, args.fusion.glu_op, args.fusion.glu_limit,
+             blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+             channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+             sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+             ntx_fd, args.work_tiles, args.n_work_tiles);
+        return;
+    }
 
     if (has_fusion || !config.stream_k) {
         GGML_ASSERT(nty <= 65535); // gridDim.y limit

@@ -184,11 +184,11 @@ int ggml_cuda_moe_zero_tail_of(const ggml_tensor * dst) {
     return (v & GGML_MOE_ZERO_TAIL_MASK) == GGML_MOE_ZERO_TAIL_MAGIC ? (v & ~GGML_MOE_ZERO_TAIL_MASK) : 0;
 }
 
-// one block per compact column c: a column of a zero expert ([bounds[first_zero], bounds[n_experts])) writes 0 in its output row
+// one block per compact column c: a column of a zero expert ([bounds[first_zero], bounds[end_idx])) writes 0 in its output row
 static __global__ void k_moe_zero_tail_rows(const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ ids_dst,
-        float * __restrict__ dst, const int first_zero, const int n_experts, const int ne0, const int64_t stride_col_dst) {
+        float * __restrict__ dst, const int first_zero, const int end_idx, const int ne0, const int64_t stride_col_dst) {
     const int c = blockIdx.x;
-    if (c < expert_bounds[first_zero] || c >= expert_bounds[n_experts]) {
+    if (c < expert_bounds[first_zero] || c >= expert_bounds[end_idx]) {
         return;
     }
     float * row = dst + (int64_t) ids_dst[c]*stride_col_dst;
@@ -198,7 +198,10 @@ static __global__ void k_moe_zero_tail_rows(const int32_t * __restrict__ expert_
 }
 
 // then the zero experts' column ranges become empty (after the rows above have read them)
-static __global__ void k_moe_zero_tail_bounds(int32_t * __restrict__ expert_bounds, const int first_zero, const int n_experts) {
+static __global__ void k_moe_zero_tail_bounds(int32_t * __restrict__ expert_bounds, const int first_zero, const int n_experts, const bool save_orig_end) {
+    if (save_orig_end) {
+        expert_bounds[n_experts + 1] = expert_bounds[n_experts];
+    }
     const int32_t b = expert_bounds[first_zero];
     for (int e = first_zero + 1; e <= n_experts; ++e) {
         expert_bounds[e] = b;
@@ -206,9 +209,18 @@ static __global__ void k_moe_zero_tail_bounds(int32_t * __restrict__ expert_boun
 }
 
 void ggml_cuda_moe_zero_tail_apply(int32_t * expert_bounds, const int32_t * ids_dst, float * dst, int n_experts, int n_zero, int ne0,
-        int64_t stride_col_dst, int n_cols_max, cudaStream_t stream) {
+        int64_t stride_col_dst, int n_cols_max, cudaStream_t stream, bool skip_zero_rows, bool save_orig_end) {
     GGML_ASSERT(n_zero > 0 && n_zero < n_experts);
     const int first_zero = n_experts - n_zero;
-    k_moe_zero_tail_rows<<<n_cols_max, 256, 0, stream>>>(expert_bounds, ids_dst, dst, first_zero, n_experts, ne0, stride_col_dst);
-    k_moe_zero_tail_bounds<<<1, 1, 0, stream>>>(expert_bounds, first_zero, n_experts);
+    if (!skip_zero_rows) {
+        k_moe_zero_tail_rows<<<n_cols_max, 256, 0, stream>>>(expert_bounds, ids_dst, dst, first_zero, n_experts, ne0, stride_col_dst);
+    }
+    k_moe_zero_tail_bounds<<<1, 1, 0, stream>>>(expert_bounds, first_zero, n_experts, save_orig_end);
+}
+
+void ggml_cuda_moe_zero_tail_rows_cached(const int32_t * expert_bounds, const int32_t * ids_dst, float * dst, int n_experts, int n_zero,
+        int ne0, int64_t stride_col_dst, int n_cols_max, cudaStream_t stream) {
+    GGML_ASSERT(n_zero > 0 && n_zero < n_experts);
+    const int first_zero = n_experts - n_zero;
+    k_moe_zero_tail_rows<<<n_cols_max, 256, 0, stream>>>(expert_bounds, ids_dst, dst, first_zero, n_experts + 1, ne0, stride_col_dst);
 }

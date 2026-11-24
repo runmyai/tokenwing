@@ -2253,12 +2253,11 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
 
     // The fused kernel needs one block per tile (no stream-k split), so only fuse if the tiling is efficient.
     int64_t ncols_eff = ncols;
-    if (is_id && ggml_cuda_mmq_moe_opt_enabled() && cc >= GGML_CUDA_CC_AMPERE &&
-            ggml_cuda_moe_zero_tail_of(up) == 0 && nchannels >= 128) {
-        const int64_t avg_tok = (ncols * up->src[2]->ne[0] + nchannels - 1) / nchannels;
-        if (avg_tok <= 40) {
-            ncols_eff = avg_tok;
-        }
+    if (is_id && ggml_cuda_mmq_moe_opt_enabled() && cc >= GGML_CUDA_CC_AMPERE && nchannels >= 64) {
+        const int     nz       = ggml_cuda_moe_zero_tail_of(up);
+        const int64_t ne02_est = (nz > 0 && nz < nchannels) ? (nchannels - nz) : nchannels;
+        const int64_t avg_tok  = (ncols * up->src[2]->ne[0] + ne02_est - 1) / ne02_est;
+        ncols_eff = std::min<int64_t>(ncols, std::max<int64_t>(16, (avg_tok * 5 + 3) / 4));
     }
     return ggml_cuda_mmq_fusion_is_efficient(x_up->type, x_up->ne[1], ncols_eff, nchannels, device);
 }

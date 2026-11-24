@@ -833,7 +833,7 @@ static int64_t os_plan_cap_margin() {
         }
         fclose(f);
         if (sw_kb == 0) {
-            return (int64_t) 1536 << 20;
+            return (int64_t) 3584 << 20;
         }
     }
     return (int64_t) 512 << 20;

@@ -16958,11 +16958,11 @@ int64_t llama_moe_stream::vx_growth_bytes(int64_t n_ubatch, int64_t n_ctx_run, s
     const int64_t modules = (int64_t) 20 << 20;
     const int64_t graphs  = vx_graphs_on ? (int64_t) il_of_moe.size()*1572864 : 0;
     const int64_t scratch = vx_scratch_premapped > 0 ? 0 : vx_scratch_lazy;
-    // With --spec-type draft-mtp, ctx_dft (LLAMA_CONTEXT_TYPE_MTP) is built after ctx_tgt's vx_setup on the same GPU,
-    // taking its NextN KV/recurrent cache plus its own compute buffer / VMM scratch / CUDA graph (~256 MiB at -ub 2048).
+    // With --spec-type draft-mtp, ctx_dft (LLAMA_CONTEXT_TYPE_MTP, ubatch <= 256) is built after ctx_tgt's vx_setup on the same GPU,
+    // taking its NextN KV/recurrent cache plus its own compute buffer / VMM scratch / CUDA graph, and prompt calls also allocate the pinned H2D ring.
+    const int64_t ub_mtp  = std::min<int64_t>(std::max<int64_t>(1, n_ubatch), 256);
     const int64_t mtp_dft = p1.mtp_on_pool_dev
-            ? p1.mtp_ctx_bytes + std::max<int64_t>((int64_t) 96 << 20,
-                    std::max<int64_t>(1, n_ubatch) * std::max<int64_t>(2048, n_embd) * 64)
+            ? p1.mtp_ctx_bytes + std::max<int64_t>((int64_t) 192 << 20, ub_mtp * std::max<int64_t>(2048, n_embd) * 96)
             : 0;
     if (why) {
         *why = format("derived: 20 MiB modules + %.1f MiB CUDA-graph instances (1.5 MiB x %zu streamed layers%s)%s%s", graphs/1048576.0, il_of_moe.size(),

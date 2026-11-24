@@ -2187,8 +2187,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     if (!any_mtp) {
                         return 0;
                     }
-                    const int64_t ub_m = params.moe_stream_ubatch > 0 ? (int64_t) params.moe_stream_ubatch : 512;
-                    return std::max<int64_t>((int64_t) 96 << 20, ub_m * std::max<int64_t>(2048, (int64_t) hparams.n_embd) * 64);
+                    const int64_t ub_m = std::min<int64_t>(params.moe_stream_ubatch > 0 ? (int64_t) params.moe_stream_ubatch : 256, 256);
+                    return std::max<int64_t>((int64_t) 192 << 20, ub_m * std::max<int64_t>(2048, (int64_t) hparams.n_embd) * 96);
                 }();
                 const int64_t room_after_fixed = (int64_t) f_pool - pool_keep - wl_compute - wl_prewarm - pool_oth - pool_ctx - mtp_compute_pool;
                 const int64_t eff_room = room_after_fixed + lend_reclaim;
@@ -2604,8 +2604,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     if (ml.load_mtp && hparams.n_layer_nextn > 0) {
                         for (uint32_t il_m = hparams.n_layer(); il_m < (uint32_t) n_layer_all; ++il_m) {
                             if (il_m < pimpl->dev_layer.size() && pimpl->dev_layer[il_m].dev == dv.dev) {
-                                const int64_t ub_m = params.moe_stream_ubatch > 0 ? (int64_t) params.moe_stream_ubatch : 512;
-                                w.compute += std::max<int64_t>((int64_t) 96 << 20, ub_m * std::max<int64_t>(2048, (int64_t) hparams.n_embd) * 64);
+                                const int64_t ub_m = std::min<int64_t>(params.moe_stream_ubatch > 0 ? (int64_t) params.moe_stream_ubatch : 256, 256);
+                                w.compute += std::max<int64_t>((int64_t) 192 << 20, ub_m * std::max<int64_t>(2048, (int64_t) hparams.n_embd) * 96);
                                 break;
                             }
                         }

@@ -2725,7 +2725,12 @@ common_speculative_init_result::common_speculative_init_result(
     // and matches target n_batch when --moe-stream-layer-major raises target n_batch
     cparams.n_ctx   = llama_n_ctx(ctx_tgt);
     cparams.n_batch = std::max<uint32_t>(cparams.n_batch, llama_n_batch(ctx_tgt));
-    if (cparams.n_ubatch == 0) {
+    if (spec_mtp) {
+        // An MTP draft context runs a non-streamed NextN block without VRAM lending:
+        // cap its physical ubatch at 256 so its compute buffer + MMQ VMM scratch stay compact (~64 MiB).
+        const uint32_t ub_in = cparams.n_ubatch > 0 ? cparams.n_ubatch : llama_n_ubatch(ctx_tgt);
+        cparams.n_ubatch = std::min<uint32_t>(ub_in, 256u);
+    } else if (cparams.n_ubatch == 0) {
         cparams.n_ubatch = llama_n_ubatch(ctx_tgt);
     }
 

@@ -209,6 +209,7 @@ struct llama_moe_stream_p1 {
     bool        mmq_moe_opt    = false;   // --moe-stream-mmq-moe-opt 1
     bool        gpu_moe_fused  = false;   // --moe-stream-gpu-moe-fused 1
     int64_t     pinned_ring    = 0;       // --moe-stream-pinned-ring SIZE
+    bool        pinned_ring_auto     = false;   // the ring is used only when a timed copy shows it faster than the plain copy (the prefill group's default)
     bool        lm_bf16        = false;   // --moe-stream-lm-bf16 1
     bool        lend_output    = false;   // --moe-stream-lend-output 1
     bool        qsa_fused      = false;   // --moe-stream-qsa-fused 1
@@ -1682,6 +1683,9 @@ struct llama_moe_stream {
     ggml_backend_event_t  vf_pring_ev[PRING_SLICES] = {};
     bool                  vf_pring_ev_rec[PRING_SLICES] = {};
     void                  pring_ensure();
+    std::atomic<int>      pring_mode{-1};          // -1 = not decided, 0 = plain copies, 1 = through the staging ring
+    std::mutex            pring_mode_mtx;
+    bool                  pring_use(ggml_backend_t be, char * ring, size_t ring_bytes, const char * src, size_t nbytes);
     void                  tailw_set_async_staged(ggml_tensor * D, const char * src, size_t dst_off, size_t nbytes);
     void                  vf_pring_ensure();
     void                  vf_set_async_staged(ggml_tensor * D, const char * src, size_t dst_off, size_t nbytes);

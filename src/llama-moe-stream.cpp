@@ -18723,6 +18723,62 @@ void llama_moe_stream::pring_ensure() {
     }
 }
 
+// Is the staging ring used for the RAM -> GPU expert copies? Given by hand: yes. By the prefill group's default: decided once, on
+// the first copy of at least 1 MiB, by timing - the same bytes of this copy's real source (a RAM pool's pages) go to a scratch
+// tensor on the GPU the plain way and through the ring (its host copy included), three times each, the best of each counts. A
+// driver that copies ordinary memory slowly gains much from the ring; where the plain copy is already fast the ring's extra host
+// copy only costs. The plain way wins a tie (it takes no CPU time from the experts).
+bool llama_moe_stream::pring_use(ggml_backend_t be, char * ring, size_t ring_bytes, const char * src, size_t nbytes) {
+    const int m0 = pring_mode.load(std::memory_order_relaxed);
+    if (m0 >= 0) {
+        return m0 == 1;
+    }
+    if (!p1.pinned_ring_auto) {
+        pring_mode.store(1, std::memory_order_relaxed);
+        return true;
+    }
+    const size_t n = std::min(std::min(nbytes, ring_bytes), (size_t) 8 << 20);
+    if (n < ((size_t) 1 << 20) || ring == nullptr) {
+        return false;   // too little to time: the plain way now, decided at a later copy
+    }
+    std::lock_guard<std::mutex> lk(pring_mode_mtx);
+    if (pring_mode.load(std::memory_order_relaxed) >= 0) {
+        return pring_mode.load(std::memory_order_relaxed) == 1;
+    }
+    ggml_backend_buffer_t gb = ggml_backend_alloc_buffer(be, n);
+    ggml_context * cx = gb ? ggml_init({ ggml_tensor_overhead(), nullptr, /* no_alloc = */ true }) : nullptr;
+    ggml_tensor *  T  = cx ? ggml_new_tensor_1d(cx, GGML_TYPE_I8, (int64_t) n) : nullptr;
+    if (T == nullptr || ggml_backend_tensor_alloc(gb, T, ggml_backend_buffer_get_base(gb)) != GGML_STATUS_SUCCESS) {
+        if (cx) { ggml_free(cx); }
+        if (gb) { ggml_backend_buffer_free(gb); }
+        pring_mode.store(0, std::memory_order_relaxed);   // no room for the test: the plain way
+        return false;
+    }
+    ggml_backend_synchronize(be);
+    ggml_backend_tensor_set_async(be, T, src, 0, n);   // (warm-up: the driver's own staging, the pages)
+    ggml_backend_synchronize(be);
+    int64_t t_plain = INT64_MAX, t_ring = INT64_MAX;
+    for (int r = 0; r < 3; r++) {
+        int64_t t0 = ggml_time_us();
+        ggml_backend_tensor_set_async(be, T, src, 0, n);
+        ggml_backend_synchronize(be);
+        t_plain = std::min(t_plain, ggml_time_us() - t0);
+        t0 = ggml_time_us();
+        std::memcpy(ring, src, n);
+        ggml_backend_tensor_set_async(be, T, ring, 0, n);
+        ggml_backend_synchronize(be);
+        t_ring = std::min(t_ring, ggml_time_us() - t0);
+    }
+    ggml_free(cx);
+    ggml_backend_buffer_free(gb);
+    const bool use = (double) t_ring < 0.95*(double) t_plain;
+    fprintf(stderr, "llama_moe_stream: RAM -> GPU expert copies, timed on %.1f MiB: plain %.2f GB/s, through the page-locked staging ring %.2f GB/s - "
+            "%s (--moe-stream-pinned-ring SIZE or 0 decides by hand)\n", (double) n/1048576.0, (double) n/std::max<int64_t>(t_plain, 1)/1000.0,
+            (double) n/std::max<int64_t>(t_ring, 1)/1000.0, use ? "the ring is used" : "plain copies are used");
+    pring_mode.store(use ? 1 : 0, std::memory_order_relaxed);
+    return use;
+}
+
 void llama_moe_stream::tailw_set_async_staged(ggml_tensor * D, const char * src, size_t dst_off, size_t nbytes) {
     if (pools_registered || p1.pinned_ring <= 0 || nbytes == 0) {
         ggml_backend_tensor_set_async(tailw_be, D, src, dst_off, nbytes);
@@ -18732,7 +18788,7 @@ void llama_moe_stream::tailw_set_async_staged(ggml_tensor * D, const char * src,
         pring_ensure();
     }
     const size_t slice_cap = pring_cap / PRING_SLICES;
-    if (pring_ptr == nullptr || slice_cap == 0) {
+    if (pring_ptr == nullptr || slice_cap == 0 || !pring_use(tailw_be, pring_ptr, slice_cap, src, nbytes)) {
         ggml_backend_tensor_set_async(tailw_be, D, src, dst_off, nbytes);
         return;
     }
@@ -18799,7 +18855,7 @@ void llama_moe_stream::vf_set_async_staged(ggml_tensor * D, const char * src, si
         vf_pring_ensure();
     }
     const size_t slice_cap = vf_pring_cap / PRING_SLICES;
-    if (vf_pring_ptr == nullptr || slice_cap == 0) {
+    if (vf_pring_ptr == nullptr || slice_cap == 0 || !pring_use(vf_be, vf_pring_ptr, slice_cap, src, nbytes)) {
         ggml_backend_tensor_set_async(vf_be, D, src, dst_off, nbytes);
         return;
     }

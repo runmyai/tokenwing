@@ -1063,6 +1063,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             if (!has("--moe-stream-prefill-fast"))      { params.moe_stream_prefill_fast      = 1; }
             if (!has("--moe-stream-pinned-ring") && params.moe_stream_prefill_fast == 1) {
                 params.moe_stream_pinned_ring = (int64_t) 64 << 20;
+                params.moe_stream_auto_mask  |= (1u << 7);   // not given by hand: the engine times both copy ways and uses the faster
             }
             if (!has("--moe-stream-layer-major"))       { params.moe_stream_layer_major       = 1; }
             if (!has("--moe-stream-layer-major-batch")) { params.moe_stream_layer_major_batch = 32768; }

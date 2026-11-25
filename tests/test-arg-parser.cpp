@@ -327,7 +327,7 @@ static void test(void) {
         assert(p.moe_stream_gpu_waves == 512);
         assert(p.moe_stream_gpu_wave_skip_zero == 1);
         assert(p.moe_stream_prompt_split == 1);
-        assert(p.moe_stream_vram_end_fill == 1);
+        assert(p.moe_stream_vram_end_fill == 2);
         assert(p.moe_stream_copy_ahead == 1);
         assert(p.moe_stream_vram_lend_prompt == 1);
         assert(p.moe_stream_overlap == 1);

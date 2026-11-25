@@ -562,6 +562,7 @@ struct ggml_gallocr_plan {
     struct leaf_alloc * leaf_allocs;
     int n_leafs;
     uint64_t topo_hash;
+    uint64_t topo_hash_nobuf;
     uint64_t last_used;
 };
 
@@ -588,6 +589,7 @@ struct ggml_gallocr {
     int leaf_allocs_cap;
 
     uint64_t active_topo_hash;
+    uint64_t active_topo_hash_nobuf;
     uint64_t plan_clock;
     struct ggml_gallocr_plan plan_cache[GGML_GALLOCR_MAX_PLANS];
 };
@@ -599,6 +601,7 @@ static void ggml_gallocr_clear_plan_cache(ggml_gallocr_t galloc) {
         memset(&galloc->plan_cache[k], 0, sizeof(galloc->plan_cache[k]));
     }
     galloc->active_topo_hash = 0;
+    galloc->active_topo_hash_nobuf = 0;
 }
 
 static int ggml_gallocr_topo_id(ggml_gallocr_t galloc, struct ggml_tensor * t, int * next_id) {
@@ -1335,7 +1338,11 @@ static bool ggml_gallocr_reserve_n_impl(
     }
 
     const uint64_t th = ggml_gallocr_graph_topo_hash(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+    const uint64_t th_nobuf = (node_buffer_ids == NULL && leaf_buffer_ids == NULL)
+        ? th
+        : ggml_gallocr_graph_topo_hash(galloc, graph, NULL, NULL);
     galloc->active_topo_hash = th;
+    galloc->active_topo_hash_nobuf = th_nobuf;
 
     // Save or update matching topology slot in plan_cache
     int slot_idx = -1;
@@ -1379,6 +1386,7 @@ static bool ggml_gallocr_reserve_n_impl(
         memcpy(sp->leaf_allocs, galloc->leaf_allocs, (size_t)graph->n_leafs * sizeof(struct leaf_alloc));
     }
     sp->topo_hash = th;
+    sp->topo_hash_nobuf = th_nobuf;
     sp->last_used = ++galloc->plan_clock;
 
     return true;
@@ -1532,15 +1540,16 @@ static bool ggml_gallocr_try_restore_cached_plan(ggml_gallocr_t galloc, struct g
     if (galloc->force_replan) {
         return false;
     }
+    const bool nobuf = (node_buffer_ids == NULL && leaf_buffer_ids == NULL);
     const uint64_t th = ggml_gallocr_graph_topo_hash(galloc, graph, node_buffer_ids, leaf_buffer_ids);
-    if (galloc->active_topo_hash == th &&
+    if ((nobuf ? galloc->active_topo_hash_nobuf : galloc->active_topo_hash) == th &&
         ggml_gallocr_plan_fits_graph(galloc, graph, galloc->node_allocs, galloc->n_nodes,
                                      galloc->leaf_allocs, galloc->n_leafs, node_buffer_ids, leaf_buffer_ids, false)) {
         return true;
     }
     for (int k = 0; k < GGML_GALLOCR_MAX_PLANS; k++) {
         struct ggml_gallocr_plan * sp = &galloc->plan_cache[k];
-        if (sp->topo_hash != th || sp->n_nodes != graph->n_nodes || sp->n_leafs != graph->n_leafs) {
+        if ((nobuf ? sp->topo_hash_nobuf : sp->topo_hash) != th || sp->n_nodes != graph->n_nodes || sp->n_leafs != graph->n_leafs) {
             continue;
         }
         if (!ggml_gallocr_plan_fits_graph(galloc, graph, sp->node_allocs, sp->n_nodes,
@@ -1567,7 +1576,8 @@ static bool ggml_gallocr_try_restore_cached_plan(ggml_gallocr_t galloc, struct g
         }
         galloc->n_nodes = sp->n_nodes;
         galloc->n_leafs = sp->n_leafs;
-        galloc->active_topo_hash = th;
+        galloc->active_topo_hash = sp->topo_hash;
+        galloc->active_topo_hash_nobuf = sp->topo_hash_nobuf;
         sp->last_used = ++galloc->plan_clock;
         return true;
     }

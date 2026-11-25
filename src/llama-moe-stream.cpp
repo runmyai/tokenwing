@@ -394,6 +394,7 @@ static size_t os_page_size() {
 // alignment rule). A read off this alignment is done by the caller through an aligned buffer and a copy, never refused.
 static size_t os_direct_io_align(int fd, size_t file_size, const char ** how) {
 #if defined(__linux__)
+    GGML_UNUSED(file_size);
 #ifdef STATX_DIOALIGN
     struct statx sx;
     if (statx(fd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &sx) == 0 && (sx.stx_mask & STATX_DIOALIGN) && sx.stx_dio_offset_align > 0) {
@@ -401,24 +402,11 @@ static size_t os_direct_io_align(int fd, size_t file_size, const char ** how) {
         return std::max<size_t>(sx.stx_dio_offset_align, sx.stx_dio_mem_align);
     }
 #endif
-    void * buf = nullptr;
-    if (posix_memalign(&buf, 4096, 8192) == 0) {
-        for (size_t a = 512; a < 4096 && 2*a <= file_size; a *= 2) {
-            ssize_t r;
-            do {
-                r = pread(fd, (char *) buf + a, a, (off_t) a);   // offset, length and address all on `a`, none on 2a
-            } while (r < 0 && errno == EINTR);
-            if (r == (ssize_t) a) {
-                free(buf);
-                *how = "a direct read at that alignment";
-                return a;
-            }
-            if (r >= 0 || errno != EINVAL) {
-                break;   // not an alignment refusal: keep the safe value
-            }
-        }
-        free(buf);
-    }
+    // When the filesystem / container sandbox (e.g. gVisor runsc) does not report STATX_DIOALIGN,
+    // sub-page O_DIRECT reads may succeed via slow hypervisor bounce emulation rather than EINVAL.
+    // Use OS page alignment (4096 B) so moe_stream_preadv stays on zero-copy page-aligned DMA.
+    *how = "the page size";
+    return os_page_size();
 #elif defined(_WIN32)
     GGML_UNUSED(file_size);
     // An unbuffered read must be on the volume's logical sector size. The storage property query only answers on a volume or
@@ -3814,6 +3802,17 @@ llama_moe_stream::llama_moe_stream(
     repack_views.assign(repack_view_stride*n_io, nullptr);
     repack_ctxs .assign(repack_view_stride*n_io, nullptr);
 
+    io_files.resize(n_io);
+    for (uint32_t i = 0; i < n_io; i++) {
+        try {
+            auto lf = std::make_unique<llama_file>(sidecar.c_str(), "rb", file.has_direct_io());
+            if (!file.has_direct_io() || lf->has_direct_io()) {
+                io_files[i] = std::move(lf);
+            }
+        } catch (...) {
+        }
+    }
+
     io_threads.reserve(n_io);
     for (uint32_t i = 0; i < n_io; i++) {
         // The readers' loop is chosen here, once: the plain one (no new check in a turn) or the one with the behind rule /
@@ -4240,6 +4239,7 @@ llama_moe_stream::~llama_moe_stream() {
         t.join();
     }
     io_threads.clear();
+    io_files.clear();
     q_demand.clear();
     q_prefetch.clear();
     q_refill.clear();
@@ -6193,11 +6193,12 @@ void llama_moe_stream::io_loop_t(int ith) {
                         const int64_t f_off0 = (int64_t) (bsl.file_off[proj_i] + (size_t) batch[0].expert*w.size);
                         const size_t  want_b = (size_t) nb * w.size;
                         bool bok = false;
+                        const int rfd = io_fd(ith);
                         for (int att = 0; att <= read_retries; att++) {
                             if (att > 0) {
                                 std::this_thread::sleep_for(std::chrono::microseconds(read_retry_us));
                             }
-                            const ssize_t got = moe_stream_preadv(file.file_id(), biov, nb, f_off0);
+                            const ssize_t got = moe_stream_preadv(rfd, biov, nb, f_off0);
                             if (got == (ssize_t) want_b) {
                                 bok = true;
                                 break;
@@ -6369,12 +6370,13 @@ void llama_moe_stream::io_loop_t(int ith) {
             // A sidecar already in the repacked layout is copied into the slot as it is; only a
             // plain sidecar is converted, and then only into a repacked pool.
             wait_slot_h2d_done(sl, job.slot);
+            const int rfd = io_fd(ith);
             if (convert_on_read && !sl.repacked) {
                 // this thread's own scratch, so the reads stay parallel (one shared scratch behind a
                 // mutex serialized all of them and tripled the stall: 13.5 -> 42.8 ms/token)
                 uint8_t * scratch = repack_scratch(ith);
 
-                if (!moe_stream_read_range_to(file.file_id(), sl, job.expert, scratch, job.off, job.len)) {
+                if (!moe_stream_read_range_to(rfd, sl, job.expert, scratch, job.off, job.len)) {
                     ok = false;
                 } else {
                     for (int p = 0; p < 3; p++) {
@@ -6390,9 +6392,9 @@ void llama_moe_stream::io_loop_t(int ith) {
             } else if (cpu_repack_on) {
                 // the sidecar is already repacked and the pool is repacked: straight into the slot,
                 // no scratch and no conversion
-                ok = moe_stream_read_range(file.file_id(), sl, job.expert, job.slot, job.off, job.len, job.dz_touch);
+                ok = moe_stream_read_range(rfd, sl, job.expert, job.slot, job.off, job.len, job.dz_touch);
             } else {
-                ok = moe_stream_read_range(file.file_id(), sl, job.expert, job.slot, job.off, job.len, job.dz_touch);
+                ok = moe_stream_read_range(rfd, sl, job.expert, job.slot, job.off, job.len, job.dz_touch);
             }
 
             if (ok) {
@@ -16952,17 +16954,24 @@ int64_t llama_moe_stream::vx_growth_bytes(int64_t n_ubatch, int64_t n_ctx_run, s
     // instance per streamed layer for each live shape set (the decode graph, the prompt piece shapes seen in the last 10 s) = ~1.5 MiB per
     // streamed layer (55.5 MiB for Ling's 37, measured maximum ~50 + 10 %); it is not held where the backend does not use CUDA graphs. The
     // scratch is counted here only when it is not mapped at start. --moe-stream-vram-growth replaces the whole sum.
-    (void) n_ubatch; (void) n_ctx_run;
+    (void) n_ctx_run;
     const int64_t modules = (int64_t) 20 << 20;
     const int64_t graphs  = vx_graphs_on ? (int64_t) il_of_moe.size()*1572864 : 0;
     const int64_t scratch = vx_scratch_premapped > 0 ? 0 : vx_scratch_lazy;
+    // With --spec-type draft-mtp, ctx_dft (LLAMA_CONTEXT_TYPE_MTP, ubatch <= 256) is built after ctx_tgt's vx_setup on the same GPU,
+    // taking its NextN KV/recurrent cache plus its own compute buffer / VMM scratch / CUDA graph, and prompt calls also allocate the pinned H2D ring.
+    const int64_t ub_mtp  = std::min<int64_t>(std::max<int64_t>(1, n_ubatch), 256);
+    const int64_t mtp_dft = p1.mtp_on_pool_dev
+            ? p1.mtp_ctx_bytes + std::max<int64_t>((int64_t) 192 << 20, ub_mtp * std::max<int64_t>(2048, n_embd) * 96)
+            : 0;
     if (why) {
-        *why = format("derived: 20 MiB modules + %.1f MiB CUDA-graph instances (1.5 MiB x %zu streamed layers%s)%s", graphs/1048576.0, il_of_moe.size(),
+        *why = format("derived: 20 MiB modules + %.1f MiB CUDA-graph instances (1.5 MiB x %zu streamed layers%s)%s%s", graphs/1048576.0, il_of_moe.size(),
                 vx_graphs_on ? "" : "; the backend uses no CUDA graphs",
                 vx_scratch_premapped > 0 ? format("; the %.1f MiB scratch pool is mapped at start and in the check", vx_scratch_premapped/1048576.0).c_str()
-                : scratch > 0 ? format(" + %.1f MiB scratch pool (not mapped at start)", scratch/1048576.0).c_str() : "");
+                : scratch > 0 ? format(" + %.1f MiB scratch pool (not mapped at start)", scratch/1048576.0).c_str() : "",
+                mtp_dft > 0 ? format(" + %.1f MiB MTP draft context", mtp_dft/1048576.0).c_str() : "");
     }
-    return modules + graphs + scratch;
+    return modules + graphs + scratch + mtp_dft;
 }
 
 // Once per request, when its prompt is done (set_decode): the free VRAM now against the load-time check. Printed the first

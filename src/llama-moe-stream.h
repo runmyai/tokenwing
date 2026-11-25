@@ -188,6 +188,8 @@ struct llama_moe_stream_p1 {
     int64_t     vram_free = 0;      // --moe-stream-vram-free: end-state keep-free that sizes N; 0 = off
     int64_t     vram_scratch = -1;  // --moe-stream-vram-scratch: the op scratch pool mapped before the check, bytes; -1 = derived by llama_context, 0 = not mapped
     int64_t     vram_growth = 0;    // --moe-stream-vram-growth: the fit's reserve for lazy allocations; 0 = derived
+    bool        mtp_on_pool_dev = false;   // --spec-type draft-mtp loads NextN on the pool's GPU; ctx_dft is created after vx_setup
+    int64_t     mtp_ctx_bytes   = 0;       // NextN KV/recurrent bytes ctx_dft allocates on the pool's GPU after vx_setup
     std::string correction_file;   // --moe-stream-correction FILE: the trained correction of the router-trick guess, "" = off
     uint64_t    correction_base = 0, correction_size = 0;   // the file is the `size` bytes at `base` of correction_file (the word `model`: data appended to the model file); 0 = the whole file
     bool        idle_load      = false;   // --moe-stream-idle-load 1 or 2 (idle-time loading)
@@ -2991,6 +2993,12 @@ struct llama_moe_stream {
     std::deque<llama_moe_stream_job> q_idle;   // idle-time loads, taken only when nothing else waits
     std::deque<llama_moe_stream_job> q_refill; // elastic RAM's refill reads: after every needed and guessed read, el_refill_io at a time
     std::vector<std::thread>    io_threads;
+    std::vector<std::unique_ptr<llama_file>> io_files;
+    int io_fd(int ith) const {
+        return ith >= 0 && (size_t) ith < io_files.size() && io_files[(size_t) ith]
+            ? io_files[(size_t) ith]->file_id()
+            : file.file_id();
+    }
     bool                        io_stop = false;
     int32_t                     n_inflight = 0;      // reads in flight right now
     // Measured: a needed read takes 0.76 ms on an idle drive and ~4.7 ms with

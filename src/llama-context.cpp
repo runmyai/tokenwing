@@ -2643,7 +2643,7 @@ bool llama_context::lm_layer_major_ok(uint32_t n_tokens_all) {
         return false;   // off, or one ubatch: nothing to reorder (or this call's layer-major attempt failed)
     }
     if (!llama_arch_layer_major(model.arch) ||                      // the model builders that take a layer range (Ling-3.0, Flint, qwen4exp)
-        cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || cparams.n_rs_seq > 0 ||   // MTP and its snapshot slots: not checked
+        cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
         cparams.embeddings || !memory ||
         std::find(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), true) !=
             cparams.embeddings_layer_inp.end()) {   // a draft (EAGLE3 / DFlash) reading layer inputs: a group graph has only its own

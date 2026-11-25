@@ -398,6 +398,7 @@ extern "C" {
     // async H2D on that GPU's stream, without the host waits (no effect with pipeline parallelism)
     GGML_API void                 ggml_backend_sched_set_async_host_input(ggml_backend_sched_t sched, bool on);
     GGML_API bool                 ggml_backend_sched_get_async_host_input(ggml_backend_sched_t sched);   //
+    GGML_API void                 ggml_backend_sched_wait_async_host_inputs(ggml_backend_sched_t sched);
 
     // whether ops that read host weights may run on a device backend, with a copy of those weights.
     // Read when a graph is assigned, so it may be changed between graphs

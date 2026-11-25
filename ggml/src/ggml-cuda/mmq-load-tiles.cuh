@@ -1611,9 +1611,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 // ---------------------------------------------------------------------------------------------
 
-template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_mxfp4(
+template <ggml_type type, int J, bool fallback, bool has_fusion> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_mxfp4(
         const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
-    GGML_UNUSED(x_gate);
 
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / warp_size;
@@ -1643,7 +1642,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             i = min(i, i_max);
         }
 
-        const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbx;
+        const block_mxfp4 * bxi = ggml_cuda_mmq_x_row<block_mxfp4, has_fusion>(x, x_gate, kbx0, i, stride) + kbx;
 
         const int aux_q4 = get_int_b1(bxi->qs, kqsx);
         const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
@@ -1670,7 +1669,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             i = min(i, i_max);
         }
 
-        const block_mxfp4 * bxi = (const block_mxfp4 *) x + kbx0 + i*stride + kbxd;
+        const block_mxfp4 * bxi = ggml_cuda_mmq_x_row<block_mxfp4, has_fusion>(x, x_gate, kbx0, i, stride) + kbxd;
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i*sram_stride                           + kbxd] = ggml_cuda_e8m0_to_fp32(bxi->e)*0.5f;

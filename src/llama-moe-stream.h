@@ -188,6 +188,8 @@ struct llama_moe_stream_p1 {
     int64_t     vram_free = 0;      // --moe-stream-vram-free: end-state keep-free that sizes N; 0 = off
     int64_t     vram_scratch = -1;  // --moe-stream-vram-scratch: the op scratch pool mapped before the check, bytes; -1 = derived by llama_context, 0 = not mapped
     int64_t     vram_growth = 0;    // --moe-stream-vram-growth: the fit's reserve for lazy allocations; 0 = derived
+    bool        mtp_on_pool_dev = false;   // --spec-type draft-mtp loads NextN on the pool's GPU; ctx_dft is created after vx_setup
+    int64_t     mtp_ctx_bytes   = 0;       // NextN KV/recurrent bytes ctx_dft allocates on the pool's GPU after vx_setup
     std::string correction_file;   // --moe-stream-correction FILE: the trained correction of the router-trick guess, "" = off
     uint64_t    correction_base = 0, correction_size = 0;   // the file is the `size` bytes at `base` of correction_file (the word `model`: data appended to the model file); 0 = the whole file
     bool        idle_load      = false;   // --moe-stream-idle-load 1 or 2 (idle-time loading)
@@ -1672,8 +1674,17 @@ struct llama_moe_stream {
     ggml_backend_buffer_t tailw_zero_pin_buf = nullptr;
     uint8_t *             tailw_zero_pin_ptr = nullptr;
     size_t                tailw_zero_pin_cap = 0;
+    ggml_backend_buffer_t vf_pring_buf       = nullptr;
+    char *                vf_pring_ptr       = nullptr;
+    size_t                vf_pring_cap       = 0;
+    size_t                vf_pring_head      = 0;
+    int                   vf_pring_slice     = 0;
+    ggml_backend_event_t  vf_pring_ev[PRING_SLICES] = {};
+    bool                  vf_pring_ev_rec[PRING_SLICES] = {};
     void                  pring_ensure();
     void                  tailw_set_async_staged(ggml_tensor * D, const char * src, size_t dst_off, size_t nbytes);
+    void                  vf_pring_ensure();
+    void                  vf_set_async_staged(ggml_tensor * D, const char * src, size_t dst_off, size_t nbytes);
 
     std::vector<std::vector<uint8_t>> lm_routed_mask;   // [il][expert]: 1 if routed in lm_phase 1
     void set_lm_routed_ids(int32_t il, const int32_t * ids_host, int64_t n);
@@ -1910,6 +1921,7 @@ struct llama_moe_stream {
     int64_t  el_low_keep() const;                                                 // the slots below the start size every layer keeps
     bool     el_givable_any() const;                                              // mtx: a slot some layer may give back
     void     el_release_slot(llama_moe_stream_layer & sl, int32_t s);             // mtx: its pages back to the system
+    void     el_release_slots_batch(std::vector<std::pair<llama_moe_stream_layer *, int32_t>> & batch);
     int64_t  el_take_steps = 0, el_take_t0_us = 0, el_take_step_us = 0, el_n_trigger = 0;
     std::atomic<int64_t> el_looks{0};
     double   el_thread_cpu_s = 0.0, el_thread_wall_s = 0.0;
@@ -2996,6 +3008,12 @@ struct llama_moe_stream {
     std::deque<llama_moe_stream_job> q_idle;   // idle-time loads, taken only when nothing else waits
     std::deque<llama_moe_stream_job> q_refill; // elastic RAM's refill reads: after every needed and guessed read, el_refill_io at a time
     std::vector<std::thread>    io_threads;
+    std::vector<std::unique_ptr<llama_file>> io_files;
+    int io_fd(int ith) const {
+        return ith >= 0 && (size_t) ith < io_files.size() && io_files[(size_t) ith]
+            ? io_files[(size_t) ith]->file_id()
+            : file.file_id();
+    }
     bool                        io_stop = false;
     int32_t                     n_inflight = 0;      // reads in flight right now
     // Measured: a needed read takes 0.76 ms on an idle drive and ~4.7 ms with
@@ -3011,6 +3029,10 @@ struct llama_moe_stream {
     std::vector<float>          p1_decay_tbl;          // 2^(-d/evict_halflife) for a distance of d decode words
     float p1_decay(int64_t d) const {                  // 0 past the table (64 half-lives)
         return d <= 0 ? 1.0f : d < (int64_t) p1_decay_tbl.size() ? p1_decay_tbl[(size_t) d] : 0.0f;
+    }
+    std::vector<float>          pe_decay_tbl;          // 2^(-d/prompt_end_halflife) precomputed to avoid subnormal exp2 traps
+    float pe_decay(int64_t d) const {
+        return d <= 0 ? 1.0f : d < (int64_t) pe_decay_tbl.size() ? pe_decay_tbl[(size_t) d] : 0.0f;
     }
     // The chance table (--moe-stream-chance-model): the chance that a
     // guess candidate is picked by its layer, by lead, rank, sigmoid score bin and band of layers
@@ -3190,7 +3212,8 @@ struct llama_moe_stream {
     void    win_close(bool complete);                                                           // mtx held: the pass is over
     void    win_drain(llama_moe_stream_layer * only, const std::vector<uint8_t> * keep_e);      // mtx held: queued window reads back
     int64_t win_take(llama_moe_stream_layer & sl, int64_t need, bool borrow, bool keep_take);
-    bool    win_move_room(llama_moe_stream_layer & a_sl, int32_t a, llama_moe_stream_layer & t_sl);
+    bool    win_move_room(llama_moe_stream_layer & a_sl, int32_t a, llama_moe_stream_layer & t_sl,
+                          std::vector<std::pair<llama_moe_stream_layer *, int32_t>> * defer_rel = nullptr);
     bool    win_commit_slot(llama_moe_stream_layer & sl, int32_t s);
     bool    win_commit_range(llama_moe_stream_layer & sl, uint32_t a, uint32_t b);
     bool    win_was_decommitted(const llama_moe_stream_layer & sl, int32_t s) const;

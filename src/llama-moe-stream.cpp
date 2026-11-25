@@ -394,6 +394,7 @@ static size_t os_page_size() {
 // alignment rule). A read off this alignment is done by the caller through an aligned buffer and a copy, never refused.
 static size_t os_direct_io_align(int fd, size_t file_size, const char ** how) {
 #if defined(__linux__)
+    GGML_UNUSED(file_size);
 #ifdef STATX_DIOALIGN
     struct statx sx;
     if (statx(fd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &sx) == 0 && (sx.stx_mask & STATX_DIOALIGN) && sx.stx_dio_offset_align > 0) {
@@ -401,24 +402,11 @@ static size_t os_direct_io_align(int fd, size_t file_size, const char ** how) {
         return std::max<size_t>(sx.stx_dio_offset_align, sx.stx_dio_mem_align);
     }
 #endif
-    void * buf = nullptr;
-    if (posix_memalign(&buf, 4096, 8192) == 0) {
-        for (size_t a = 512; a < 4096 && 2*a <= file_size; a *= 2) {
-            ssize_t r;
-            do {
-                r = pread(fd, (char *) buf + a, a, (off_t) a);   // offset, length and address all on `a`, none on 2a
-            } while (r < 0 && errno == EINTR);
-            if (r == (ssize_t) a) {
-                free(buf);
-                *how = "a direct read at that alignment";
-                return a;
-            }
-            if (r >= 0 || errno != EINVAL) {
-                break;   // not an alignment refusal: keep the safe value
-            }
-        }
-        free(buf);
-    }
+    // When the filesystem / container sandbox (e.g. gVisor runsc) does not report STATX_DIOALIGN,
+    // sub-page O_DIRECT reads may succeed via slow hypervisor bounce emulation rather than EINVAL.
+    // Use OS page alignment (4096 B) so moe_stream_preadv stays on zero-copy page-aligned DMA.
+    *how = "the page size";
+    return os_page_size();
 #elif defined(_WIN32)
     GGML_UNUSED(file_size);
     // An unbuffered read must be on the volume's logical sector size. The storage property query only answers on a volume or
@@ -815,8 +803,32 @@ static double os_page_table_fraction() { return 8.0/(double) os_page_size(); }
 // plan beyond the free VRAM it measured)
 #ifdef _WIN32
 static const int64_t MOE_STREAM_CAP_MARGIN = (int64_t) 1 << 30;
+static int64_t os_plan_cap_margin() { return MOE_STREAM_CAP_MARGIN; }
 #else
 static const int64_t MOE_STREAM_CAP_MARGIN = (int64_t) 256 << 20;
+// At startup (before libggml-cuda code pages, CUDA host structures, and pinned H2D staging rings are faulted in),
+// a Linux cgroup without swap needs ~1.5 GiB of margin above pools + other_bytes to avoid direct-reclaim thrashing.
+static int64_t os_plan_cap_margin() {
+#if defined(__linux__) && !defined(MOE_STREAM_TEST_NO_LINUX)
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (f != nullptr) {
+        char ln[128];
+        long long sw_kb = -1;
+        while (fgets(ln, sizeof(ln), f)) {
+            if (sscanf(ln, "SwapTotal: %lld kB", &sw_kb) == 1) {
+                break;
+            }
+        }
+        fclose(f);
+        if (sw_kb == 0) {
+            return (int64_t) 3584 << 20;
+        }
+    }
+    return (int64_t) 512 << 20;
+#else
+    return MOE_STREAM_CAP_MARGIN;
+#endif
+}
 #endif
 
 // The OS layer: DISCARDABLE expert slots - the OS takes their pages itself, when and as much as an app needs RAM; a later use
@@ -2305,6 +2317,14 @@ llama_moe_stream::llama_moe_stream(
             p1_decay_tbl[d] = std::exp2(-(float) d/p1.evict_halflife);
         }
     }
+    {
+        // 150 half-lives cover the full IEEE-754 float32 dynamic range so runtime loops never call libm exp2 on subnormals
+        const size_t n_pe = (size_t) std::min(150.0*(double) p1.prompt_end_halflife, 1048576.0) + 1;
+        pe_decay_tbl.resize(n_pe);
+        for (size_t d = 0; d < n_pe; d++) {
+            pe_decay_tbl[d] = std::exp2(-(float) d/p1.prompt_end_halflife);
+        }
+    }
 
     if (!file.has_direct_io()) {   // a file system without O_DIRECT - buffered reads (the buffers stay page-aligned), slower
         fprintf(stderr, "llama_moe_stream: '%s' cannot be opened with O_DIRECT here - the experts are read through the page cache (slower, "
@@ -3002,14 +3022,15 @@ llama_moe_stream::llama_moe_stream(
 #else
     const int64_t cap_zero = 0;
 #endif
-    const int64_t zero_cap_room = own_cap.has ? std::max<int64_t>(0, (int64_t) ((double) (own_cap.room() - MOE_STREAM_CAP_MARGIN - cap_gpu - cap_zero)/(1.0 + pt_frac))) : -1;
+    const int64_t plan_cap_margin = own_cap.has ? os_plan_cap_margin() : MOE_STREAM_CAP_MARGIN;
+    const int64_t zero_cap_room = own_cap.has ? std::max<int64_t>(0, (int64_t) ((double) (own_cap.room() - plan_cap_margin - cap_gpu - cap_zero)/(1.0 + pt_frac))) : -1;
     if (n_streamed > 0 && mem_available > 0) {
         fprintf(stderr, "%s: RAM limit: MemAvailable %lld MiB - keep-free %lld MiB = %lld MiB; %s; decided by: %s\n", __func__,
                 (long long) (mem_available >> 20), (long long) (ram_free >> 20), (long long) (((int64_t) mem_available - ram_free) >> 20),
                 own_cap.has ? format("process cap '%s' %s %lld MiB - in use %lld MiB%s = room %lld MiB, less the %lld MiB margin%s and %.3f %% page tables = %lld MiB",
                         own_cap.path.c_str(), own_cap.max_file.c_str(), (long long) (own_cap.max >> 20), (long long) (own_cap.cur >> 20),
                         own_cap.cache >= OS_CG_CACHE_SHOWN ? format(" (not counted: %lld MiB of file cache the kernel can free)", (long long) (own_cap.cache >> 20)).c_str() : "",
-                        (long long) (own_cap.room() >> 20), (long long) (MOE_STREAM_CAP_MARGIN >> 20),
+                        (long long) (own_cap.room() >> 20), (long long) (plan_cap_margin >> 20),
                         cap_gpu > 0 ? format(", the %lld MiB of free VRAM the cap also charges", (long long) (cap_gpu >> 20)).c_str() : "",
                         100.0*pt_frac, (long long) (zero_cap_room >> 20)).c_str()
                             : "no process memory cap",
@@ -3173,7 +3194,7 @@ llama_moe_stream::llama_moe_stream(
         fprintf(stderr, "%s: the pools and the rest of the process need %lld MiB (pools %zu MiB + %lld MiB other); the process's own memory cap '%s' "
                 "leaves %lld MiB after the %lld MiB margin and the page tables - running anyway at the minimum (the cap may stop the process)\n",
                 __func__, (long long) (((int64_t) pool_bytes + other_bytes) >> 20), pool_bytes >> 20, (long long) (other_bytes >> 20),
-                own_cap.path.c_str(), (long long) (zero_cap_room >> 20), (long long) (MOE_STREAM_CAP_MARGIN >> 20));
+                own_cap.path.c_str(), (long long) (zero_cap_room >> 20), (long long) (plan_cap_margin >> 20));
     }
 
     if (mplan.mem_available > 0 && n_streamed > 0 && spare < ram_free) {
@@ -3787,6 +3808,17 @@ llama_moe_stream::llama_moe_stream(
     repack_views.assign(repack_view_stride*n_io, nullptr);
     repack_ctxs .assign(repack_view_stride*n_io, nullptr);
 
+    io_files.resize(n_io);
+    for (uint32_t i = 0; i < n_io; i++) {
+        try {
+            auto lf = std::make_unique<llama_file>(sidecar.c_str(), "rb", file.has_direct_io());
+            if (!file.has_direct_io() || lf->has_direct_io()) {
+                io_files[i] = std::move(lf);
+            }
+        } catch (...) {
+        }
+    }
+
     io_threads.reserve(n_io);
     for (uint32_t i = 0; i < n_io; i++) {
         // The readers' loop is chosen here, once: the plain one (no new check in a turn) or the one with the behind rule /
@@ -4213,6 +4245,7 @@ llama_moe_stream::~llama_moe_stream() {
         t.join();
     }
     io_threads.clear();
+    io_files.clear();
     q_demand.clear();
     q_prefetch.clear();
     q_refill.clear();
@@ -6126,6 +6159,104 @@ void llama_moe_stream::io_loop_t(int ith) {
             // An idle-time load, only when nothing else waits (a call's start takes the queued ones back: idle_drain)
             job = q_idle.front();
             q_idle.pop_front();
+            // Coalesce contiguous LBA projection pieces from q_idle into one scatter-DMA preadv (up to 16 experts / ~16-32 MiB)
+            if (job.idle && !job.verify && !job.dz_touch && !rec_ev_on && job.sl->by_proj &&
+                    !(convert_on_read && !job.sl->repacked) && fail_at <= 0 && !q_idle.empty()) {
+                auto & bsl = *job.sl;
+                int proj_i = -1;
+                int64_t p_acc = 0;
+                for (int p = 0; p < 3; p++) {
+                    if (job.off == p_acc && (size_t) job.len == bsl.weights[p].size) {
+                        proj_i = p;
+                        break;
+                    }
+                    p_acc += (int64_t) bsl.weights[p].size;
+                }
+                if (proj_i >= 0 && bsl.slot_gen[job.slot] == job.gen && bsl.slot_cancel[job.slot] == 0) {
+                    llama_moe_stream_job batch[16];
+                    iovec                biov[16];
+                    int                  nb = 0;
+                    const auto &         w  = bsl.weights[proj_i];
+                    batch[nb] = job;
+                    biov[nb]  = { (char *) w.mem + (size_t) job.slot*w.size, w.size };
+                    nb++;
+                    while (nb < 16 && !q_idle.empty()) {
+                        const auto & nx = q_idle.front();
+                        if (!nx.idle || nx.sl != &bsl || nx.verify || nx.dz_touch || nx.off != job.off || nx.len != job.len ||
+                                nx.expert != batch[nb - 1].expert + 1 || bsl.slot_gen[nx.slot] != nx.gen || bsl.slot_cancel[nx.slot] != 0) {
+                            break;
+                        }
+                        batch[nb] = nx;
+                        biov[nb]  = { (char *) w.mem + (size_t) nx.slot*w.size, w.size };
+                        nb++;
+                        q_idle.pop_front();
+                    }
+                    if (nb > 1) {
+                        lock.unlock();
+                        for (int bi = 0; bi < nb; bi++) {
+                            wait_slot_h2d_done(bsl, batch[bi].slot);
+                        }
+                        const int64_t f_off0 = (int64_t) (bsl.file_off[proj_i] + (size_t) batch[0].expert*w.size);
+                        const size_t  want_b = (size_t) nb * w.size;
+                        bool bok = false;
+                        const int rfd = io_fd(ith);
+                        for (int att = 0; att <= read_retries; att++) {
+                            if (att > 0) {
+                                std::this_thread::sleep_for(std::chrono::microseconds(read_retry_us));
+                            }
+                            const ssize_t got = moe_stream_preadv(rfd, biov, nb, f_off0);
+                            if (got == (ssize_t) want_b) {
+                                bok = true;
+                                break;
+                            }
+                        }
+                        lock.lock();
+                        for (int bi = 0; bi < nb; bi++) {
+                            const auto & bj = batch[bi];
+                            const bool bstale  = bsl.slot_gen[bj.slot] != bj.gen;
+                            const bool bcancel = bstale || bsl.slot_cancel[bj.slot] != 0;
+                            const int64_t bnbytes = (bok && !bcancel) ? (int64_t) bj.len : 0;
+                            n_idle_bytes += bnbytes;
+                            n_idle_reads += (bj.off == 0 && bok && !bcancel) ? 1 : 0;
+                            if (!bstale && bsl.slot_pending[bj.slot] > 0) {
+                                if (pr_on && bok && !bcancel && !bsl.slot_chunk_bad[bj.slot]) {
+                                    if (bsl.proj_left[proj_i][bj.slot] > 0) {
+                                        bsl.proj_left[proj_i][bj.slot] -= (int64_t) bj.len;
+                                        if (bsl.proj_left[proj_i][bj.slot] == 0) {
+                                            bsl.proj_ready_us[proj_i][bj.slot] = ggml_time_us();
+                                            reinterpret_cast<std::atomic<uint32_t> *>(&bsl.proj_ready[proj_i][bj.slot])->store(1, std::memory_order_release);
+                                        }
+                                    }
+                                }
+                                bsl.slot_pending[bj.slot] -= 1;
+                                if (!bok) {
+                                    bsl.slot_chunk_bad[bj.slot] = 1;
+                                }
+                                if (bsl.slot_pending[bj.slot] == 0) {
+                                    n_idle_loading -= n_idle_loading > 0 ? 1 : 0;
+                                    if (!fs_verify_slot.empty()) {
+                                        fs_verify_settled(bsl, bj.slot, bok && !bsl.slot_chunk_bad[bj.slot]);
+                                    }
+                                    if (bok && !bsl.slot_chunk_bad[bj.slot] && !bcancel) {
+                                        slot_settle_ready(bsl, bj.slot);
+                                    } else {
+                                        bsl.slot_prefetch[bj.slot] = 0;
+                                        drop_slot(bsl, bj.slot);
+                                        if (!bsl.el_land.empty()) {
+                                            bsl.el_land[bj.slot] = 0;
+                                        }
+                                        if (!bcancel) {
+                                            n_idle_failed += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        cv_done.notify_all();
+                        continue;
+                    }
+                }
+            }
         } else if (io_stop) {
             break;
         } else if (BEHIND && gi_capped && !capped && (!q_prefetch.empty() || !pl_list.empty())) {
@@ -6245,12 +6376,13 @@ void llama_moe_stream::io_loop_t(int ith) {
             // A sidecar already in the repacked layout is copied into the slot as it is; only a
             // plain sidecar is converted, and then only into a repacked pool.
             wait_slot_h2d_done(sl, job.slot);
+            const int rfd = io_fd(ith);
             if (convert_on_read && !sl.repacked) {
                 // this thread's own scratch, so the reads stay parallel (one shared scratch behind a
                 // mutex serialized all of them and tripled the stall: 13.5 -> 42.8 ms/token)
                 uint8_t * scratch = repack_scratch(ith);
 
-                if (!moe_stream_read_range_to(file.file_id(), sl, job.expert, scratch, job.off, job.len)) {
+                if (!moe_stream_read_range_to(rfd, sl, job.expert, scratch, job.off, job.len)) {
                     ok = false;
                 } else {
                     for (int p = 0; p < 3; p++) {
@@ -6266,9 +6398,9 @@ void llama_moe_stream::io_loop_t(int ith) {
             } else if (cpu_repack_on) {
                 // the sidecar is already repacked and the pool is repacked: straight into the slot,
                 // no scratch and no conversion
-                ok = moe_stream_read_range(file.file_id(), sl, job.expert, job.slot, job.off, job.len, job.dz_touch);
+                ok = moe_stream_read_range(rfd, sl, job.expert, job.slot, job.off, job.len, job.dz_touch);
             } else {
-                ok = moe_stream_read_range(file.file_id(), sl, job.expert, job.slot, job.off, job.len, job.dz_touch);
+                ok = moe_stream_read_range(rfd, sl, job.expert, job.slot, job.off, job.len, job.dz_touch);
             }
 
             if (ok) {
@@ -10639,8 +10771,8 @@ void llama_moe_stream::idle_round(std::unique_lock<std::mutex> & lock, bool star
     }
     n_idle_rounds += 1;
     const int64_t t0    = ggml_time_us();
-    // the fill at start keeps a second read per I/O thread queued, so a thread that finishes one takes the next at once
-    const size_t  max_out = start ? 2*std::max<size_t>(1, io_threads.size()) : std::max<size_t>(2, io_threads.size());
+    // the fill at start keeps deep LBA-sorted batches per layer queued so all I/O threads execute large sequential scatter-DMAs
+    const size_t  max_out = start ? 64*std::max<size_t>(1, io_threads.size()) : std::max<size_t>(2, io_threads.size());
     const auto    outstanding = [&] { return (size_t) n_idle_loading; };
     const int64_t seq0 = idle_call_seq;
     // (elastic RAM: a give-back switches the empty slots off first and never a slot being read, and the scan below skips switched-off
@@ -10681,6 +10813,81 @@ void llama_moe_stream::idle_round(std::unique_lock<std::mutex> & lock, bool star
     if (start) {
         fprintf(stderr, "llama_moe_stream: loading: experts into RAM 0 %% (0 of %lld, 0.0 of %.1f GB, 0.0 s)\n", (long long) plan_n, plan_bytes/1e9);
         fs_running = true;
+        // Startup preload: issue layer-by-layer in ascending expert LBA order (while preserving exact rank-ordered LRU stamps),
+        // grouping projection pieces in q_idle so I/O threads coalesce contiguous experts into 16 MiB preadv scatter-DMAs.
+        struct start_pick { int32_t e; size_t rank_r; uint32_t ord; };
+        std::vector<start_pick> picks;
+        for (lyr & x : ls) {
+            if (stop()) {
+                break;
+            }
+            llama_moe_stream_layer & sl = *x.sl;
+            picks.clear();
+            picks.reserve(x.n_empty);
+            for (size_t r = 0; r < x.rank.size() && picks.size() < x.n_empty; r++) {
+                const int32_t e = x.rank[r];
+                if (sl.expert_slot[e] >= 0 || (sl.vx_held(e) && !vx_keep_ram)) {
+                    continue;
+                }
+                picks.push_back({ e, r, (uint32_t) picks.size() });
+            }
+            std::sort(picks.begin(), picks.end(), [](const start_pick & a, const start_pick & b) { return a.e < b.e; });
+            for (size_t i0 = 0; i0 < picks.size() && !stop(); i0 += 64) {
+                wait_below(max_out);
+                if (stop()) {
+                    break;
+                }
+                const size_t i1 = std::min(picks.size(), i0 + (size_t) 64);
+                const size_t q0 = q_idle.size();
+                for (size_t i = i0; i < i1 && x.n_iss < x.n_empty; i++) {
+                    const int32_t e = picks[i].e;
+                    if (sl.expert_slot[e] >= 0 || (sl.vx_held(e) && !vx_keep_ram)) {
+                        continue;
+                    }
+                    while (x.scan < sl.n_slots && !(sl.slot_state[x.scan] == MOE_STREAM_SLOT_EMPTY && !(!sl.slot_off.empty() && sl.slot_off[x.scan]))) {
+                        x.scan += 1;
+                    }
+                    if (x.scan >= sl.n_slots) {
+                        break;
+                    }
+                    const int32_t slot = (int32_t) x.scan;
+                    if (sl.slot_expert[slot] >= 0 || sl.keep[slot]) {
+                        n_idle_not_empty += 1;
+                        x.scan += 1;
+                        continue;
+                    }
+                    enqueue(sl, e, slot, /* prefetch = */ false, 0, -1, 0, /* pr_split_ok = */ false, /* idle = */ true);
+                    sl.slot_idle[slot] = 1;
+                    n_idle_loading    += 1;
+                    if (idle_stamp_old) {
+                        sl.slot_last_use[slot] = sl.use_counter - 1 - (int64_t) picks[i].rank_r;
+                    } else {
+                        if (x.n_iss == 0) {
+                            for (uint64_t & t : sl.slot_last_use) {
+                                t += x.n_empty;
+                            }
+                            for (uint64_t & t : sl.vf_cb_stamp) {
+                                t += t > 0 ? x.n_empty : 0;
+                            }
+                            sl.use_counter += x.n_empty;
+                            n_idle_shifts  += 1;
+                        }
+                        sl.slot_last_use[slot] = (uint64_t) (x.n_empty - std::min(picks[i].ord, x.n_empty - 1));
+                    }
+                    x.n_iss  += 1;
+                    n_issued += 1;
+                    x.scan   += 1;
+                }
+                if (sl.by_proj && q_idle.size() > q0 + 1) {
+                    std::stable_sort(q_idle.begin() + (ptrdiff_t) q0, q_idle.end(),
+                            [](const llama_moe_stream_job & a, const llama_moe_stream_job & b) {
+                                return a.off != b.off ? a.off < b.off : a.expert < b.expert;
+                            });
+                }
+                cv_work.notify_all();
+            }
+        }
+        any = false;
     }
     for (size_t r = 0; any && !stop(); r++) {
         any = false;
@@ -11161,7 +11368,8 @@ void llama_moe_stream::win_check_budget(const char * where) const {
 // T switches on its lowest switched-off slot below its zero block, else raises the zero block by one (T has no graph in flight: it has
 // not run in this call, or the call is over). The pages of A's slot, when it holds RAM, move onto T's slot (the OS layer's page move;
 // where there is none they are returned and T's next read gets fresh pages). false = T is at its cap
-bool llama_moe_stream::win_move_room(llama_moe_stream_layer & A, int32_t a, llama_moe_stream_layer & T) {
+bool llama_moe_stream::win_move_room(llama_moe_stream_layer & A, int32_t a, llama_moe_stream_layer & T,
+                                     std::vector<std::pair<llama_moe_stream_layer *, int32_t>> * defer_rel) {
     int32_t t = -1;
     for (uint32_t s = 0; s < T.n_slots; s++) {
         if (T.slot_off[s]) {
@@ -11214,7 +11422,11 @@ bool llama_moe_stream::win_move_room(llama_moe_stream_layer & A, int32_t a, llam
         A.el_res[a] = 0;   A.el_zero_known[a] = 1;   A.el_land[a] = 0;   // A's range is fresh again
         n_win_pagemoves += 1;
     } else {
-        el_release_slot(A, a);   // (the projections that did move left fresh ranges behind; returning them again is harmless)
+        if (defer_rel != nullptr && !win_check) {
+            defer_rel->push_back({ &A, a });
+        } else {
+            el_release_slot(A, a);   // (the projections that did move left fresh ranges behind; returning them again is harmless)
+        }
         n_win_released += 1;
     }
     n_win_moves += 1;
@@ -11276,7 +11488,9 @@ int64_t llama_moe_stream::win_take(llama_moe_stream_layer & T, int64_t need, boo
         return (size_t) e < u.sl->win_score.size() ? u.sl->win_score[e] : 0.0f; };
     std::stable_sort(c[3].begin(), c[3].end(), [&](const cand & u, const cand & v) { return sc(u) < sc(v); });
     int64_t got = 0;
-    for (int g = 0; g < 4 && got < need; g++) {
+    std::vector<std::pair<llama_moe_stream_layer *, int32_t>> defer_rel;
+    bool stopped_at_cap = false;
+    for (int g = 0; g < 4 && got < need && !stopped_at_cap; g++) {
         for (const cand & u : c[g]) {
             if (got >= need) {
                 break;
@@ -11285,14 +11499,16 @@ int64_t llama_moe_stream::win_take(llama_moe_stream_layer & T, int64_t need, boo
             if (g == 3 && e >= 0) {
                 u.sl->win_refill.push_back(e);   // a kept expert given up for now: read back after the call
             }
-            if (!win_move_room(*u.sl, u.s, T)) {
-                return got;   // T is at its cap
+            if (!win_move_room(*u.sl, u.s, T, &defer_rel)) {
+                stopped_at_cap = true;
+                break;   // T is at its cap
             }
             got += 1;
             n_win_borrowed   += g == 2 ? 1 : 0;
             n_win_keep_taken += g == 3 ? 1 : 0;
         }
     }
+    el_release_slots_batch(defer_rel);
     return got;
 }
 
@@ -11479,7 +11695,7 @@ void llama_moe_stream::win_layer_start(llama_moe_stream_layer & sl, const int32_
         if (sl.win_score[e] == 0.0f && !sl.vx_held(e)) {
             sl.win_union += 1;   // counted on first pick (the floor keeps a picked score above 0); not the VRAM-held ones
         }
-        sl.win_score[e] = win_rule == 0 ? sl.win_score[e] + std::max(std::exp2(-(float) (n_tok - 1 - t)/p1.prompt_end_halflife), 1e-30f)
+        sl.win_score[e] = win_rule == 0 ? sl.win_score[e] + std::max(pe_decay(n_tok - 1 - t), 1e-30f)
                         : win_rule == 1 ? (float) (sl.win_tok + t + 1)
                         :                 sl.win_score[e] + 1.0f;
     }
@@ -11877,6 +12093,7 @@ void llama_moe_stream::win_restore(bool drop_ready) {
     const auto home_of = [&](const llama_moe_stream_layer & x) -> uint32_t {
         return el_on ? (x.win_home > 0 ? x.win_home : x.share) : rest_share();
     };
+    std::vector<std::pair<llama_moe_stream_layer *, int32_t>> defer_rel;
     for (llama_moe_stream_layer * T : L) {
         for (llama_moe_stream_layer * A : L) {
             if (T->share >= home_of(*T)) {
@@ -11889,7 +12106,7 @@ void llama_moe_stream::win_restore(bool drop_ready) {
                 if (A->share <= home_of(*A) || T->share >= home_of(*T)) {
                     break;
                 }
-                win_move_room(*A, s, *T);
+                win_move_room(*A, s, *T, &defer_rel);
             }
         }
     }
@@ -11906,7 +12123,7 @@ void llama_moe_stream::win_restore(bool drop_ready) {
             dz_forget(*x, s);
             x->slot_off[s] = 1; x->gsf_dirty = 1;
             x->share      -= 1;
-            el_release_slot(*x, s);
+            defer_rel.push_back({ x, s });
         }
         on     += x->share;
         hm_sum += hm;
@@ -11914,6 +12131,7 @@ void llama_moe_stream::win_restore(bool drop_ready) {
             x->win_home = 0;
         }
     }
+    el_release_slots_batch(defer_rel);
     win_over = std::max<int64_t>(0, on - hm_sum);
 }
 
@@ -11992,6 +12210,7 @@ void llama_moe_stream::win_compact(llama_moe_stream_layer & sl) {
         }
     }
     size_t il = 0;
+    std::vector<std::pair<llama_moe_stream_layer *, int32_t>> defer_rel;
     for (uint32_t h = n_slots; h < sl.n_slots; h++) {
         if (sl.slot_off[h]) {
             continue;
@@ -12016,9 +12235,10 @@ void llama_moe_stream::win_compact(llama_moe_stream_layer & sl) {
             dz_forget(sl, (int32_t) h);
             sl.slot_off[h] = 1; sl.gsf_dirty = 1;
             sl.share      -= 1;
-            el_release_slot(sl, (int32_t) h);
+            defer_rel.push_back({ &sl, (int32_t) h });
         }
     }
+    el_release_slots_batch(defer_rel);
 }
 
 void llama_moe_stream::win_print_stats() const {
@@ -12471,7 +12691,7 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
         std::fill(sl.p1_pe_w.begin(), sl.p1_pe_w.end(), 0.0f);
         sl.p1_pe_seq = call_seq;
         for (int64_t t = 0; t < n_tok; t++) {
-            const float wt = std::exp2(-(float) (n_tok - 1 - t)/p1.prompt_end_halflife);
+            const float wt = pe_decay(n_tok - 1 - t);
             for (int64_t j = 0; j < k; j++) {
                 sl.p1_pe_w[ids[t*k + j]] += wt;
             }
@@ -12511,9 +12731,24 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
                 const int32_t s = sl.expert_slot[e];
                 wp_res[e] = s >= 0 && !sl.slot_cancel[s] && !(sl.el_low_only && s >= (int32_t) n_slots) ? 1 : 0;
             }
+            std::vector<uint8_t> wp_vram_w0;
+            const uint8_t * vram_w0_ptr = nullptr;
+            if (ca_on && ca_job_il == sl.il && ca_job_w == 0 && !ca_place.empty()) {
+                wp_vram_w0.assign(sl.n_expert, 0);
+                int64_t n_ca_hit = 0;
+                for (const int32_t e : sl.uniq) {
+                    if ((size_t) e < ca_place.size() && ca_place[(size_t) e] >= 0) {
+                        wp_vram_w0[(size_t) e] = 1;
+                        n_ca_hit++;
+                    }
+                }
+                if (n_ca_hit > 0) {
+                    vram_w0_ptr = wp_vram_w0.data();
+                }
+            }
             std::string err;
             bool built = moe_wave_plan_build(wp_tab, sl.uniq, ids, n, wp_res.data(), pe_ub ? sl.p1_pe_w.data() : nullptr, n_waves(n_tok),
-                        wave_w, wave_cap(n_tok), (int32_t) sl.n_expert, err);
+                        wave_w, wave_cap(n_tok), (int32_t) sl.n_expert, err, vram_w0_ptr);
             if (!built && wave_cap(n_tok) < n_tok*(int64_t) n_expert_used) {
                 // A pair cap below the safe one (only MOE_STREAM_TEST_WAVE_SLACK sets one) did not fit - built again without a
                 // cap (each expert in one wave; the wave graph computes every row in every wave, so no index tensor is sized by the cap)
@@ -12523,7 +12758,7 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
                 }
                 err.clear();
                 built = moe_wave_plan_build(wp_tab, sl.uniq, ids, n, wp_res.data(), pe_ub ? sl.p1_pe_w.data() : nullptr, n_waves(n_tok),
-                        wave_w, n_tok*(int64_t) n_expert_used, (int32_t) sl.n_expert, err);
+                        wave_w, n_tok*(int64_t) n_expert_used, (int32_t) sl.n_expert, err, vram_w0_ptr);
             }
             if (!built) {   // (without a cap it always fits - a stop here is a bug)
                 for (const int32_t e : sl.uniq) {
@@ -16729,17 +16964,24 @@ int64_t llama_moe_stream::vx_growth_bytes(int64_t n_ubatch, int64_t n_ctx_run, s
     // instance per streamed layer for each live shape set (the decode graph, the prompt piece shapes seen in the last 10 s) = ~1.5 MiB per
     // streamed layer (55.5 MiB for Ling's 37, measured maximum ~50 + 10 %); it is not held where the backend does not use CUDA graphs. The
     // scratch is counted here only when it is not mapped at start. --moe-stream-vram-growth replaces the whole sum.
-    (void) n_ubatch; (void) n_ctx_run;
+    (void) n_ctx_run;
     const int64_t modules = (int64_t) 20 << 20;
     const int64_t graphs  = vx_graphs_on ? (int64_t) il_of_moe.size()*1572864 : 0;
     const int64_t scratch = vx_scratch_premapped > 0 ? 0 : vx_scratch_lazy;
+    // With --spec-type draft-mtp, ctx_dft (LLAMA_CONTEXT_TYPE_MTP, ubatch <= 256) is built after ctx_tgt's vx_setup on the same GPU,
+    // taking its NextN KV/recurrent cache plus its own compute buffer / VMM scratch / CUDA graph, and prompt calls also allocate the pinned H2D ring.
+    const int64_t ub_mtp  = std::min<int64_t>(std::max<int64_t>(1, n_ubatch), 256);
+    const int64_t mtp_dft = p1.mtp_on_pool_dev
+            ? p1.mtp_ctx_bytes + std::max<int64_t>((int64_t) 192 << 20, ub_mtp * std::max<int64_t>(2048, n_embd) * 96)
+            : 0;
     if (why) {
-        *why = format("derived: 20 MiB modules + %.1f MiB CUDA-graph instances (1.5 MiB x %zu streamed layers%s)%s", graphs/1048576.0, il_of_moe.size(),
+        *why = format("derived: 20 MiB modules + %.1f MiB CUDA-graph instances (1.5 MiB x %zu streamed layers%s)%s%s", graphs/1048576.0, il_of_moe.size(),
                 vx_graphs_on ? "" : "; the backend uses no CUDA graphs",
                 vx_scratch_premapped > 0 ? format("; the %.1f MiB scratch pool is mapped at start and in the check", vx_scratch_premapped/1048576.0).c_str()
-                : scratch > 0 ? format(" + %.1f MiB scratch pool (not mapped at start)", scratch/1048576.0).c_str() : "");
+                : scratch > 0 ? format(" + %.1f MiB scratch pool (not mapped at start)", scratch/1048576.0).c_str() : "",
+                mtp_dft > 0 ? format(" + %.1f MiB MTP draft context", mtp_dft/1048576.0).c_str() : "");
     }
-    return modules + graphs + scratch;
+    return modules + graphs + scratch + mtp_dft;
 }
 
 // Once per request, when its prompt is done (set_decode): the free VRAM now against the load-time check. Printed the first
@@ -18494,7 +18736,7 @@ void llama_moe_stream::pring_ensure() {
 }
 
 void llama_moe_stream::tailw_set_async_staged(ggml_tensor * D, const char * src, size_t dst_off, size_t nbytes) {
-    if (p1.pinned_ring <= 0 || nbytes == 0) {
+    if (pools_registered || p1.pinned_ring <= 0 || nbytes == 0) {
         ggml_backend_tensor_set_async(tailw_be, D, src, dst_off, nbytes);
         return;
     }
@@ -18502,28 +18744,100 @@ void llama_moe_stream::tailw_set_async_staged(ggml_tensor * D, const char * src,
         pring_ensure();
     }
     const size_t slice_cap = pring_cap / PRING_SLICES;
-    if (pring_ptr == nullptr || slice_cap == 0 || nbytes > slice_cap) {
+    if (pring_ptr == nullptr || slice_cap == 0) {
         ggml_backend_tensor_set_async(tailw_be, D, src, dst_off, nbytes);
         return;
     }
-    if (pring_head + nbytes > slice_cap) {
-        if (pring_ev[pring_slice]) {
-            ggml_backend_event_record(pring_ev[pring_slice], tailw_be);
-            pring_ev_rec[pring_slice] = true;
+    size_t rem = nbytes;
+    size_t off = 0;
+    while (rem > 0) {
+        const size_t chunk = std::min(rem, slice_cap);
+        if (pring_head + chunk > slice_cap) {
+            if (pring_ev[pring_slice]) {
+                ggml_backend_event_record(pring_ev[pring_slice], tailw_be);
+                pring_ev_rec[pring_slice] = true;
+            }
+            pring_slice = (pring_slice + 1) % PRING_SLICES;
+            pring_head  = 0;
+            if (pring_ev_rec[pring_slice] && pring_ev[pring_slice]) {
+                ggml_backend_event_synchronize(pring_ev[pring_slice]);
+                pring_ev_rec[pring_slice] = false;
+            }
+            pring_wraps += 1;
         }
-        pring_slice = (pring_slice + 1) % PRING_SLICES;
-        pring_head  = 0;
-        if (pring_ev_rec[pring_slice] && pring_ev[pring_slice]) {
-            ggml_backend_event_synchronize(pring_ev[pring_slice]);
-            pring_ev_rec[pring_slice] = false;
-        }
-        pring_wraps += 1;
+        char * stage = pring_ptr + (size_t) pring_slice * slice_cap + pring_head;
+        std::memcpy(stage, src + off, chunk);
+        ggml_backend_tensor_set_async(tailw_be, D, stage, dst_off + off, chunk);
+        pring_head   = GGML_PAD(pring_head + chunk, 64);
+        pring_bytes += (int64_t) chunk;
+        off += chunk;
+        rem -= chunk;
     }
-    char * stage = pring_ptr + (size_t) pring_slice * slice_cap + pring_head;
-    std::memcpy(stage, src, nbytes);
-    ggml_backend_tensor_set_async(tailw_be, D, stage, dst_off, nbytes);
-    pring_head   = GGML_PAD(pring_head + nbytes, 64);
-    pring_bytes += (int64_t) nbytes;
+}
+
+void llama_moe_stream::vf_pring_ensure() {
+    if (vf_pring_buf != nullptr || p1.pinned_ring <= 0 || vf_be == nullptr) {
+        return;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(vf_be);
+    ggml_backend_buffer_type_t hbuft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    if (hbuft == nullptr) {
+        return;
+    }
+    for (int64_t sz = p1.pinned_ring; sz >= ((int64_t) 32 << 20); sz >>= 1) {
+        ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(hbuft, (size_t) sz);
+        if (b != nullptr) {
+            vf_pring_buf   = b;
+            vf_pring_ptr   = (char *) ggml_backend_buffer_get_base(b);
+            vf_pring_cap   = (size_t) sz;
+            vf_pring_head  = 0;
+            vf_pring_slice = 0;
+            for (int s = 0; s < PRING_SLICES; ++s) {
+                vf_pring_ev[s]     = ggml_backend_event_new(dev);
+                vf_pring_ev_rec[s] = false;
+            }
+            fprintf(stderr, "llama_moe_stream: uploader pinned H2D staging ring allocated: %.1f MiB\n", (double) sz / 1048576.0);
+            break;
+        }
+    }
+}
+
+void llama_moe_stream::vf_set_async_staged(ggml_tensor * D, const char * src, size_t dst_off, size_t nbytes) {
+    if (pools_registered || p1.pinned_ring <= 0 || nbytes == 0) {
+        ggml_backend_tensor_set_async(vf_be, D, src, dst_off, nbytes);
+        return;
+    }
+    if (vf_pring_ptr == nullptr) {
+        vf_pring_ensure();
+    }
+    const size_t slice_cap = vf_pring_cap / PRING_SLICES;
+    if (vf_pring_ptr == nullptr || slice_cap == 0) {
+        ggml_backend_tensor_set_async(vf_be, D, src, dst_off, nbytes);
+        return;
+    }
+    size_t rem = nbytes;
+    size_t off = 0;
+    while (rem > 0) {
+        const size_t chunk = std::min(rem, slice_cap);
+        if (vf_pring_head + chunk > slice_cap) {
+            if (vf_pring_ev[vf_pring_slice]) {
+                ggml_backend_event_record(vf_pring_ev[vf_pring_slice], vf_be);
+                vf_pring_ev_rec[vf_pring_slice] = true;
+            }
+            vf_pring_slice = (vf_pring_slice + 1) % PRING_SLICES;
+            vf_pring_head  = 0;
+            if (vf_pring_ev_rec[vf_pring_slice] && vf_pring_ev[vf_pring_slice]) {
+                ggml_backend_event_synchronize(vf_pring_ev[vf_pring_slice]);
+                vf_pring_ev_rec[vf_pring_slice] = false;
+            }
+        }
+        char * stage = vf_pring_ptr + (size_t) vf_pring_slice * slice_cap + vf_pring_head;
+        std::memcpy(stage, src + off, chunk);
+        ggml_backend_tensor_set_async(vf_be, D, stage, dst_off + off, chunk);
+        vf_pring_head = GGML_PAD(vf_pring_head + chunk, 64);
+        off += chunk;
+        rem -= chunk;
+    }
 }
 
 void llama_moe_stream::set_lm_routed_ids(int32_t il, const int32_t * ids_host, int64_t n) {
@@ -19029,6 +19343,14 @@ void llama_moe_stream::tailw_gather(llama_moe_stream_layer & sl, int32_t * out, 
                     ca_es.push_back((int32_t) e);   // (a held expert may have a RAM copy now; the VRAM pass computes it)
                 }
             }
+            if ((int32_t) ca_es.size() > Wp2 && (size_t) il2 < us_cnt.size() && !us_cnt[(size_t) il2].empty()) {
+                const auto & uc = us_cnt[(size_t) il2];
+                std::stable_sort(ca_es.begin(), ca_es.end(), [&](int32_t a, int32_t b) {
+                    const uint32_t ca = (size_t) a < uc.size() ? uc[(size_t) a] : 0u;
+                    const uint32_t cb = (size_t) b < uc.size() ? uc[(size_t) b] : 0u;
+                    return ca > cb;
+                });
+            }
         }
         ca_slots.resize(ca_es.size());
         if (!ca_es.empty()) {
@@ -19410,7 +19732,7 @@ void llama_moe_stream::ca_run_job(ca_job_t & j) {
         for (int k = 0; k < (j.gu_only ? 2 : 3); k++) {   // (one set: the down parts follow with the next gather)
             const ggml_tensor * P = sl.weights[k].pool;
             const size_t nb = P->nb[2];
-            ggml_backend_tensor_set_async(vf_be, tailw_tg[gix][(size_t) k], (const char *) P->data + (size_t) s0*nb, (size_t) p0*nb, (size_t) len*nb);
+            vf_set_async_staged(tailw_tg[gix][(size_t) k], (const char *) P->data + (size_t) s0*nb, (size_t) p0*nb, (size_t) len*nb);
             bytes += (int64_t) len*(int64_t) nb;
         }
         i = k2;
@@ -19490,7 +19812,7 @@ void llama_moe_stream::ca_run_job(ca_job_t & j) {
                 for (int k = 0; k < (j.gu_only ? 2 : 3); k++) {
                     const ggml_tensor * P = sl.weights[k].pool;
                     const size_t nb = P->nb[2];
-                    ggml_backend_tensor_set_async(vf_be, tailw_tg[gix][(size_t) k], (const char *) P->data + (size_t) ps.second*nb, (size_t) ps.first*nb, nb);
+                    vf_set_async_staged(tailw_tg[gix][(size_t) k], (const char *) P->data + (size_t) ps.second*nb, (size_t) ps.first*nb, nb);
                     bytes += (int64_t) nb;
                 }
             }
@@ -19938,11 +20260,11 @@ void llama_moe_stream::psplit_run_job(psplit_job_t & j) {
     const size_t nb_d = ggml_row_size(G.t_down, G.ne_down[0])*G.ne_down[1];
     for (const auto & x : j.list) {
         const int32_t s = x[1], pl = x[2];
-        ggml_backend_tensor_set_async(vf_be, G.gate_up, (const char *) sl.weights[0].pool->data + (size_t) s*sl.weights[0].size,
+        vf_set_async_staged(G.gate_up, (const char *) sl.weights[0].pool->data + (size_t) s*sl.weights[0].size,
                 (size_t) pl*2*nb_g, nb_g);
-        ggml_backend_tensor_set_async(vf_be, G.gate_up, (const char *) sl.weights[1].pool->data + (size_t) s*sl.weights[1].size,
+        vf_set_async_staged(G.gate_up, (const char *) sl.weights[1].pool->data + (size_t) s*sl.weights[1].size,
                 (size_t) pl*2*nb_g + nb_g, nb_g);
-        ggml_backend_tensor_set_async(vf_be, G.down, (const char *) sl.weights[2].pool->data + (size_t) s*sl.weights[2].size,
+        vf_set_async_staged(G.down, (const char *) sl.weights[2].pool->data + (size_t) s*sl.weights[2].size,
                 (size_t) pl*nb_d, nb_d);
     }
     ggml_backend_event_record(psplit_ev, vf_be);
@@ -20423,8 +20745,12 @@ void llama_moe_stream::vf_copy(vf_job_t & j, const uint8_t * gate, const uint8_t
     if (vf_ev_on) {
         ggml_backend_event_wait(vf_be, vf_ev);   // the GPU holds the copy until the last event tick's word has run
     }
-    ggml_backend_tensor_set_async(vf_be, G.gate_up, gate, o_g, nb_g);
-    ggml_backend_tensor_set_async(vf_be, G.gate_up, up,   o_u, nb_g);
+    if (vf_bounce) {
+        ggml_backend_tensor_set_async(vf_be, G.gate_up, gate, o_g, 2*nb_g);
+    } else {
+        ggml_backend_tensor_set_async(vf_be, G.gate_up, gate, o_g, nb_g);
+        ggml_backend_tensor_set_async(vf_be, G.gate_up, up,   o_u, nb_g);
+    }
     ggml_backend_tensor_set_async(vf_be, G.down,    down, o_d, nb_d);
     ggml_backend_synchronize(vf_be);
 }
@@ -20627,6 +20953,20 @@ void llama_moe_stream::vf_stop_uploader() {
         ggml_backend_buffer_free(vf_bounce_buf);
         vf_bounce_buf = nullptr;
         vf_bounce     = nullptr;
+    }
+    for (int s = 0; s < PRING_SLICES; ++s) {
+        if (vf_pring_ev[s]) {
+            ggml_backend_event_free(vf_pring_ev[s]);
+            vf_pring_ev[s]     = nullptr;
+            vf_pring_ev_rec[s] = false;
+        }
+    }
+    if (vf_pring_buf) {
+        ggml_backend_buffer_free(vf_pring_buf);
+        vf_pring_buf  = nullptr;
+        vf_pring_ptr  = nullptr;
+        vf_pring_cap  = 0;
+        vf_pring_head = 0;
     }
     if (vf_be) {
         ggml_backend_free(vf_be);
@@ -22090,6 +22430,13 @@ int64_t llama_moe_stream::el_drop_layer(llama_moe_stream_layer & sl, int64_t n, 
 
 // mtx held: a switched-off slot's pages back to the system; with every page of its three slices returned it reads as zeros (known zero)
 void llama_moe_stream::el_release_slot(llama_moe_stream_layer & sl, int32_t s) {
+#if !EL_OS_WIN32
+    static const bool test_rel_fail = getenv("MOE_STREAM_TEST_RELEASE_FAIL") != nullptr && atoi(getenv("MOE_STREAM_TEST_RELEASE_FAIL")) != 0;
+    if (!test_rel_fail && sl.el_res[s] == 0 && sl.el_zero_known[s] != 0) {
+        sl.el_land[s] = 0;
+        return;
+    }
+#endif
     bool whole = true;
     for (int p = 0; p < 3; p++) {
         whole = el_os_release_pages((uint8_t *) sl.weights[p].pool->data + (size_t) s*sl.weights[p].size, sl.weights[p].size, sl.slot_off[s] != 0) && whole;
@@ -22097,6 +22444,80 @@ void llama_moe_stream::el_release_slot(llama_moe_stream_layer & sl, int32_t s) {
     sl.el_zero_known[s] = whole ? 1 : 0;
     sl.el_res[s]        = whole ? 0 : 1;   // every page returned = no RAM (a part left = counted as holding RAM)
     sl.el_land[s]       = 0;
+}
+
+void llama_moe_stream::el_release_slots_batch(std::vector<std::pair<llama_moe_stream_layer *, int32_t>> & batch) {
+    if (batch.empty()) {
+        return;
+    }
+#if EL_OS_WIN32
+    for (const auto & item : batch) {
+        el_release_slot(*item.first, item.second);
+    }
+    batch.clear();
+#else
+    static const bool test_rel_fail = getenv("MOE_STREAM_TEST_RELEASE_FAIL") != nullptr && atoi(getenv("MOE_STREAM_TEST_RELEASE_FAIL")) != 0;
+    if (test_rel_fail) {
+        for (const auto & item : batch) {
+            el_release_slot(*item.first, item.second);
+        }
+        batch.clear();
+        return;
+    }
+    size_t keep_n = 0;
+    for (size_t i = 0; i < batch.size(); i++) {
+        llama_moe_stream_layer & sl = *batch[i].first;
+        const int32_t s = batch[i].second;
+        if (sl.el_res[s] == 0 && sl.el_zero_known[s] != 0) {
+            sl.el_land[s] = 0;
+            continue;
+        }
+        batch[keep_n++] = batch[i];
+    }
+    batch.resize(keep_n);
+    if (batch.empty()) {
+        return;
+    }
+    std::sort(batch.begin(), batch.end(), [](const auto & a, const auto & b) {
+        return a.first->il != b.first->il ? a.first->il < b.first->il : a.second < b.second;
+    });
+    batch.erase(std::unique(batch.begin(), batch.end()), batch.end());
+    const size_t pg = os_page_size();
+    size_t i = 0;
+    while (i < batch.size()) {
+        llama_moe_stream_layer & sl = *batch[i].first;
+        const int32_t s0 = batch[i].second;
+        int32_t s1 = s0;
+        size_t j = i + 1;
+        while (j < batch.size() && batch[j].first == &sl && batch[j].second == s1 + 1) {
+            s1 = batch[j].second;
+            j++;
+        }
+        bool aligned = s1 > s0;
+        for (int p = 0; p < 3 && aligned; p++) {
+            aligned = ((uintptr_t) sl.weights[p].pool->data % pg == 0) && (sl.weights[p].size % pg == 0);
+        }
+        if (aligned) {
+            const size_t cnt = (size_t) (s1 - s0 + 1);
+            bool whole = true;
+            for (int p = 0; p < 3; p++) {
+                uint8_t * p0 = (uint8_t *) sl.weights[p].pool->data + (size_t) s0 * sl.weights[p].size;
+                whole = el_os_release_pages(p0, cnt * sl.weights[p].size, true) && whole;
+            }
+            for (int32_t s = s0; s <= s1; s++) {
+                sl.el_zero_known[s] = whole ? 1 : 0;
+                sl.el_res[s]        = whole ? 0 : 1;
+                sl.el_land[s]       = 0;
+            }
+        } else {
+            for (int32_t s = s0; s <= s1; s++) {
+                el_release_slot(sl, s);
+            }
+        }
+        i = j;
+    }
+    batch.clear();
+#endif
 }
 
 // ---- discardable expert slots ----

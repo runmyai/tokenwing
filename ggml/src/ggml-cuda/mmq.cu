@@ -273,6 +273,10 @@ void ggml_cuda_mul_mat_q(
             // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
             if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
                 ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+            } else if (ggml_cuda_mmq_moe_opt_enabled() && cc >= GGML_CUDA_CC_AMPERE && ne02 >= 64) {
+                const int64_t ne02_est = (moe_nz > 0 && moe_nz < ne02) ? (ne02 - moe_nz) : ne02;
+                const int64_t avg_tok  = (ne12 * n_expert_used + ne02_est - 1) / ne02_est;
+                ncols_opt = std::min<int64_t>(ne12, std::max<int64_t>(16, (avg_tok * 5 + 3) / 4));
             }
         }
 
@@ -785,5 +789,5 @@ bool ggml_cuda_mmq_fusion_is_efficient(const ggml_type type, const int64_t nrows
     // Same condition as launch_mul_mat_q uses to run the stream-k kernel with one block per tile.
     const int64_t tiles_nwaves             = (ntiles + nsm - 1) / nsm;
     const int64_t tiles_efficiency_percent = 100 * ntiles / (nsm*tiles_nwaves);
-    return tiles_efficiency_percent >= 90;
+    return tiles_efficiency_percent >= 90 || (tiles_nwaves >= 4 && tiles_efficiency_percent >= 75);
 }

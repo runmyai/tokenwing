@@ -100,6 +100,163 @@ static void concat_cont_cuda(const T * x,
     concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2, 0);
 }
 
+static __global__ void __launch_bounds__(128)
+    concat_dim0_vec16(
+        const char * __restrict__ src0,
+        const char * __restrict__ src1,
+              char * __restrict__ dst,
+        int64_t  n_vec0,
+        int64_t  n_vec_tot,
+        int64_t  ne1,
+        int64_t  ne12,
+        int64_t  total_rows,
+        uint64_t nb01, uint64_t nb02, uint64_t nb03,
+        uint64_t nb11, uint64_t nb12, uint64_t nb13,
+        uint64_t nb1,  uint64_t nb2,  uint64_t nb3) {
+    for (int64_t r = blockIdx.x; r < total_rows; r += gridDim.x) {
+        const int64_t i3  = r / ne12;
+        const int64_t rem = r - i3 * ne12;
+        const int64_t i2  = rem / ne1;
+        const int64_t i1  = rem - i2 * ne1;
+
+        const uint4 * __restrict__ s0 = (const uint4 *) (src0 + (uint64_t) i3*nb03 + (uint64_t) i2*nb02 + (uint64_t) i1*nb01);
+        const uint4 * __restrict__ s1 = (const uint4 *) (src1 + (uint64_t) i3*nb13 + (uint64_t) i2*nb12 + (uint64_t) i1*nb11);
+              uint4 * __restrict__ d  = (      uint4 *) (dst  + (uint64_t) i3*nb3  + (uint64_t) i2*nb2  + (uint64_t) i1*nb1);
+
+        for (int64_t v = threadIdx.x; v < n_vec0; v += 128) {
+            d[v] = s0[v];
+        }
+        for (int64_t v = n_vec0 + threadIdx.x; v < n_vec_tot; v += 128) {
+            d[v] = s1[v - n_vec0];
+        }
+    }
+}
+
+template <typename T>
+static __global__ void __launch_bounds__(128)
+    concat_dim0_rows(
+        const char * __restrict__ src0,
+        const char * __restrict__ src1,
+              char * __restrict__ dst,
+        int64_t  ne00,
+        int64_t  ne0,
+        int64_t  ne1,
+        int64_t  ne12,
+        int64_t  total_rows,
+        uint64_t nb01, uint64_t nb02, uint64_t nb03,
+        uint64_t nb11, uint64_t nb12, uint64_t nb13,
+        uint64_t nb1,  uint64_t nb2,  uint64_t nb3) {
+    for (int64_t r = blockIdx.x; r < total_rows; r += gridDim.x) {
+        const int64_t i3  = r / ne12;
+        const int64_t rem = r - i3 * ne12;
+        const int64_t i2  = rem / ne1;
+        const int64_t i1  = rem - i2 * ne1;
+
+        const T * __restrict__ s0 = (const T *) (src0 + (uint64_t) i3*nb03 + (uint64_t) i2*nb02 + (uint64_t) i1*nb01);
+        const T * __restrict__ s1 = (const T *) (src1 + (uint64_t) i3*nb13 + (uint64_t) i2*nb12 + (uint64_t) i1*nb11);
+              T * __restrict__ d  = (      T *) (dst  + (uint64_t) i3*nb3  + (uint64_t) i2*nb2  + (uint64_t) i1*nb1);
+
+        for (int64_t i0 = threadIdx.x; i0 < ne00; i0 += 128) {
+            d[i0] = s0[i0];
+        }
+        for (int64_t i0 = ne00 + threadIdx.x; i0 < ne0; i0 += 128) {
+            d[i0] = s1[i0 - ne00];
+        }
+    }
+}
+
+template <typename T>
+static __global__ void __launch_bounds__(256)
+    concat_dim0_src0_prefix(
+        const char * __restrict__ src0,
+              char * __restrict__ dst,
+        int64_t  ne00,
+        int64_t  ne1,
+        int64_t  ne12,
+        int64_t  total_elems,
+        uint64_t nb01, uint64_t nb02, uint64_t nb03,
+        uint64_t nb1,  uint64_t nb2,  uint64_t nb3) {
+    for (int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; idx < total_elems; idx += (int64_t) blockDim.x * gridDim.x) {
+        const int64_t r   = idx / ne00;
+        const int64_t i0  = idx - r * ne00;
+        const int64_t i3  = r / ne12;
+        const int64_t rem = r - i3 * ne12;
+        const int64_t i2  = rem / ne1;
+        const int64_t i1  = rem - i2 * ne1;
+
+        *(T *) (dst + (uint64_t) i3*nb3 + (uint64_t) i2*nb2 + (uint64_t) i1*nb1 + (uint64_t) i0*sizeof(T)) =
+            *(const T *) (src0 + (uint64_t) i3*nb03 + (uint64_t) i2*nb02 + (uint64_t) i1*nb01 + (uint64_t) i0*sizeof(T));
+    }
+}
+
+template <typename T>
+static __global__ void __launch_bounds__(256)
+    concat_dim0_src1_transposed(
+        const char * __restrict__ src0,
+        const char * __restrict__ src1,
+              char * __restrict__ dst,
+        int64_t  ne00,
+        int64_t  ne10,
+        int64_t  ne1,
+        int64_t  ne2,
+        int64_t  tiles_x,
+        int64_t  tiles_xy,
+        int64_t  total_tiles,
+        uint64_t nb01, uint64_t nb02, uint64_t nb03,
+        uint64_t nb10, uint64_t nb12, uint64_t nb13,
+        uint64_t nb1,  uint64_t nb2,  uint64_t nb3) {
+    __shared__ T sh[32][33];
+
+    const int tx = threadIdx.x;
+    for (int64_t tile_idx = blockIdx.x; tile_idx < total_tiles; tile_idx += gridDim.x) {
+        const int64_t p23     = tile_idx / tiles_xy;
+        const int64_t rem_xy  = tile_idx - p23 * tiles_xy;
+        const int64_t i3      = p23 / ne2;
+        const int64_t i2      = p23 - i3 * ne2;
+        const int64_t ty_tile = rem_xy / tiles_x;
+        const int64_t tx_tile = rem_xy - ty_tile * tiles_x;
+        const int64_t base_i1 = tx_tile * 32;
+        const int64_t base_j0 = ty_tile * 32;
+
+        const char * __restrict__ s1_plane = src1 + (uint64_t) i3*nb13 + (uint64_t) i2*nb12;
+              char * __restrict__ d_plane  = dst  + (uint64_t) i3*nb3  + (uint64_t) i2*nb2;
+
+        if (src0 != nullptr && ty_tile == 0) {
+            const char * __restrict__ s0_plane = src0 + (uint64_t) i3*nb03 + (uint64_t) i2*nb02;
+            #pragma unroll
+            for (int c = threadIdx.y; c < 32; c += 8) {
+                const int64_t i1 = base_i1 + c;
+                if (i1 < ne1) {
+                    for (int64_t i0 = tx; i0 < ne00; i0 += 32) {
+                        *(T *) (d_plane + (uint64_t) i1*nb1 + (uint64_t) i0*sizeof(T)) =
+                            *(const T *) (s0_plane + (uint64_t) i1*nb01 + (uint64_t) i0*sizeof(T));
+                    }
+                }
+            }
+        }
+
+        const int64_t c1 = base_i1 + tx;
+        #pragma unroll
+        for (int r = threadIdx.y; r < 32; r += 8) {
+            const int64_t r0 = base_j0 + r;
+            if (c1 < ne1 && r0 < ne10) {
+                sh[r][tx] = *(const T *) (s1_plane + (uint64_t) r0*nb10 + (uint64_t) c1*sizeof(T));
+            }
+        }
+        __syncthreads();
+
+        const int64_t j0 = base_j0 + tx;
+        #pragma unroll
+        for (int c = threadIdx.y; c < 32; c += 8) {
+            const int64_t i1 = base_i1 + c;
+            if (i1 < ne1 && j0 < ne10) {
+                *(T *) (d_plane + (uint64_t) i1*nb1 + (uint64_t) (ne00 + j0)*sizeof(T)) = sh[tx][c];
+            }
+        }
+        __syncthreads();
+    }
+}
+
 // non-contiguous kernel (slow)
 template <typename T, int dim>
 static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
@@ -183,6 +340,78 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
+
+        if (dim == 0 && src0->nb[0] == sizeof(T) && src1->nb[0] == sizeof(T) && dst->nb[0] == sizeof(T) &&
+                src0->ne[1] == dst->ne[1] && src0->ne[2] == dst->ne[2] && src0->ne[3] == dst->ne[3] &&
+                src1->ne[1] == dst->ne[1] && src1->ne[2] == dst->ne[2] && src1->ne[3] == dst->ne[3]) {
+            const int64_t ne12       = dst->ne[1] * dst->ne[2];
+            const int64_t total_rows = ne12 * dst->ne[3];
+            if (total_rows > 0) {
+                const int grid_rows = (int) std::min<int64_t>(total_rows, 1048576);
+                const uint64_t row_b0  = (uint64_t) src0->ne[0] * sizeof(T);
+                const uint64_t row_tot = (uint64_t) dst->ne[0]  * sizeof(T);
+                const uint64_t align_m = (uintptr_t) src0->data | (uintptr_t) src1->data | (uintptr_t) dst->data |
+                                         row_b0 | row_tot |
+                                         src0->nb[1] | src0->nb[2] | src0->nb[3] |
+                                         src1->nb[1] | src1->nb[2] | src1->nb[3] |
+                                         dst->nb[1]  | dst->nb[2]  | dst->nb[3];
+                if ((align_m & 15u) == 0) {
+                    concat_dim0_vec16<<<grid_rows, 128, 0, stream>>>(
+                        (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+                        (int64_t) (row_b0 / 16), (int64_t) (row_tot / 16),
+                        dst->ne[1], ne12, total_rows,
+                        src0->nb[1], src0->nb[2], src0->nb[3],
+                        src1->nb[1], src1->nb[2], src1->nb[3],
+                        dst->nb[1],  dst->nb[2],  dst->nb[3]);
+                } else {
+                    concat_dim0_rows<T><<<grid_rows, 128, 0, stream>>>(
+                        (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+                        src0->ne[0], dst->ne[0],
+                        dst->ne[1], ne12, total_rows,
+                        src0->nb[1], src0->nb[2], src0->nb[3],
+                        src1->nb[1], src1->nb[2], src1->nb[3],
+                        dst->nb[1],  dst->nb[2],  dst->nb[3]);
+                }
+            }
+            return;
+        }
+
+        if (dim == 0 && src0->nb[0] == sizeof(T) && src1->nb[1] == sizeof(T) && dst->nb[0] == sizeof(T) &&
+                dst->ne[0] == src0->ne[0] + src1->ne[0] &&
+                src0->ne[1] == dst->ne[1] && src0->ne[2] == dst->ne[2] && src0->ne[3] == dst->ne[3] &&
+                src1->ne[1] == dst->ne[1] && src1->ne[2] == dst->ne[2] && src1->ne[3] == dst->ne[3]) {
+            const int64_t ne12       = dst->ne[1] * dst->ne[2];
+            const int64_t total_rows = ne12 * dst->ne[3];
+            if (total_rows > 0) {
+                const bool fuse_src0 = src0->ne[0] > 0 && src1->ne[0] > 0 && src0->ne[0] <= 64;
+                if (src0->ne[0] > 0 && !fuse_src0) {
+                    const int64_t total_elems0 = src0->ne[0] * total_rows;
+                    const int grid0 = (int) std::min<int64_t>((total_elems0 + 255) / 256, 1048576);
+                    concat_dim0_src0_prefix<T><<<grid0, 256, 0, stream>>>(
+                        (const char *) src0->data, (char *) dst->data,
+                        src0->ne[0], dst->ne[1], ne12, total_elems0,
+                        src0->nb[1], src0->nb[2], src0->nb[3],
+                        dst->nb[1],  dst->nb[2],  dst->nb[3]);
+                }
+                if (src1->ne[0] > 0) {
+                    const int64_t tiles_x     = (dst->ne[1]  + 31) / 32;
+                    const int64_t tiles_y     = (src1->ne[0] + 31) / 32;
+                    const int64_t tiles_xy    = tiles_x * tiles_y;
+                    const int64_t total_tiles = tiles_xy * dst->ne[2] * dst->ne[3];
+                    const int grid1 = (int) std::min<int64_t>(total_tiles, 1048576);
+                    const dim3 block1(32, 8, 1);
+                    concat_dim0_src1_transposed<T><<<grid1, block1, 0, stream>>>(
+                        fuse_src0 ? (const char *) src0->data : nullptr,
+                        (const char *) src1->data, (char *) dst->data,
+                        src0->ne[0], src1->ne[0], dst->ne[1], dst->ne[2],
+                        tiles_x, tiles_xy, total_tiles,
+                        src0->nb[1], src0->nb[2], src0->nb[3],
+                        src1->nb[0], src1->nb[2], src1->nb[3],
+                        dst->nb[1],  dst->nb[2],  dst->nb[3]);
+                }
+            }
+            return;
+        }
 
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {

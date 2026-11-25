@@ -1634,8 +1634,8 @@ static int64_t llama_moe_stream_layer_ctx_bytes(const llama_hparams & hp, llm_ar
     if (!hp.has_kv(il)) {
         return 0;
     }
-    if (!hybrid && hp.n_layer_nextn > 0 && hp.n_layer() > 0 && hp.router_layer < 0 && il >= hp.n_layer()) {
-        return 0;   // the MTP block's cache belongs to the draft context
+    if (!p.load_mtp && !hybrid && hp.n_layer_nextn > 0 && hp.n_layer() > 0 && hp.router_layer < 0 && il >= hp.n_layer()) {
+        return 0;   // the MTP block's cache belongs to the draft context (allocated only when p.load_mtp is true)
     }
     const bool     swa     = hp.swa_type != LLAMA_SWA_TYPE_NONE && hp.is_swa(il) && !swa_full;
     const uint32_t kv_size = swa ? GGML_PAD(std::min(n_ctx_seq, hp.n_swa*(unified ? n_seq : 1) + n_ubatch), 256) : n_ctx_seq;
@@ -2173,7 +2173,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 const int64_t reclaim_cap  = std::max<int64_t>(0, params.moe_stream_gpu_layers_lend_reclaim);
                 const int64_t lend_reclaim = (params.moe_stream_vram_lend_prompt != 0 && params.moe_stream_vram_follow == 1)
                                            ? std::min<int64_t>(wl_compute, reclaim_cap) : 0;
-                const int64_t room_after_fixed = (int64_t) f_pool - pool_keep - wl_compute - wl_prewarm - pool_oth - pool_ctx;
+                const int64_t mtp_compute_pool = [&]() -> int64_t {
+                    if (!ml.load_mtp || hparams.n_layer_nextn == 0 || ms_pool_dev == nullptr) {
+                        return 0;
+                    }
+                    bool any_mtp = false;
+                    for (int x = il_end; x < n_layer_all; ++x) {
+                        if (x < (int) pimpl->dev_layer.size() && pimpl->dev_layer[x].dev == ms_pool_dev) {
+                            any_mtp = true;
+                            break;
+                        }
+                    }
+                    if (!any_mtp) {
+                        return 0;
+                    }
+                    const int64_t ub_m = std::min<int64_t>(params.moe_stream_ubatch > 0 ? (int64_t) params.moe_stream_ubatch : 256, 256);
+                    return std::max<int64_t>((int64_t) 192 << 20, ub_m * std::max<int64_t>(2048, (int64_t) hparams.n_embd) * 96);
+                }();
+                const int64_t room_after_fixed = (int64_t) f_pool - pool_keep - wl_compute - wl_prewarm - pool_oth - pool_ctx - mtp_compute_pool;
                 const int64_t eff_room = room_after_fixed + lend_reclaim;
                 const int64_t vx_floor = std::max<int64_t>(0, params.moe_stream_gpu_layers_floor);
                 const float   cap_frac = std::min(1.0f, std::max(0.0f, params.moe_stream_gpu_layers_cap));
@@ -2584,6 +2601,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (has_layer) {
                     w.compute = wl_compute;
                     w.prewarm = wl_prewarm;
+                    if (ml.load_mtp && hparams.n_layer_nextn > 0) {
+                        for (uint32_t il_m = hparams.n_layer(); il_m < (uint32_t) n_layer_all; ++il_m) {
+                            if (il_m < pimpl->dev_layer.size() && pimpl->dev_layer[il_m].dev == dv.dev) {
+                                const int64_t ub_m = std::min<int64_t>(params.moe_stream_ubatch > 0 ? (int64_t) params.moe_stream_ubatch : 256, 256);
+                                w.compute += std::max<int64_t>((int64_t) 192 << 20, ub_m * std::max<int64_t>(2048, (int64_t) hparams.n_embd) * 96);
+                                break;
+                            }
+                        }
+                    }
                 }
                 w.keep = fit_keep(dv.dev);
                 wl_devs.push_back(w);
@@ -2684,6 +2710,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
         p1.vram_scratch        = params.moe_stream_vram_scratch;   // -1 = derived
         p1.vram_growth         = params.moe_stream_vram_growth > 0 ? params.moe_stream_vram_growth : 0;  // 0 = derived
+        if (ml.load_mtp && hparams.n_layer_nextn > 0 && ms_pool_dev != nullptr) {
+            llama_model_params p_dft = params;
+            p_dft.moe_stream_ctx_rs_seq = 0;
+            int64_t mtp_ctx = 0;
+            bool any_on_pool = false;
+            for (uint32_t il_m = hparams.n_layer(); il_m < (uint32_t) n_layer_all; ++il_m) {
+                if (il_m < pimpl->dev_layer.size() && pimpl->dev_layer[il_m].dev == ms_pool_dev) {
+                    any_on_pool = true;
+                    if (offload_kv) {
+                        mtp_ctx += llama_moe_stream_layer_ctx_bytes(hparams, arch, il_m, p_dft);
+                    }
+                }
+            }
+            p1.mtp_on_pool_dev = any_on_pool;
+            p1.mtp_ctx_bytes   = mtp_ctx;
+        }
         {
             const llama_moe_corr_ref cref = llama_moe_correction_ref(params.moe_stream_correction, ml.file_paths[0],
                     /* say = */ (params.moe_stream_auto_mask & (1u << 2)) == 0);
@@ -2709,7 +2751,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.prefill_fast        = pf_fast;
         p1.mmq_moe_opt         = pf_fast || params.moe_stream_mmq_moe_opt   == 1;
         p1.gpu_moe_fused       = pf_fast || params.moe_stream_gpu_moe_fused == 1;
-        p1.pinned_ring         = params.moe_stream_pinned_ring > 0 ? params.moe_stream_pinned_ring : 0;
+        p1.pinned_ring         = params.moe_stream_pinned_ring > 0 ? params.moe_stream_pinned_ring : (pf_fast ? ((int64_t) 64 << 20) : 0);
         p1.lm_bf16             = pf_fast || params.moe_stream_lm_bf16      == 1;
         p1.lend_output         = params.moe_stream_lend_output == 1;
         p1.qsa_fused           = pf_fast || params.moe_stream_qsa_fused    == 1;
@@ -4574,7 +4616,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_recr = [&](uint32_t il) {
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
-                    } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
+                    } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01 || arch == LLM_ARCH_BAILINGMOE3) {
                         filter_attn = [&](uint32_t il) {
                             return il < hparams.n_layer() && !hparams.is_recr(il);
                         };

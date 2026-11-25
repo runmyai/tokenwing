@@ -394,7 +394,12 @@ static size_t os_page_size() {
 // alignment rule). A read off this alignment is done by the caller through an aligned buffer and a copy, never refused.
 static size_t os_direct_io_align(int fd, size_t file_size, const char ** how) {
 #if defined(__linux__)
-    GGML_UNUSED(file_size);
+    // MOE_STREAM_DIO_ALIGN=N: the alignment by hand (a sandbox that takes sub-page direct reads but serves them slowly: 4096)
+    static const long env_align = getenv("MOE_STREAM_DIO_ALIGN") ? atol(getenv("MOE_STREAM_DIO_ALIGN")) : 0;
+    if (env_align >= 512 && (env_align & (env_align - 1)) == 0) {
+        *how = "MOE_STREAM_DIO_ALIGN";
+        return (size_t) env_align;
+    }
 #ifdef STATX_DIOALIGN
     struct statx sx;
     if (statx(fd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &sx) == 0 && (sx.stx_mask & STATX_DIOALIGN) && sx.stx_dio_offset_align > 0) {
@@ -402,11 +407,27 @@ static size_t os_direct_io_align(int fd, size_t file_size, const char ** how) {
         return std::max<size_t>(sx.stx_dio_offset_align, sx.stx_dio_mem_align);
     }
 #endif
-    // When the filesystem / container sandbox (e.g. gVisor runsc) does not report STATX_DIOALIGN,
-    // sub-page O_DIRECT reads may succeed via slow hypervisor bounce emulation rather than EINVAL.
-    // Use OS page alignment (4096 B) so moe_stream_preadv stays on zero-copy page-aligned DMA.
-    *how = "the page size";
-    return os_page_size();
+    // No answer from the file system (ntfs3 and btrfs give none): a direct read tells. Offset, length and address are all on `a`
+    // and none on 2a, so a drive that takes 512-byte direct reads keeps them (model files whose expert slices are on 512 and not
+    // on 4096 would otherwise be read through a copy).
+    void * buf = nullptr;
+    if (posix_memalign(&buf, 4096, 8192) == 0) {
+        for (size_t a = 512; a < 4096 && 2*a <= file_size; a *= 2) {
+            ssize_t r;
+            do {
+                r = pread(fd, (char *) buf + a, a, (off_t) a);
+            } while (r < 0 && errno == EINTR);
+            if (r == (ssize_t) a) {
+                free(buf);
+                *how = "a direct read at that alignment";
+                return a;
+            }
+            if (r >= 0 || errno != EINVAL) {
+                break;   // not an alignment refusal: keep the safe value
+            }
+        }
+        free(buf);
+    }
 #elif defined(_WIN32)
     GGML_UNUSED(file_size);
     // An unbuffered read must be on the volume's logical sector size. The storage property query only answers on a volume or

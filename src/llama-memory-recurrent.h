@@ -200,7 +200,8 @@ private:
         uint32_t head = 0;
         uint32_t n    = 0;
         int32_t  rs_z = -1;
-        std::vector<int32_t> src0;   // cells[head .. head + n).src0
+        std::vector<int32_t> src0;     // cells[head .. head + n).src0
+        std::vector<int32_t> s_copy;   // resolved snapshot-aware source cell ids (preserves rs_idx across layer-major rewinds)
     };
     std::vector<slot_rec_t> slot_rec;
 

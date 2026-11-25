@@ -975,6 +975,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                     if (!has("--moe-stream-guess-combined")) { params.moe_stream_guess_combined = 1; }
                     if (!has("--moe-stream-wordstart"))      { params.moe_stream_wordstart      = 2; }
                     if (!has("--moe-stream-protect-named"))  { params.moe_stream_protect_named  = 1; }
+                    if (!has("--moe-stream-guess-skip-full"))     { params.moe_stream_guess_skip_full     = 1; }
+                    if (!has("--moe-stream-guess-skip-full-gpu")) { params.moe_stream_guess_skip_full_gpu = 1; }
                     if (!has("--moe-stream-guess-inflight") && params.moe_stream_promote == 1) {
                         params.moe_stream_guess_inflight = 4;
                     }
@@ -1036,6 +1038,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                     params.moe_stream_auto_mask |= (1u << 3);
                 }
                 if (!has("--moe-stream-vram-follow"))   { params.moe_stream_vram_follow   = 1; }
+                if (g_decode && params.moe_stream_vram_follow == 1) {
+                    if (!has("--moe-stream-vram-follow-tick"))   { params.moe_stream_vram_follow_tick   = 4; }
+                    if (!has("--moe-stream-vram-follow-margin")) { params.moe_stream_vram_follow_margin = 2; }
+                }
                 if (!has("--moe-stream-vram-parallel") && params.moe_stream_needed_early == 1) {
                     params.moe_stream_vram_parallel = 1;
                 }
@@ -1055,6 +1061,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                     : std::min<int32_t>(2048, params.n_batch);
             }
             if (!has("--moe-stream-prefill-fast"))      { params.moe_stream_prefill_fast      = 1; }
+            if (!has("--moe-stream-pinned-ring") && params.moe_stream_prefill_fast == 1) {
+                params.moe_stream_pinned_ring = (int64_t) 64 << 20;
+                params.moe_stream_auto_mask  |= (1u << 7);   // not given by hand: the engine times both copy ways and uses the faster
+            }
             if (!has("--moe-stream-layer-major"))       { params.moe_stream_layer_major       = 1; }
             if (!has("--moe-stream-layer-major-batch")) { params.moe_stream_layer_major_batch = 32768; }
             if (!has("--moe-stream-wave-plan"))         { params.moe_stream_wave_plan         = 1; }
@@ -1075,7 +1085,9 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                     params.moe_stream_prompt_split = 1;
                 }
                 if (params.moe_stream_vram_free > 0) {
-                    if (!has("--moe-stream-vram-end-fill")) { params.moe_stream_vram_end_fill = 1; }
+                    if (!has("--moe-stream-vram-end-fill")) {
+                        params.moe_stream_vram_end_fill = params.moe_stream_vram_follow == 1 ? 2 : 1;
+                    }
                     if (!has("--moe-stream-copy-ahead")) {
                         params.moe_stream_copy_ahead = 1;
                         params.moe_stream_auto_mask |= (1u << 1);

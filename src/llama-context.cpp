@@ -814,6 +814,23 @@ llama_context::llama_context(
             }
             ms->el_note_ctx_host(kv_host, compute_host);
         }
+        if (!model.no_alloc() && ms->cap_settle_due()) {
+            // Fixed pools under a process memory cap: the host KV cache and compute buffers are written once, so the cap's count
+            // holds them, then the pools get what the cap really has left (before the start fill)
+            if (memory && !ms->np_started) {
+                int64_t kv_host = 0;
+                for (const auto & [buft, size] : memory->memory_breakdown()) {
+                    kv_host += ggml_backend_buft_is_host(buft) ? (int64_t) size : 0;
+                }
+                if (kv_host > 0) {
+                    memory->clear(true);
+                }
+            }
+            if (!ms->np_started && sched) {
+                ggml_backend_sched_clear_host_buffers(sched.get());
+            }
+            ms->cap_settle();
+        }
         ms->idle_arm(/* may_fill = */ !model.no_alloc());
     }
 }
@@ -2279,7 +2296,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // between two computes) - wait for them first. Between decode words the GPU is already idle here (the logits were read)
         if (ctx_moe_stream() && ctx_moe_stream()->p1.async_h2d && ggml_backend_sched_get_async_host_input(sched.get())) {
             const int64_t t_tt = ctx_moe_stream()->vf_test_tick_timers ? ggml_time_us() : 0;
-            ggml_backend_sched_synchronize(sched.get());   // (only when the scheduler really turned it on)
+            ggml_backend_sched_wait_async_host_inputs(sched.get());   // wait only for pending async_h2d DMAs, not whole GPU stream
             if (t_tt) {
                 ctx_moe_stream()->vf_tt_sync_us += ggml_time_us() - t_tt;   // TEST ONLY (MOE_STREAM_TEST_VF_TICK_TIMERS)
             }
@@ -2672,7 +2689,7 @@ bool llama_context::lm_layer_major_ok(uint32_t n_tokens_all) {
         return false;   // off, or one ubatch: nothing to reorder (or this call's layer-major attempt failed)
     }
     if (!llama_arch_layer_major(model.arch) ||                      // the model builders that take a layer range (Ling-3.0, Flint, qwen4exp)
-        cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || cparams.n_rs_seq > 0 ||   // MTP and its snapshot slots: not checked
+        cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ||
         cparams.embeddings || !memory ||
         std::find(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), true) !=
             cparams.embeddings_layer_inp.end()) {   // a draft (EAGLE3 / DFlash) reading layer inputs: a group graph has only its own

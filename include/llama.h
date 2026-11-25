@@ -551,9 +551,9 @@ extern "C" {
         // A CPU split's output in the GPU's pinned host buffer goes to the next GPU split with an
         // async H2D on that GPU's stream and no host wait (one GPU, no pipeline parallelism); 0 = off (a synchronous copy)
         int32_t      moe_stream_async_h2d;
-        // Elastic RAM - the pools give RAM back on memory pressure / low headroom and take it back smoothly when calm;
-        // 0 = off (fixed pools). ram_margin: bytes to leave free (0 = OS default: 1.25 GiB Linux / 1.5 GiB Win & macOS);
-        // elastic_opts: "keep=..,gap=..,again=..,settle=..,refillstep=..,refillms=..,softmin=..,min=.." (NULL = defaults)
+        // Elastic RAM - the pools follow the other programs' memory: RAM is given back when they take some and taken back in steps
+        // when they release it; 0 = off (fixed pools). ram_margin: bytes to leave free (0 = OS default: 1.25 GiB Linux / 1.5 GiB
+        // Win & macOS); elastic_opts: "keep=..,follow=..,settle=..,refillstep=..,refillms=..,softmin=..,min=.." (NULL = defaults)
         int32_t      moe_stream_elastic;
         int64_t      moe_stream_ram_margin;
         const char * moe_stream_elastic_opts;

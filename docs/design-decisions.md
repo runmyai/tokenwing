@@ -76,6 +76,21 @@ Each entry ends with a result. **Kept** means the idea is part of the engine. **
 
 **Copy the next wave's experts while this one computes.** In GPU-wave prompts the engine copies into the pool's tail (tail waves) instead of letting the scheduler copy a whole pool per graph. Two sets of copy places overlap copy and compute; one set returns room to the pool. Prompts got faster; the first reply words after a prompt got a little slower. Kept as `--moe-stream-copy-ahead` (off by default).
 
+**One hotness ranking across RAM and VRAM.** RAM eviction used a 64-word decayed use count and
+VRAM follow used its own 256/1024-word counts, while whole MoE layers were chosen once from a census
+and never adapted. That meant ~6 GiB of VRAM held whole layers whose members might not be hot, and
+only ~3 GiB was a hot pool. Using the one decayed use count for both eviction and VRAM swaps, and
+giving all VRAM to the pool (no whole layers), cut CPU expert work 30.7 → 17.4 ms/word and raised
+VRAM picks 120 → 305 per word; decode went 19.75 → 22.09 tok/s (+11.9 %, 5/5 pairs) and prefill
+88.29 → 97.67 (+10.6 %, 5/5), with SSD wait and handoff rising only slightly. Kept as
+`--moe-stream-unified-tier` (off by default; it needs a GPU pool).
+
+**Bounding VRAM promotions by measured uploader headroom.** With the unified pool the engine made
+16.8 swaps/word and put off 29 switches/word; capping a tick's queued copies at what the uploader
+measured it could finish in half a tick dropped decode 22.70 → 22.25 tok/s (−2.0 %, 1/5 pairs).
+The skipped swaps were useful — a cold victim is worth replacing even when the uploader is busy.
+Not kept; the swap budget is the existing `--moe-stream-vram-follow-swaps`.
+
 ## The CPU side
 
 **Keep the pools in the repacked CPU layout.** The repacked kernel is faster per matmul, and each read must be converted on its I/O thread. In prompts that run in waves it named about 20 distinct experts per ubatch and layer instead of about 390, and the text after the prompt was garbage: the prompt speed first measured for it was that broken path. Not kept; `--moe-stream-cpu-repack` remains, off, and is for decode only.

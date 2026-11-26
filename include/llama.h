@@ -548,6 +548,9 @@ extern "C" {
         // empty slot, or a keep value above the pool's lowest), and held experts' picks count in the keep value (needs
         // --moe-stream-vram-follow 1); 0 = off (the leaving expert is dropped)
         int32_t      moe_stream_vram_copyback;
+        // One decayed use count ranks both RAM eviction and VRAM-follow swaps, and all VRAM is a
+        // hot expert pool (no whole MoE layers); 0 = off
+        int32_t      moe_stream_unified_tier;
         // A CPU split's output in the GPU's pinned host buffer goes to the next GPU split with an
         // async H2D on that GPU's stream and no host wait (one GPU, no pipeline parallelism); 0 = off (a synchronous copy)
         int32_t      moe_stream_async_h2d;

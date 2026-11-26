@@ -162,6 +162,7 @@ Each individual knob below remains available via CLI as an internal override (`-
 | `--moe-stream-vram-follow-ratio R` | a swap needs the incoming expert's recent count > floor(R x the leaving one's) + --moe-stream-vram-follow-margin (default: 1.25 = AI-der's cold + cold/4) |
 | `--moe-stream-vram-follow-margin N` | the margin of the swap rule (default: 4) |
 | `--moe-stream-vram-follow-pinned 0\|1` | the uploader copies through a pinned bounce buffer; 0 = straight from the RAM slot (default: 1) |
+| `--moe-stream-unified-tier 0\|1` | 1 = one hotness ranking for both memory tiers: the decayed use count that picks RAM eviction victims also ranks VRAM-follow swaps (the long-term count is only a tie-break), and no whole MoE layers are kept in VRAM (-gpu-layers 0 is forced), so all VRAM is one hot expert pool. The path stays SSD -> RAM -> VRAM. Needs a GPU expert pool (--moe-stream-vram-free SIZE or --moe-stream-vram-experts N); falls back with one line when no pool fits (default: 0 = separate rankings, whole layers + hot pool) |
 | `--moe-stream-vram-copyback 0\|1` | with --moe-stream-vram-follow 1, an expert that leaves VRAM follow's set is copied back GPU -> RAM into its layer's pool (no SSD read) when the pool has an empty slot or the expert's keep value is above the pool's lowest one, and the picks of held experts count in the pool's keep value (default: 0 = the leaving expert is dropped) |
 
 ## GPU work

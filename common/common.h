@@ -985,6 +985,7 @@ struct common_params {
     int32_t     moe_stream_vram_follow_pinned = 1;
     int32_t     moe_stream_vram_parallel = 0;     // the device pass during the CPU experts
     int32_t     moe_stream_vram_copyback = 0;     // VRAM follow's leaving experts copied back into RAM
+    int32_t     moe_stream_unified_tier = 0;      // 1 = one hotness signal for RAM and VRAM, no whole-layer partition
     int32_t     moe_stream_async_h2d = 0;         // CPU -> GPU split inputs as async H2D copies
     int32_t     moe_stream_overlap = 0;      // compute the resident experts during the miss reads
     int64_t     moe_stream_ram = 0;        // RAM budget for the pools in bytes, 0 = slots decide

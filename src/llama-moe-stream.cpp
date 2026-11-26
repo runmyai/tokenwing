@@ -2090,6 +2090,10 @@ llama_moe_stream::llama_moe_stream(
         off("--moe-stream-vram-copyback 1", "--moe-stream-vram-follow 1 (it copies back the experts that leave VRAM follow's set)");
         p1.vram_copyback = false;
     }
+    if (p1.unified_tier && p1.vram_experts == 0 && p1.vram_free == 0) {
+        off("--moe-stream-unified-tier 1", "--moe-stream-vram-experts N or --moe-stream-vram-free SIZE (the GPU hot pool)");
+        p1.unified_tier = false;
+    }
     if (p1.vram_follow) {
         if (p1.vram_follow_tick == 0 || p1.vram_follow_recent == 0 || p1.vram_follow_longterm == 0 || !(p1.vram_follow_ratio >= 1.0)) {
             fprintf(stderr, "llama_moe_stream: --moe-stream-vram-follow: -tick, -recent and -longterm below 1 are 1, -ratio below 1 is 1\n");
@@ -17248,6 +17252,10 @@ void llama_moe_stream::vf_setup(ggml_backend_dev_t dev) {
             p1.vram_follow_fixed ? "FIXED (test only: every switch at the next call, waiting for its copy)" : "real", n_places,
             il_of_moe.size(), p1.vram_follow_tick, p1.vram_follow_swaps, p1.vram_follow_ratio, p1.vram_follow_margin,
             p1.vram_follow_recent, p1.vram_follow_longterm, bounce.c_str(), std::max<int32_t>(0, (int32_t) n_slots - 2*(int32_t) n_expert_used));   // (the start share)
+    if (p1.unified_tier) {
+        fprintf(stderr, "%s: --moe-stream-unified-tier 1: one decayed use count ranks both RAM eviction and VRAM swaps "
+                "(long-term count is the tie-break); no whole MoE layers - all VRAM is the hot pool\n", __func__);
+    }
 }
 
 // mtx held (end_call): one more reply word - AI-der's decays (qwen38_tier.c lfru_tick_locked: the counts are halved before the
@@ -20466,7 +20474,15 @@ void llama_moe_stream::psplit_end_call() {
 // this call (0 for the others)
 uint64_t llama_moe_stream::vf_key(const llama_moe_stream_layer & sl, uint32_t e) const {
     if (!vf_rank_pe) {
-        return ((uint64_t) sl.vf_recent[e] << 32) | sl.vf_long[e];
+        uint32_t recent = sl.vf_recent[e];
+        if (p1.unified_tier) {
+            // One signal for both tiers: the decayed use count that also picks RAM victims. The
+            // hysteresis compares two values from this same source, so the scale is free.
+            const float h = sl.p1_dval[e] > 0.0f
+                          ? sl.p1_dval[e]*p1_decay(n_tok_outer - sl.p1_dword[e])*16.0f : 0.0f;
+            recent = h > 0.0f ? (uint32_t) std::min<double>(h, 4.0e9) : 0u;
+        }
+        return ((uint64_t) recent << 32) | sl.vf_long[e];
     }
     if (sl.p1_pe_seq != call_seq || sl.p1_pe_w.empty()) {
         return 0;

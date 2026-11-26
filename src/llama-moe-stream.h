@@ -257,6 +257,9 @@ struct llama_moe_stream_p1 {
     // --moe-stream-vram-copyback 1 - an expert leaving VRAM follow's set is copied back into its RAM pool
     // (an empty slot, or a keep value above the pool's lowest), and held experts' picks count in the keep value
     bool        vram_copyback        = false;
+    // --moe-stream-unified-tier 1 - one decayed use count ranks RAM eviction and VRAM swaps, and
+    // all VRAM is a hot expert pool (no whole layers)
+    bool        unified_tier         = false;
     // --moe-stream-async-h2d 1 - CPU -> GPU split inputs in the GPU's pinned host buffer as async
     // H2D copies on the GPU's stream, no host wait (llama-context turns it on in the scheduler: one GPU, no pipeline parallelism)
     bool        async_h2d            = false;

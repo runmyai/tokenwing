@@ -2787,6 +2787,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.vram_parallel        = params.moe_stream_vram_parallel >= 1;
         p1.vram_parallel_cross  = params.moe_stream_vram_parallel == 2;
         p1.vram_copyback        = params.moe_stream_vram_copyback == 1;
+        p1.unified_tier         = params.moe_stream_unified_tier == 1;
         p1.async_h2d            = params.moe_stream_async_h2d == 1;
         p1.vram_chunk           = std::max<int64_t>(0, params.moe_stream_vram_chunk);
         p1.uma                  = params.moe_stream_uma == 1;
@@ -4988,6 +4989,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_vram_follow_pinned =*/ 1,
         /*.moe_stream_vram_parallel =*/ 0,   // off (the device pass after the CPU experts)
         /*.moe_stream_vram_copyback =*/ 0,   // off (an expert leaving VRAM follow's set is dropped)
+        /*.moe_stream_unified_tier =*/ 0,    // off (two rankings, whole layers + hot pool)
         /*.moe_stream_async_h2d     =*/ 0,   // off (CPU -> GPU split inputs copied synchronously)
         /*.moe_stream_elastic       =*/ 0,         // fixed pools, as before
         /*.moe_stream_ram_margin    =*/ 0,         // 500 MiB when elastic

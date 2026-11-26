@@ -1967,6 +1967,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_stream_vram_follow_pinned   = params.moe_stream_vram_follow_pinned;
     mparams.moe_stream_vram_parallel        = params.moe_stream_vram_parallel;
     mparams.moe_stream_vram_copyback        = params.moe_stream_vram_copyback;
+    mparams.moe_stream_unified_tier         = params.moe_stream_unified_tier;
     mparams.moe_stream_async_h2d            = params.moe_stream_async_h2d;
     mparams.moe_stream_overlap          = params.moe_stream_overlap;
     mparams.moe_stream_ram              = params.moe_stream_ram;

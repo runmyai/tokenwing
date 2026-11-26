@@ -4798,6 +4798,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_internal());
     add_opt(common_arg(
+        {"--moe-stream-vram-stack"}, "0|1",
+        "1 = the measured decode set: --moe-stream-plan 1, --moe-stream-needed-early 1, --moe-stream-vram-follow 1 and "
+        "--moe-stream-vram-parallel 1 together. Needs a GPU expert pool (--moe-stream-vram-free SIZE or "
+        "--moe-stream-vram-experts N); each part still switches itself off with one start-up line when its own prerequisite "
+        "is missing (default: 0 = off)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-vram-stack must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_vram_stack = value;
+            if (value == 1) {
+                params.moe_stream_plan          = 1;
+                params.moe_stream_needed_early  = 1;
+                params.moe_stream_vram_follow   = 1;
+                params.moe_stream_vram_parallel = 1;
+            }
+        }
+    ));
+    add_opt(common_arg(
         {"--moe-stream-vram-copyback"}, "0|1",
         "with --moe-stream-vram-follow 1, an expert that leaves VRAM follow's set is copied back GPU -> RAM into its "
         "layer's pool (no SSD read) when the pool has an empty slot or the expert's keep value is above the pool's lowest one, "

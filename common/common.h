@@ -984,6 +984,7 @@ struct common_params {
     int32_t     moe_stream_vram_follow_fixed = 0;   // test only
     int32_t     moe_stream_vram_follow_pinned = 1;
     int32_t     moe_stream_vram_parallel = 0;     // the device pass during the CPU experts
+    int32_t     moe_stream_vram_stack = 0;        // 1 = the measured decode set: plan + needed-early + vram-follow + vram-parallel
     int32_t     moe_stream_vram_copyback = 0;     // VRAM follow's leaving experts copied back into RAM
     int32_t     moe_stream_async_h2d = 0;         // CPU -> GPU split inputs as async H2D copies
     int32_t     moe_stream_overlap = 0;      // compute the resident experts during the miss reads

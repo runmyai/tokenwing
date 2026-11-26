@@ -3149,6 +3149,12 @@ struct llama_moe_stream {
     bool    win_keep_take = false;         // MOE_STREAM_TEST_WINDOW_KEEP_TAKE=1 (test only): the last layers' read-ahead may take kept experts
     bool    win_refill_on = false;         // MOE_STREAM_TEST_WINDOW_REFILL=1 (test only): read back evicted kept experts after a call
     bool    win_need_compact = false;      // the end's compaction is needed (a one-wave GPU offload, or GPU waves without tail waves)
+    // Elastic RAM counts and gives a layer's slots by their place (below / above its start size). A window pass leaves the experts
+    // where they landed; they are put back in order only when elastic RAM is about to change a share (el_tidy), not at every pass's end
+    bool    el_untidy = false;             // mtx: a window pass left some layer out of order
+    void    el_tidy();                     // mtx held, a boundary: every layer back in order (win_compact) when el_untidy
+    int64_t el_n_tidy = 0;                 // times the layers were put back in order
+    double  el_tidy_ms = 0.0;
     int64_t n_win_compact_short = 0;
     int64_t n_win_short_why[7] = {}, n_win_short_ready = 0, n_win_short_rwhy[8] = {}, n_win_incomplete = 0;
     int64_t n_win_stale_bound = 0;

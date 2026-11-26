@@ -11658,8 +11658,8 @@ void llama_moe_stream::win_layer_start(llama_moe_stream_layer & sl, const int32_
             }
             return;
         }
-        // (elastic RAM counts a layer's slots below and above its start size by their place: its layers are always put back in order)
-        win_need_compact = win_test_compact || el_on || (el_has_gpu && ((n_waves(el_offload_min()) <= 1 && !tail_onewave_host) || (gpu_waves > 0 && !tailw_ready)));
+        // (elastic RAM, which counts a layer's slots by their place, puts the layers back in order itself, when it changes a share: el_tidy)
+        win_need_compact = win_test_compact || (el_has_gpu && ((n_waves(el_offload_min()) <= 1 && !tail_onewave_host) || (gpu_waves > 0 && !tailw_ready)));
         for (const int32_t il : il_of_moe) {   // no event of an earlier call (or context) is ever waited for
             if ((size_t) il < layers.size() && layers[il]) {
                 layers[il]->win_ev = nullptr;
@@ -11923,6 +11923,7 @@ void llama_moe_stream::win_close(bool complete) {
             }
         }
     }
+    el_untidy = el_untidy || (el_on && !win_need_compact);
     for (llama_moe_stream_layer * x : L) {
         if (win_need_compact) {
             win_compact(*x);   // the layer's experts in its first n_slots slots (a one-wave GPU offload sees only those)
@@ -12293,6 +12294,27 @@ void llama_moe_stream::win_compact(llama_moe_stream_layer & sl) {
         }
     }
     el_release_slots_batch(defer_rel);
+}
+
+// mtx held, a boundary (no graph in flight). A window pass leaves a layer's experts where they landed: some above its start size, with
+// switched-off holes below. Nothing minds that while the pools stay as they are - the next pass starts from any layout, as with the
+// fixed pools. Elastic RAM gives and takes a layer's slots by their place, and a GPU view copies the low ones: before either, the
+// layers are put back in order here (win_compact: a page move per expert, a copy where the system has none). So a quiet machine never
+// pays for it - after every long prompt it cost Linux 1.5 % of an 8k prompt and Windows, which copies, 8 %
+void llama_moe_stream::el_tidy() {
+    if (!el_untidy) {
+        return;
+    }
+    el_untidy = false;
+    const int64_t t0 = ggml_time_us(), r0 = n_win_relocated;
+    for (const int32_t il : il_of_moe) {
+        win_compact(*layers[il]);
+    }
+    const double ms = (ggml_time_us() - t0)/1e3;
+    el_n_tidy  += 1;
+    el_tidy_ms += ms;
+    fprintf(stderr, "llama_moe_stream: elastic RAM: the layers put back in order before a share changes (%lld experts moved, %.1f ms)\n",
+            (long long) (n_win_relocated - r0), ms);
 }
 
 void llama_moe_stream::win_print_stats() const {
@@ -21876,8 +21898,10 @@ void llama_moe_stream::el_parse_opts() {
         fix(el_step <= 0, el_step, (int64_t) 512 << 20, "step");
         fix(el_refill_step <= 0, el_refill_step, (int64_t) 256 << 20, "refillstep");
         fix(el_refill_ms < 0, el_refill_ms, 5000, "refillms");
-        if (el_follow <= 0) {   // not set: a fifth of keep-free - a change that small stays inside what is kept free anyway
-            el_follow = std::max<int64_t>(1, p1.ram_margin/5);
+        if (el_follow <= 0) {
+            // not set: a fifth of keep-free - a change that small stays inside what is kept free anyway. Windows: a third (its own
+            // background work - updates, the virus scanner - commits 300-500 MiB at a time, and no program needs RAM then)
+            el_follow = std::max<int64_t>(1, p1.ram_margin/(EL_OS_WIN32 ? 3 : 5));
         }
         if (el_psi_floor < 0) {   // not set: under keep-free
             el_psi_floor = p1.ram_margin;
@@ -22764,8 +22788,11 @@ void llama_moe_stream::el_recount() {
     for (const int32_t il : il_of_moe) {
         const auto & sl = *layers[il];
         uint32_t lo = 0;
-        for (uint32_t s = 0; s < (el_wide ? sl.n_slots : std::min<uint32_t>(sl.n_slots, n_slots)); s++) {
+        for (uint32_t s = 0; s < (el_wide || el_untidy ? sl.n_slots : std::min<uint32_t>(sl.n_slots, n_slots)); s++) {
             lo += sl.slot_off[s] ? 0 : 1;
+        }
+        if (el_untidy && !el_wide) {   // (out of order after a window pass: place says nothing, the layer has that many slots)
+            lo = std::min(lo, n_slots);
         }
         if (el_wide) {
             lo = (uint32_t) std::max<int64_t>(2*(int64_t) n_expert_used + 4, (int64_t) lo);
@@ -22832,12 +22859,14 @@ int64_t llama_moe_stream::el_give(int64_t bytes, bool boundary, llama_moe_stream
     if (bytes <= 0 || il_of_moe.empty() || win_active) {
         return 0;
     }
-    if (!boundary && el_hold_gives) {
+    if (!boundary && (el_hold_gives || el_untidy)) {
         // a prompt call with GPU-wave copies runs (tail waves, copy-ahead - they copy from the slots, sized for the call's waves): no slot
-        // is switched off until it ends, where what is pending is given (a prompt call lasts seconds; the band frees RAM meanwhile)
+        // is switched off until it ends, where what is pending is given (a prompt call lasts seconds; the band frees RAM meanwhile).
+        // The same while the layers are out of order after a window pass: they are put back in order at the call's end, then given
         el_n_held_gives += 1;
         return 0;
     }
+    el_tidy();
 
     const size_t blk = layers[il_of_moe[0]]->block_bytes;
     int64_t n = (bytes + (int64_t) blk - 1)/(int64_t) blk;
@@ -23128,6 +23157,7 @@ void llama_moe_stream::el_take(int mode, const el_mem & m) {
         }
         return;
     }
+    el_tidy();
     const int64_t step_cap = el_test_keep_skip ? room : std::max<int64_t>((int64_t) blk, el_refill_step);
     int64_t n = std::min<int64_t>(std::min(room, freed), step_cap)/(int64_t) blk;
     std::vector<int32_t> order(il_of_moe.begin(), il_of_moe.end());
@@ -23406,6 +23436,7 @@ void llama_moe_stream::el_self_call_start(int64_t need, const el_mem & m) {
     if (need_padded <= spare) {
         return;   // fits inside the spare RAM above keep-free without touching expert slots
     }
+    el_tidy();
     const int64_t short_b = need_padded - std::max<int64_t>(0, spare);
     const size_t blk = layers[il_of_moe[0]]->block_bytes;
     const int64_t want_slots = (short_b + (int64_t) blk - 1) / (int64_t) blk;
@@ -23859,6 +23890,7 @@ void llama_moe_stream::el_at_call_end(bool complete, const el_mem & end_mem) {
 // below n_slots only, and an expert of a wave that sits higher is dropped and read again low (remap). No expert ever moves; the
 // GPU copy never grows. mtx held (lock), at the call's start: the reads in flight into those slices land first.
 void llama_moe_stream::el_low_start(std::unique_lock<std::mutex> & lock) {
+    el_tidy();   // (the view copies the low slots)
     const uint32_t k = n_expert_used;
     const int64_t t0 = ggml_time_us();
     const int64_t z0 = el_n_zero_done, sk0 = el_n_zero_skip;
@@ -24068,6 +24100,7 @@ void llama_moe_stream::sh_tick() {
         return;
     }
     sh_next_word = n_tok_outer + sh_every;
+    el_tidy();   // (a share move counts slots by their place)
     const double f = std::exp2(-(double) sh_every/sh_half);
     for (const int32_t il : il_of_moe) {
         auto & sl = *layers[il];
@@ -24718,9 +24751,10 @@ void llama_moe_stream::el_print_stats() const {
                 (long long) dz_n_probe_slots, dz_n_probe > 0 ? dz_probe_ms_sum/dz_n_probe : 0.0, dz_probe_ms_max, dz_hold_ms_max, (long long) anon_huge);
     }
     fprintf(stderr, "llama_moe_stream: elastic RAM: asks cut to the part still missing %.0f MiB; asked until nothing pending: %lld times, mean "
-            "%.0f ms, max %.0f ms; prompt layer ops gave %lld slots above the start size, %lld below\n", el_n_ask_cut/1048576.0,
+            "%.0f ms, max %.0f ms; prompt layer ops gave %lld slots above the start size, %lld below; the layers put back in order after "
+            "a window pass %lld times (%.1f ms in all)\n", el_n_ask_cut/1048576.0,
             (long long) el_pend_n, el_pend_n > 0 ? el_pend_sum_ms/el_pend_n : 0.0, el_pend_max_ms, (long long) el_n_prompt_hi,
-            (long long) el_n_prompt_lo);
+            (long long) el_n_prompt_lo, (long long) el_n_tidy, el_tidy_ms);
     if (el_test_fake_squeeze > 0) {
         fprintf(stderr, "llama_moe_stream: TEST fake squeeze: the pretend kernel swapped %.0f MiB\n", el_fk_swapped.load()/1048576.0);
         if (el_check && el_fk_swapped.load() > ((int64_t) 256 << 20)) {

@@ -5492,7 +5492,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--moe-stream-elastic"}, "0|1",
         "1 = elastic RAM (Linux, Windows, macOS): the routed-expert RAM pools start at the size the fixed pools get and then follow the other programs' memory "
         "(what they hold in RAM or in swap, without the file cache; the engine's own memory does not count): nothing is done while it has moved by less than "
-        "the follow step (a fifth of --moe-stream-ram-free), so with no other program taking or releasing memory elastic RAM acts as the fixed pools do; a follow "
+        "the follow step (a fifth of --moe-stream-ram-free, a third on Windows), so with no other program taking or releasing memory elastic RAM acts as the fixed pools do; a follow "
         "step more held by them = that much given back at once, that much less = taken back in paced steps after settle calm seconds, never leaving less than "
         "--moe-stream-ram-free free; up to band% of the coldest slots stay discardable for the system to take by itself, and a memory-pressure event with less than "
         "--moe-stream-ram-free free gives back too; never above the process's cgroup or job memory limit; tunables in --moe-stream-elastic-opts (default: 0)",
@@ -5514,7 +5514,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-elastic-opts"}, "K=V,...",
-        "elastic RAM tunables: keep=SIZE RAM kept free, follow=SIZE the change of the other programs' memory that is followed (a fifth of keep), "
+        "elastic RAM tunables: keep=SIZE RAM kept free, follow=SIZE the change of the other programs' memory that is followed (a fifth of keep, a third on Windows), "
         "settle=SECONDS time nothing needed RAM before a take-back (30), refillstep=SIZE max take-back step (256MiB), refillms=MS between take-back steps (5000), "
         "psi=SIZE a memory-pressure event's give-back (128MiB), psifloor=SIZE such an event counts only with less free (keep), "
         "band=PCT discardable cold band per layer at most (20), age=N reply words a slot's expert goes unused before it joins the band, falling to 0 "

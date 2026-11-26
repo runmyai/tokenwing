@@ -3138,7 +3138,10 @@ struct llama_moe_stream {
     bool    win_test_compact = false;
     bool    win_log = false;               // MOE_STREAM_TEST_WINDOW_LOG=1 (test only)      // MOE_STREAM_TEST_WINDOW_COMPACT=1 (test only): compact at a pass's end without a GPU
     int64_t n_win_relocated = 0, n_win_compact_left = 0;
-    void    win_relocate(llama_moe_stream_layer & sl, int32_t h, int32_t l);
+    // copies / rel given: a copy (no page move) is queued with its old slot's release, for win_compact to run on several threads
+    void    win_relocate(llama_moe_stream_layer & sl, int32_t h, int32_t l,
+                         std::vector<std::tuple<uint8_t *, const uint8_t *, size_t>> * copies = nullptr,
+                         std::vector<std::pair<llama_moe_stream_layer *, int32_t>> * rel = nullptr);
     void    win_compact(llama_moe_stream_layer & sl);
     bool    win_keep_take = false;         // MOE_STREAM_TEST_WINDOW_KEEP_TAKE=1 (test only): the last layers' read-ahead may take kept experts
     bool    win_refill_on = false;         // MOE_STREAM_TEST_WINDOW_REFILL=1 (test only): read back evicted kept experts after a call

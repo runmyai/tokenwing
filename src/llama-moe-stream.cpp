@@ -12025,7 +12025,9 @@ void llama_moe_stream::win_drain(llama_moe_stream_layer * only, const std::vecto
 
 // mtx held, a pass's end (no graph in flight): expert e moves from slot h (switched on, READY, droppable) to slot l (EMPTY, switched on,
 // below the zero block) - its bytes (the OS layer's page move, else a copy) and its slot state; h is emptied without counting an eviction
-void llama_moe_stream::win_relocate(llama_moe_stream_layer & sl, int32_t h, int32_t l) {
+void llama_moe_stream::win_relocate(llama_moe_stream_layer & sl, int32_t h, int32_t l,
+                                    std::vector<std::tuple<uint8_t *, const uint8_t *, size_t>> * copies,
+                                    std::vector<std::pair<llama_moe_stream_layer *, int32_t>> * rel) {
     if (!sl.dz.empty() && sl.dz[h] && !slot_use(sl, h)) {
         dz_forget(sl, l);
         sl.slot_off[h] = 1; sl.gsf_dirty = 1;
@@ -12045,7 +12047,11 @@ void llama_moe_stream::win_relocate(llama_moe_stream_layer & sl, int32_t h, int3
             if (win_page_move) {
                 win_page_move_failed();
             }
-            memcpy(dst, src, sl.weights[p].size);
+            if (copies != nullptr && rel != nullptr) {
+                copies->emplace_back(dst, src, sl.weights[p].size);
+            } else {
+                memcpy(dst, src, sl.weights[p].size);
+            }
         }
     }
     // (some per-slot arrays exist only with their feature on: copied only where both entries exist)
@@ -12073,6 +12079,8 @@ void llama_moe_stream::win_relocate(llama_moe_stream_layer & sl, int32_t h, int3
     sl.share      -= 1;
     if (moved == 3) {
         sl.el_res[h] = 0;   sl.el_zero_known[h] = 1;   sl.el_land[h] = 0;   // h's range is fresh again
+    } else if (copies != nullptr && rel != nullptr) {
+        rel->push_back({ &sl, h });   // released after its queued copy has run
     } else {
         el_release_slot(sl, h);
     }
@@ -12229,6 +12237,7 @@ void llama_moe_stream::win_compact(llama_moe_stream_layer & sl) {
     }
     size_t il = 0;
     std::vector<std::pair<llama_moe_stream_layer *, int32_t>> defer_rel;
+    std::vector<std::tuple<uint8_t *, const uint8_t *, size_t>> copies;
     for (uint32_t h = n_slots; h < sl.n_slots; h++) {
         if (sl.slot_off[h]) {
             continue;
@@ -12248,12 +12257,31 @@ void llama_moe_stream::win_compact(llama_moe_stream_layer & sl) {
             sl.share      += 1;
         }
         if (sl.slot_state[h] == MOE_STREAM_SLOT_READY && sl.slot_expert[h] >= 0) {
-            win_relocate(sl, (int32_t) h, l);
+            win_relocate(sl, (int32_t) h, l, &copies, &defer_rel);
         } else {   // an empty slot above: switched off, the hole below takes its place
             dz_forget(sl, (int32_t) h);
             sl.slot_off[h] = 1; sl.gsf_dirty = 1;
             sl.share      -= 1;
             defer_rel.push_back({ &sl, (int32_t) h });
+        }
+    }
+    // Where pages cannot be moved (Windows) the experts are copied, with the engine lock held: ~3,100 experts (9 GB) at an 8k Ling
+    // prompt's end took 1.17 s on one thread, 0.48-0.54 s on 8; the old slots are released after (still under the lock, no graph in flight)
+    if (!copies.empty()) {
+        const size_t nt = std::min<size_t>(copies.size(), std::max(1u, std::min(8u, std::thread::hardware_concurrency()/2)));
+        std::atomic<size_t> next{0};
+        const auto work = [&]() {
+            for (size_t i; (i = next.fetch_add(1)) < copies.size(); ) {
+                memcpy(std::get<0>(copies[i]), std::get<1>(copies[i]), std::get<2>(copies[i]));
+            }
+        };
+        std::vector<std::thread> th;
+        for (size_t t = 1; t < nt; t++) {
+            th.emplace_back(work);
+        }
+        work();
+        for (auto & t : th) {
+            t.join();
         }
     }
     el_release_slots_batch(defer_rel);

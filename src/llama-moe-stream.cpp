@@ -21740,7 +21740,11 @@ int64_t llama_moe_stream::el_room() {
         // Windows OfferVirtualMemory moves band pages to Standby immediately (raising ullAvailPhys), so room = ullAvailPhys - band.
         // The commit rooms (ullAvailPageFile, the job's) already count our switched-on empty slots, which every caller subtracts from
         // this room again: so their bound goes to el_x_committed as a shortfall, not here (else those slots count twice)
-        const int64_t cr = std::min<int64_t>(el_win_commit_free(), el_cgroup_room(el_cgroup_dir()));
+        // (a job cap's room on the keep-free scale, as for Linux below: else the pools stop 1.5 GiB short of the cap, not the plan's margin -
+        // CPU-only Flint under an 11 GiB cap switched off 807 slots of its 2,162 at the start)
+        const int64_t cap_room = el_cgroup_room(el_cgroup_dir());
+        const int64_t cr = std::min<int64_t>(el_win_commit_free(),
+                                             cap_room == INT64_MAX ? INT64_MAX : cap_room - os_plan_cap_margin() + p1.ram_margin);
         el_win_cshort.store(std::max<int64_t>(0, room - cr), std::memory_order_relaxed);
         return room;
 #endif

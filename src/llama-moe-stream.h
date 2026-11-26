@@ -897,6 +897,9 @@ inline int64_t llama_moe_stream_ne2_bytes(int64_t n_layer_all, int64_t lookahead
     return (b_guess + 63)/64*64 + 64 + n_layer_all*64 + n_layer_all*rd_cap + llama_moe_stream_ps_cap(ps_rows, width, n_embd, n_expert_used);
 }
 
+// Windows: a job memory cap applies (llama-moe-stream.cpp); elsewhere always false
+bool llama_moe_stream_win_job_capped();
+
 inline int64_t llama_moe_stream_record_bytes(int64_t n_moe, int64_t n_layer_all, int64_t E, int64_t k, int64_t words,
                                              int64_t n_io = 8, bool helper = false, int64_t guess_top = 0,
                                              int64_t lookahead = 1, int64_t pace = 1) {

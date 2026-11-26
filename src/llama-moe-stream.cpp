@@ -757,6 +757,14 @@ static os_mem_cap os_mem_cap_get() {
 #else
 static os_mem_cap os_mem_cap_get() { return os_mem_cap(); }   // macOS: no such limit
 #endif
+// Windows: a job memory cap applies (the RAM plan then counts the KV cache whole: a job counts commit); elsewhere always false
+bool llama_moe_stream_win_job_capped() {
+#if defined(_WIN32)
+    return os_mem_cap_get().has;
+#else
+    return false;
+#endif
+}
 // Windows, under a job memory cap: an allocation refused late in the load (another program in the job, or the plan's estimate short of the
 // margin) can fail anywhere - a small malloc in ggml_init asserts, an unchecked one faults - so no single place can stop cleanly. When the
 // process dies (a crash, or abort from an assert) with less room under the cap than the plan's margin, one line says so with the numbers,

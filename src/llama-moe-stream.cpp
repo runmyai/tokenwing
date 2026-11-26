@@ -21473,18 +21473,22 @@ static int64_t el_meminfo_bytes(const char * key) {
     if (strcmp(key, "MemAvailable") == 0 || strcmp(key, "MemFree") == 0) { return (int64_t) ms.ullAvailPhys; }
     return -1;
 }
-// Windows: the physical memory in use less this process's working set (what the system has pushed to the pagefile is not counted yet,
-// so a program pushed there reads as a release)
+// Windows: the system's commit charge less this process's private commit - what programs hold in RAM or in the pagefile. The
+// memory in use less our working set fell 1.9 GB on a quiet PC while the pools filled (Windows moves idle programs' pages out to make
+// room), read as a release; the commit charge does not change when pages move to the pagefile, and our commit (the pools, the
+// page-locked buffers, the GPU memory WDDM charges to us) leaves with ours: 176 MiB of drift over a whole run on Ling
 static int64_t el_read_others_held(int64_t memtotal, int64_t * lag) {
+    GGML_UNUSED(memtotal);
     GGML_UNUSED(lag);
-    MEMORYSTATUSEX ms{};
-    ms.dwLength = sizeof(ms);
-    PROCESS_MEMORY_COUNTERS pc{};
+    PERFORMANCE_INFORMATION pi{};
+    pi.cb = sizeof(pi);
+    PROCESS_MEMORY_COUNTERS_EX pc{};
     pc.cb = sizeof(pc);
-    if (memtotal <= 0 || !GlobalMemoryStatusEx(&ms) || !K32GetProcessMemoryInfo(GetCurrentProcess(), &pc, sizeof(pc))) {
+    if (!K32GetPerformanceInfo(&pi, sizeof(pi)) ||
+            !K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *) &pc, sizeof(pc))) {
         return INT64_MIN;
     }
-    return memtotal - (int64_t) ms.ullAvailPhys - (int64_t) pc.WorkingSetSize;
+    return (int64_t) pi.CommitTotal * (int64_t) pi.PageSize - (int64_t) pc.PrivateUsage;
 }
 static int el_read_swap_kind(std::string & desc) {
     desc.clear();

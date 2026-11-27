@@ -24656,10 +24656,21 @@ void llama_moe_stream::el_loop() {
         std::unique_lock<std::mutex> plock(mtx);
         const int64_t x_ev = room >= 0 ? room - el_x_committed() : -1;
         plock.unlock();
-        const bool short_ram = room >= 0 && x_ev < el_psi_floor;
+#if EL_OS_WIN32
+        // Windows' low-memory notification is a level (free RAM under a threshold the system picks, about 1 GiB on a 32 GB PC), not Linux's
+        // stall signal: a long prompt's own working memory reaches it on a quiet PC (free 1.9 -> 1.14 GiB at a 32k Ling prompt's end, elastic
+        // off too), and the answer was a 1.1 s tidy-up for 128 MiB. So it is a need only when the other programs hold more than the pools'
+        // size is matched to by a quarter of the follow step - the engine's own memory does not move elastic RAM
+        const bool others_took = el_others_grown.load(std::memory_order_relaxed) >= el_follow/4;
+#else
+        const bool others_took = true;
+#endif
+        const bool short_ram = room >= 0 && x_ev < el_psi_floor && others_took;
         fprintf(stderr, "llama_moe_stream: elastic RAM pressure event at %.3f s (%s%s%s), free room %.0f MiB (avail %.0f MiB): %s\n",
                 ggml_time_us()/1e6, ev_sys ? "system" : "", ev_sys && ev_cg ? " + " : "", ev_cg ? "this process's cgroup" : "",
-                x_ev/1048576.0, el_os_avail()/1048576.0, short_ram ? "a need - give back" : "ignored (more than psifloor free)");
+                x_ev/1048576.0, el_os_avail()/1048576.0, short_ram ? "a need - give back" :
+                room >= 0 && x_ev < el_psi_floor ? "ignored (the other programs took less than a quarter of the follow step: this process's own memory)" :
+                "ignored (more than psifloor free)");
         if (!short_ram) {
             el_n_ignored += 1;
             continue;

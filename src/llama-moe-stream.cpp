@@ -22874,9 +22874,74 @@ void llama_moe_stream::el_check_shares(const char * where) const {
     const_cast<llama_moe_stream *>(this)->sh_checks += 1;
 }
 
+#if EL_OS_WIN32
+// mtx held, a window pass running (Windows): give back from the layers this pass has finished. The pass is layer-major, so none of them
+// runs again in this call - their slots hold only what the pass keeps for the reply - and their coldest go now, wherever they sit, in
+// place of waiting for the call's end. Waiting cost a 32k Ling prompt dearly when another program took 4 GiB 10 s in: the band's
+// slot-by-slot offers (1.5 ms each, the lock held up to 185 ms) took it from 27 to 66 s; without the band Windows wrote 2.5 GB of our
+// pages to the pagefile instead. The finished layers' shares and their home in the pass fall together, so the pass's end does not take
+// the room back; what they cannot cover stays pending for the call's end, as before
+int64_t llama_moe_stream::el_give_finished(int64_t bytes) {
+    const int64_t blk = (int64_t) layers[il_of_moe[0]]->block_bytes;
+    const int64_t n   = (bytes + blk - 1)/blk;
+    std::vector<llama_moe_stream_layer *> fin;
+    for (const int32_t il : il_of_moe) {
+        if (layers[il] && layers[il]->win_state == 2) {
+            fin.push_back(layers[il].get());
+        }
+    }
+    // A finished layer keeps at least half the mean share: asked early in the pass, two finished layers went to the floor (258 slots) and
+    // the reply after the prompt ran at 10.5 tok/s. The rest is given as more layers finish (each look serves what is pending again)
+    const int64_t keep = (int64_t) el_total/(2*(int64_t) il_of_moe.size());
+    int64_t got = 0;
+    for (int round = 0; round < 2 && got < n && !fin.empty(); round++) {   // evenly over them; a second round where a layer fell short
+        std::sort(fin.begin(), fin.end(), [](const llama_moe_stream_layer * a, const llama_moe_stream_layer * b) { return a->share > b->share; });
+        const int64_t q = (n - got + (int64_t) fin.size() - 1)/(int64_t) fin.size();
+        for (llama_moe_stream_layer * x : fin) {
+            if (got >= n) {
+                break;
+            }
+            // Its share and its home in the pass (where it goes back to at the pass's end) fall together, neither below `keep`: a layer
+            // the pass has not reached keeps its home - the room its waves were planned with (taking from those homes left layer 41
+            // with no free slot for wave 0) - and a finished layer's room borrowed from layers ahead stays theirs
+            const int64_t lim = std::max<int64_t>(0, std::min<int64_t>((int64_t) x->share, (int64_t) x->win_home) - keep);
+            const int64_t g   = el_drop_layer(*x, std::min<int64_t>({ q, n - got, lim }), true, 0, 0, -1);
+            x->win_home -= (uint32_t) g;
+            got += g;
+        }
+    }
+    if (got > 0) {
+        win_budget     -= got;
+        el_total       -= (uint32_t) got;
+        el_min_dirty    = true;
+        el_given_slots += got;
+        el_n_give      += 1;
+        el_last_give_us = ggml_time_us();
+        el_ref_others  += el_ref_others != INT64_MIN ? got*blk : 0;   // the size now matches that much more held by the others
+        el_events_unanswered = 0;
+        if (el_check) {
+            el_check_shares("give back in a window pass");
+        }
+        if (win_check) {
+            win_check_budget("give back in a window pass");
+        }
+        fprintf(stderr, "llama_moe_stream: elastic RAM give-back at %.3f s (in a window pass, from the %zu layers it finished): %lld slots, "
+                "%.0f MiB\n", ggml_time_us()/1e6, fin.size(), (long long) got, got*(double) blk/1048576.0);
+    }
+    return got*blk;
+}
+#endif
+
 int64_t llama_moe_stream::el_give(int64_t bytes, bool boundary, llama_moe_stream_layer * only) {
-    if (bytes <= 0 || il_of_moe.empty() || win_active) {
+    if (bytes <= 0 || il_of_moe.empty()) {
         return 0;
+    }
+    if (win_active) {
+#if EL_OS_WIN32
+        return el_give_finished(bytes);
+#else
+        return 0;
+#endif
     }
     if (!boundary && el_hold_gives) {
         // a prompt call with GPU-wave copies runs (tail waves, copy-ahead - they copy from the slots, sized for the call's waves): no slot

@@ -1928,6 +1928,7 @@ struct llama_moe_stream {
     void     el_move_zero(llama_moe_stream_layer & sl, uint32_t zb);              // mtx, boundary: the zero block to [zb, zb + n_zero)
     void     el_lower_zero(llama_moe_stream_layer & sl);                          // mtx, boundary
     int64_t  el_give(int64_t bytes, bool boundary, llama_moe_stream_layer * only);   // mtx
+    int64_t  el_give_finished(int64_t bytes);                                     // mtx, a window pass running (Windows)
     struct el_mem { int64_t room = -1, avail = -1; };                            // read through the OS layer before the lock
     el_mem   el_read_mem();
     void     el_take(int mode, const el_mem & m);                                 // mtx, boundary: 0 a request, 1 a reply's end, 3 idle (elastic RAM thread)

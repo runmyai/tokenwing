@@ -12298,9 +12298,10 @@ void llama_moe_stream::win_compact(llama_moe_stream_layer & sl) {
 
 // mtx held, a boundary (no graph in flight). A window pass leaves a layer's experts where they landed: some above its start size, with
 // switched-off holes below. Nothing minds that while the pools stay as they are - the next pass starts from any layout, as with the
-// fixed pools. Elastic RAM gives and takes a layer's slots by their place, and a GPU view copies the low ones: before either, the
-// layers are put back in order here (win_compact: a page move per expert, a copy where the system has none). So a quiet machine never
-// pays for it - after every long prompt it cost Linux 1.5 % of an 8k prompt and Windows, which copies, 8 %
+// fixed pools. A give-back and a take-back count a layer's slots while it is so (el_give's by_count). What does go by place - a prompt's
+// own memory lend, a slot-share move, a GPU view of the low slots - puts the layers back in order here first (win_compact: a page move
+// per expert, a copy where the system has none). So a quiet machine never pays for it - after every long prompt it cost Linux 1.5 % of
+// an 8k prompt and Windows, which copies, 8 % - and neither does a machine where another program takes or releases RAM
 void llama_moe_stream::el_tidy() {
     if (!el_untidy) {
         return;
@@ -21324,7 +21325,8 @@ static int64_t el_meminfo_bytes(const char * key) {
 // the free the buffer reads as another program's. *lag gets what this process's shared memory fell by in the last two seconds: growth
 // of the returned number up to *lag may be that, and is not taken for another program's.
 // Not seen: memory another program holds inside the system (an integrated GPU's buffers) - a memory-pressure event still answers it
-static int64_t el_read_others_held(int64_t memtotal, int64_t * lag) {
+static int64_t el_read_others_held(int64_t memtotal, int64_t * lag, int64_t * in_ram) {
+    GGML_UNUSED(in_ram);
     GGML_UNUSED(memtotal);
     enum { K_ANON, K_SHMEM, K_SWAPTOTAL, K_SWAPFREE, K_SWAPCACHED, K_N };
     static const char * const keys[K_N] = { "AnonPages", "Shmem", "SwapTotal", "SwapFree", "SwapCached" };
@@ -21544,8 +21546,10 @@ static int64_t el_meminfo_bytes(const char * key) {
 // Windows: the system's commit charge less this process's private commit - what programs hold in RAM or in the pagefile. The
 // memory in use less our working set fell 1.9 GB on a quiet PC while the pools filled (Windows moves idle programs' pages out to make
 // room), read as a release; the commit charge does not change when pages move to the pagefile, and our commit (the pools, the
-// page-locked buffers, the GPU memory WDDM charges to us) leaves with ours: 176 MiB of drift over a whole run on Ling
-static int64_t el_read_others_held(int64_t memtotal, int64_t * lag) {
+// page-locked buffers, the GPU memory WDDM charges to us) leaves with ours: 176 MiB of drift over a whole run on Ling.
+// The commit charge also counts memory a program has reserved and never used (4 GiB committed and not touched read as 4 GiB taken), so
+// the memory in use less our working set is handed out beside it (*in_ram): growth counts only as far as both show it
+static int64_t el_read_others_held(int64_t memtotal, int64_t * lag, int64_t * in_ram) {
     GGML_UNUSED(memtotal);
     GGML_UNUSED(lag);
     PERFORMANCE_INFORMATION pi{};
@@ -21556,6 +21560,7 @@ static int64_t el_read_others_held(int64_t memtotal, int64_t * lag) {
             !K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *) &pc, sizeof(pc))) {
         return INT64_MIN;
     }
+    *in_ram = ((int64_t) pi.PhysicalTotal - (int64_t) pi.PhysicalAvailable) * (int64_t) pi.PageSize - (int64_t) pc.WorkingSetSize;
     return (int64_t) pi.CommitTotal * (int64_t) pi.PageSize - (int64_t) pc.PrivateUsage;
 }
 static int el_read_swap_kind(std::string & desc) {
@@ -21625,7 +21630,8 @@ static int64_t el_meminfo_bytes(const char * key) {
     return -1;
 }
 // macOS: the memory not available less this process's footprint (what the compressor and the swap hold is not counted yet)
-static int64_t el_read_others_held(int64_t memtotal, int64_t * lag) {
+static int64_t el_read_others_held(int64_t memtotal, int64_t * lag, int64_t * in_ram) {
+    GGML_UNUSED(in_ram);
     GGML_UNUSED(lag);
     const int64_t avail = el_meminfo_bytes("MemAvailable");
     task_vm_info_data_t ti{};
@@ -21669,7 +21675,7 @@ static void el_os_zero_unreturned(void * p, size_t n) {
 static int64_t el_os_default_keep_bytes() { return (int64_t) 3 << 29; }
 static int64_t el_win_commit_free() { return INT64_MAX; }
 static int64_t el_meminfo_bytes(const char * key) { GGML_UNUSED(key); return -1; }
-static int64_t el_read_others_held(int64_t memtotal, int64_t * lag) { GGML_UNUSED(memtotal); GGML_UNUSED(lag); return INT64_MIN; }
+static int64_t el_read_others_held(int64_t memtotal, int64_t * lag, int64_t * in_ram) { GGML_UNUSED(memtotal); GGML_UNUSED(lag); GGML_UNUSED(in_ram); return INT64_MIN; }
 static int el_read_swap_kind(std::string & desc) { desc = "not read on this system"; return 0; }
 static std::string el_cgroup_dir() { return ""; }
 static int64_t el_cgroup_room(const std::string & cg) { GGML_UNUSED(cg); return INT64_MAX; }
@@ -21739,13 +21745,15 @@ int64_t llama_moe_stream::el_os_avail() {
 }
 
 // The other programs' memory (el_read_others_held; INT64_MIN when not read; *lag: growth of it up to that much may be this process's
-// own free still under way) - in the fake squeeze what the pretend program has taken
-int64_t llama_moe_stream::el_os_others(int64_t * lag) {
-    *lag = 0;
+// own free still under way; *in_ram: where the number counts memory that is only reserved, what the other programs hold in RAM, else
+// INT64_MIN) - in the fake squeeze what the pretend program has taken
+int64_t llama_moe_stream::el_os_others(int64_t * lag, int64_t * in_ram) {
+    *lag    = 0;
+    *in_ram = INT64_MIN;
     if (el_test_fake_squeeze > 0) {
         return el_os_avail() >= 0 ? el_fk_took.load() : INT64_MIN;
     }
-    return el_read_others_held(el_memtotal, lag);
+    return el_read_others_held(el_memtotal, lag, in_ram);
 }
 
 // the memory a take-back looks at, read through the OS layer BEFORE the engine lock
@@ -22126,7 +22134,7 @@ bool llama_moe_stream::el_givable_any() const {
         for (uint32_t s2 = 0; s2 < sl.n_slots; s2++) {   // the unanswered-alarm check must not count an alarm nothing could answer)
             if (!sl.slot_off[s2]) {
                 const bool d = el_droppable(sl, (int32_t) s2);
-                if (s2 < n_slots) {
+                if (s2 < n_slots || el_untidy) {   // (out of order after a window pass: by count)
                     lo += 1;
                     lo_free += d ? 1 : 0;
                 } else {
@@ -22771,9 +22779,10 @@ void llama_moe_stream::el_wide_off(const char * why) {
     graph_gen += 1;
 }
 
-// the slots a prompt call's guard counts: with wide waves every switched-on slot (the waves use them), else the ones below the start size
+// the slots a prompt call's guard counts: with wide waves every switched-on slot (the waves use them) and out of order after a window
+// pass too (place says nothing, as el_recount's wave width), else the ones below the start size
 uint32_t llama_moe_stream::el_lo_end(const llama_moe_stream_layer & sl, bool prompt) const {
-    return el_wide && prompt ? sl.n_slots : std::min<uint32_t>(sl.n_slots, n_slots);
+    return (el_wide && prompt) || el_untidy ? sl.n_slots : std::min<uint32_t>(sl.n_slots, n_slots);
 }
 
 void llama_moe_stream::el_recount() {
@@ -22865,18 +22874,90 @@ void llama_moe_stream::el_check_shares(const char * where) const {
     const_cast<llama_moe_stream *>(this)->sh_checks += 1;
 }
 
+#if EL_OS_WIN32
+// mtx held, a window pass running (Windows): give back from the layers this pass has finished. The pass is layer-major, so none of them
+// runs again in this call - their slots hold only what the pass keeps for the reply - and their coldest go now, wherever they sit, in
+// place of waiting for the call's end. Waiting cost a 32k Ling prompt dearly when another program took 4 GiB 10 s in: the band's
+// slot-by-slot offers (1.5 ms each, the lock held up to 185 ms) took it from 27 to 66 s; without the band Windows wrote 2.5 GB of our
+// pages to the pagefile instead. The finished layers' shares and their home in the pass fall together, so the pass's end does not take
+// the room back; what they cannot cover stays pending for the call's end, as before
+int64_t llama_moe_stream::el_give_finished(int64_t bytes) {
+    const int64_t blk = (int64_t) layers[il_of_moe[0]]->block_bytes;
+    const int64_t n   = (bytes + blk - 1)/blk;
+    std::vector<llama_moe_stream_layer *> fin;
+    for (const int32_t il : il_of_moe) {
+        if (layers[il] && layers[il]->win_state == 2) {
+            fin.push_back(layers[il].get());
+        }
+    }
+    // A finished layer keeps at least half the mean share: asked early in the pass, two finished layers went to the floor (258 slots) and
+    // the reply after the prompt ran at 10.5 tok/s. The rest is given as more layers finish (each look serves what is pending again)
+    const int64_t keep = (int64_t) el_total/(2*(int64_t) il_of_moe.size());
+    int64_t got = 0;
+    for (int round = 0; round < 2 && got < n && !fin.empty(); round++) {   // evenly over them; a second round where a layer fell short
+        std::sort(fin.begin(), fin.end(), [](const llama_moe_stream_layer * a, const llama_moe_stream_layer * b) { return a->share > b->share; });
+        const int64_t q = (n - got + (int64_t) fin.size() - 1)/(int64_t) fin.size();
+        for (llama_moe_stream_layer * x : fin) {
+            if (got >= n) {
+                break;
+            }
+            // Its share and its home in the pass (where it goes back to at the pass's end) fall together, neither below `keep`: a layer
+            // the pass has not reached keeps its home - the room its waves were planned with (taking from those homes left layer 41
+            // with no free slot for wave 0) - and a finished layer's room borrowed from layers ahead stays theirs
+            const int64_t lim = std::max<int64_t>(0, std::min<int64_t>((int64_t) x->share, (int64_t) x->win_home) - keep);
+            const int64_t g   = el_drop_layer(*x, std::min<int64_t>({ q, n - got, lim }), true, 0, 0, -1);
+            x->win_home -= (uint32_t) g;
+            got += g;
+        }
+    }
+    if (got > 0) {
+        win_budget     -= got;
+        el_total       -= (uint32_t) got;
+        el_min_dirty    = true;
+        el_given_slots += got;
+        el_n_give      += 1;
+        el_last_give_us = ggml_time_us();
+        el_ref_others  += el_ref_others != INT64_MIN ? got*blk : 0;   // the size now matches that much more held by the others
+        el_events_unanswered = 0;
+        if (el_check) {
+            el_check_shares("give back in a window pass");
+        }
+        if (win_check) {
+            win_check_budget("give back in a window pass");
+        }
+        fprintf(stderr, "llama_moe_stream: elastic RAM give-back at %.3f s (in a window pass, from the %zu layers it finished): %lld slots, "
+                "%.0f MiB\n", ggml_time_us()/1e6, fin.size(), (long long) got, got*(double) blk/1048576.0);
+    }
+    return got*blk;
+}
+#endif
+
 int64_t llama_moe_stream::el_give(int64_t bytes, bool boundary, llama_moe_stream_layer * only) {
-    if (bytes <= 0 || il_of_moe.empty() || win_active) {
+    if (bytes <= 0 || il_of_moe.empty()) {
         return 0;
     }
-    if (!boundary && (el_hold_gives || el_untidy)) {
+    if (win_active) {
+#if EL_OS_WIN32
+        return el_give_finished(bytes);
+#else
+        return 0;
+#endif
+    }
+    if (!boundary && el_hold_gives) {
         // a prompt call with GPU-wave copies runs (tail waves, copy-ahead - they copy from the slots, sized for the call's waves): no slot
-        // is switched off until it ends, where what is pending is given (a prompt call lasts seconds; the band frees RAM meanwhile).
-        // The same while the layers are out of order after a window pass: they are put back in order at the call's end, then given
+        // is switched off until it ends, where what is pending is given (a prompt call lasts seconds; the band frees RAM meanwhile)
         el_n_held_gives += 1;
         return 0;
     }
-    el_tidy();
+    if (sh_on) {
+        el_tidy();   // (slot shares pick the slots above the start size by their value, one by one)
+    }
+    // Out of order after a window pass a slot's place says nothing, so nothing here goes by place then: a layer's slots "above the start
+    // size" are its count above it, and a slot is switched off wherever it is. No tidy-up first - where pages cannot be moved it copied
+    // every expert out of place under the lock (1.1 s for 2,800 Ling experts on Windows, the reply waiting) before a single page went back
+    const bool    by_count = el_untidy;
+    const int32_t hi_from  = by_count ? 0 : (int32_t) n_slots;    // the slots a cut "above the start size" picks from
+    const int32_t lo_to    = by_count ? -1 : (int32_t) n_slots;   // the end of the slots a cut "below the start size" picks from
 
     const size_t blk = layers[il_of_moe[0]]->block_bytes;
     int64_t n = (bytes + (int64_t) blk - 1)/(int64_t) blk;
@@ -22893,12 +22974,12 @@ int64_t llama_moe_stream::el_give(int64_t bytes, bool boundary, llama_moe_stream
         // the pending as they can at once; below the start size the layer gives its even share of the pending at the start of this
         // pass (el_pass_req: one pass gives it all - before, a share of what was still pending, so one pass gave ~64 %)
         const int64_t mn = std::max<int64_t>(1, el_prompt_min);
-        got = el_drop_layer(*only, n, true, mn, (int32_t) n_slots, -1);
+        got = el_drop_layer(*only, by_count ? std::min<int64_t>(n, (int64_t) only->share - (int64_t) n_slots) : n, true, mn, hi_from, -1);
         el_n_prompt_hi += got;
         if (got < n) {
             const int64_t L = (int64_t) il_of_moe.size();
             const int64_t q = std::min<int64_t>(n - got, ((el_pass_req + (int64_t) blk - 1)/(int64_t) blk + L - 1)/L);
-            const int64_t g2 = q > 0 ? el_drop_layer(*only, q, true, mn, 0, (int32_t) n_slots) : 0;
+            const int64_t g2 = q > 0 ? el_drop_layer(*only, q, true, mn, 0, lo_to) : 0;
             got += g2;
             el_n_prompt_lo += g2;
         }
@@ -22939,6 +23020,12 @@ int64_t llama_moe_stream::el_give(int64_t bytes, bool boundary, llama_moe_stream
                         hi[i] += givable(sl, (int32_t) s2) ? 1 : 0;
                     }
                 }
+            }
+            if (by_count) {
+                const int64_t g = hi[i] + dlo[i];   // every slot that may go now
+                hi[i]  = std::min<int64_t>(g, std::max<int64_t>(0, (int64_t) sl.share - (int64_t) n_slots));
+                dlo[i] = g - hi[i];
+                lo[i]  = std::min<int64_t>((int64_t) sl.share, (int64_t) n_slots);
             }
         }
         // With wide waves a prompt call's waves use every slot - phase A keeps the call's wave width (+ marks / copy-backs) too
@@ -22988,7 +23075,7 @@ int64_t llama_moe_stream::el_give(int64_t bytes, bool boundary, llama_moe_stream
                 el_rr = (best + 1) % L;
             }
             for (size_t i = 0; i < L; i++) {
-                got += cut[i] > 0 ? el_drop_layer(*layers[il_of_moe[i]], cut[i], true, pmin_of(*layers[il_of_moe[i]]), (int32_t) n_slots, -1) : 0;
+                got += cut[i] > 0 ? el_drop_layer(*layers[il_of_moe[i]], cut[i], true, pmin_of(*layers[il_of_moe[i]]), hi_from, -1) : 0;
             }
         }
         // phase B: below the start size, evenly (each slot from the layer with the most left; ties: a rotating start), within each
@@ -23031,10 +23118,10 @@ int64_t llama_moe_stream::el_give(int64_t bytes, bool boundary, llama_moe_stream
                 el_rr = (best + 1) % L;
             }
             for (size_t i = 0; i < L; i++) {
-                got += cut[i] > 0 ? el_drop_layer(*layers[il_of_moe[i]], cut[i], true, pmin[i], 0, (int32_t) n_slots) : 0;
+                got += cut[i] > 0 ? el_drop_layer(*layers[il_of_moe[i]], cut[i], true, pmin[i], 0, lo_to) : 0;
             }
         }
-        if (el_check && got > 0) {   // the rule: no slot below the start size while any layer keeps one above; below it, evenly
+        if (el_check && got > 0 && !by_count) {   // the rule: no slot below the start size while any layer keeps one above; below it, evenly
             int64_t max_lo = 0;
             bool any_hi = false;   // a slot above the start size that could still have been given
             std::vector<int64_t> lo2(L, 0), dlo2(L, 0);
@@ -23159,6 +23246,7 @@ void llama_moe_stream::el_take(int mode, const el_mem & m) {
         if (freed >= el_follow && room < (int64_t) blk) {
             // released, but the free room is not there (it was held in swap, or the engine's own memory grew): nothing to follow
             el_ref_others = el_others_seen;
+            el_ref_ram_d  = el_ram_seen != INT64_MIN ? el_ram_seen - el_others_seen : 0;
         }
         if (el_taking) {
             el_taking = false;
@@ -23167,7 +23255,6 @@ void llama_moe_stream::el_take(int mode, const el_mem & m) {
         }
         return;
     }
-    el_tidy();
     const int64_t step_cap = el_test_keep_skip ? room : std::max<int64_t>((int64_t) blk, el_refill_step);
     int64_t n = std::min<int64_t>(std::min(room, freed), step_cap)/(int64_t) blk;
     std::vector<int32_t> order(il_of_moe.begin(), il_of_moe.end());
@@ -23198,6 +23285,7 @@ void llama_moe_stream::el_take(int mode, const el_mem & m) {
     if (got == 0) {   // every layer at its ceiling: nothing to follow
         el_taking     = false;
         el_ref_others = el_test_keep_skip ? el_ref_others : el_others_seen;
+        el_ref_ram_d  = el_test_keep_skip || el_ram_seen == INT64_MIN ? el_ref_ram_d : el_ram_seen - el_others_seen;
         return;
     }
     el_recount();
@@ -24497,6 +24585,8 @@ void llama_moe_stream::el_loop() {
             el_mac_src ? "armed" : el_test_psi_off ? "not armed (TEST ONLY: MOE_STREAM_TEST_PSI_OFF)" : "not available");
 #endif
     int64_t others_last = INT64_MIN;   // the other programs' memory at the look before
+    int64_t ram_last    = INT64_MIN;   // its in-RAM part at the look before (where the system's number has one)
+    bool    reserved_said = false;
     int64_t below = 0;
     bool psi_gone_said = false;
     GGML_UNUSED(psi_gone_said);
@@ -24564,8 +24654,8 @@ void llama_moe_stream::el_loop() {
             dz_band(el_test_unlock_every ? INT64_MAX : el_band_pace, &taken, recon_win);
             const int64_t avail  = el_os_avail();
             const int64_t room   = el_room();
-            int64_t lag = 0;
-            const int64_t others = el_os_others(&lag);
+            int64_t lag = 0, in_ram = INT64_MIN;
+            const int64_t others = el_os_others(&lag, &in_ram);
             const int64_t now    = ggml_time_us();
             std::lock_guard<std::mutex> lock(mtx);
             const int64_t committed = el_x_committed();
@@ -24588,15 +24678,34 @@ void llama_moe_stream::el_loop() {
             const bool filling    = now < el_quiet_until_us.load();   // the fill at start: only a memory-pressure event is answered
             if (has_others && !filling && el_ref_others == INT64_MIN) {
                 el_ref_others  = others;
+                el_ref_ram_d   = in_ram != INT64_MIN ? in_ram - others : 0;
                 el_last_obj_us = now;
                 fprintf(stderr, "llama_moe_stream: elastic RAM: the other programs hold %.0f MiB (in RAM or swap) at %.3f s - the pools follow a "
                         "change of %.0f MiB or more from here\n", others/1048576.0, now/1e6, el_follow/1048576.0);
             }
             const int64_t raw   = has_others && el_ref_others != INT64_MIN ? others - el_ref_others : 0;
-            const int64_t grown = raw > 0 ? std::max<int64_t>(0, raw - lag) : raw;
-            const bool    moved = has_others && others_last != INT64_MIN && std::llabs(others - others_last) >= el_follow/8;
+            int64_t       grown = raw > 0 ? std::max<int64_t>(0, raw - lag) : raw;
+            // Where the number counts memory a program only reserved (in_ram is read), growth is the other programs' only as far as it
+            // also came out of RAM since the pools' size was matched to them: reserved and not used, it takes nothing from anyone. As
+            // the program uses it the in-RAM part grows and that much is given; a release is followed by the number itself, as before
+            // (the in-RAM part alone falls whenever the system moves idle programs' pages out)
+            const int64_t ram_grown = in_ram != INT64_MIN && el_ref_others != INT64_MIN ? std::max<int64_t>(0, in_ram - (el_ref_others + el_ref_ram_d)) : INT64_MAX;
+            if (grown >= el_follow && ram_grown < el_follow && !reserved_said) {
+                reserved_said = true;
+                fprintf(stderr, "llama_moe_stream: elastic RAM: the other programs reserved %.0f MiB more at %.3f s but hold %.0f MiB more in "
+                        "RAM: nothing is given back until they use it\n", grown/1048576.0, now/1e6, ram_grown/1048576.0);
+            }
+            reserved_said = reserved_said && raw >= el_follow;
+            if (grown > ram_grown) {
+                grown = ram_grown;
+            }
+            // (while a reservation is waiting to be used, a move of the in-RAM part keeps the looks at the fastest pace too)
+            const bool    moved = has_others && others_last != INT64_MIN && (std::llabs(others - others_last) >= el_follow/8 ||
+                                  (raw >= el_follow && in_ram != INT64_MIN && ram_last != INT64_MIN && std::llabs(in_ram - ram_last) >= el_follow/8));
             others_last    = others;
+            ram_last       = in_ram;
             el_others_seen = others;
+            el_ram_seen    = in_ram;
             el_others_grown.store(grown, std::memory_order_relaxed);
             if (el_test_look_log) {   // TEST ONLY: one line per look - the engine's own view
                 fprintf(stderr, "llama_moe_stream: elastic RAM look at %.3f s: the other programs hold %lld MiB, %lld MiB %s the pools' size is "

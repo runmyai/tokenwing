@@ -1742,6 +1742,8 @@ struct llama_moe_stream {
     int64_t  el_follow = 0;                        // opts follow=: the follow step (0 = a fifth of keep-free)
     int64_t  el_ref_others = INT64_MIN;            // mtx: the other programs' memory the pools' size is matched to (INT64_MIN: not noted yet)
     int64_t  el_others_seen = INT64_MIN;           // mtx: the other programs' memory at the last look
+    int64_t  el_ram_seen = INT64_MIN;              // mtx: its in-RAM part at the last look (INT64_MIN: the system's number needs none)
+    int64_t  el_ref_ram_d = 0;                     // mtx: the in-RAM part less the number itself when the pools' size was matched to them
     std::atomic<int64_t> el_others_grown{0};       // the last look's el_others_seen - el_ref_others (the band's upkeep reads it)
     double   el_cool_s = 30.0;                     // opts settle= (cool=): no take-back until nothing needed RAM for this long
     int32_t  el_stall_us = 100000;
@@ -1817,7 +1819,7 @@ struct llama_moe_stream {
     int64_t  dz_age_used = 0;                      // the age the last upkeep used (in the layer's expert uses; the stats line)
     double   dz_probe_ms_sum = 0.0, dz_probe_ms_max = 0.0, dz_hold_ms_max = 0.0, dz_lock_us_sum = 0.0, dz_unlock_us_sum = 0.0;
     int64_t  el_n_settle_wait = 0;                 // idle looks a take-back waited for the settle rule
-    int64_t  el_os_others(int64_t * lag);          // the other programs' memory, in RAM or swap (OS layer: el_read_others_held; the fake squeeze's)
+    int64_t  el_os_others(int64_t * lag, int64_t * in_ram);   // the other programs' memory, in RAM or swap (OS layer: el_read_others_held; the fake squeeze's)
     void     el_short(int64_t bytes, int reason, int64_t allowed = -1);   // elastic RAM thread, no lock: `bytes` go back - our empty slots first, then our filled ones
     int64_t  el_n_refill_val = 0;                  // idle refills by the decayed value (after the dropped list)
     bool     el_give_empty = false;                // mtx: el_give / el_drop_layer take switched-on EMPTY slots only (empties first)
@@ -1926,6 +1928,7 @@ struct llama_moe_stream {
     void     el_move_zero(llama_moe_stream_layer & sl, uint32_t zb);              // mtx, boundary: the zero block to [zb, zb + n_zero)
     void     el_lower_zero(llama_moe_stream_layer & sl);                          // mtx, boundary
     int64_t  el_give(int64_t bytes, bool boundary, llama_moe_stream_layer * only);   // mtx
+    int64_t  el_give_finished(int64_t bytes);                                     // mtx, a window pass running (Windows)
     struct el_mem { int64_t room = -1, avail = -1; };                            // read through the OS layer before the lock
     el_mem   el_read_mem();
     void     el_take(int mode, const el_mem & m);                                 // mtx, boundary: 0 a request, 1 a reply's end, 3 idle (elastic RAM thread)

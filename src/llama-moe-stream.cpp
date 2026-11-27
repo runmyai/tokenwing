@@ -18825,6 +18825,16 @@ bool llama_moe_stream::pring_use(ggml_backend_t be, char * ring, size_t ring_byt
         pring_mode.store(1, std::memory_order_relaxed);
         return true;
     }
+#ifdef _WIN32
+    // Windows: the ring without the timing. One copy timed alone (waited for) cannot see the ring's host copy overlap the transfer of the
+    // one before, which a prompt's stream of copies does: on the laptop the timing picked plain copies for Flint half the time (ring
+    // 3-9 % ahead on one 1.4 MiB expert), yet in the prompt the ring took 440-490 ms for the tail waves' 345 MiB against 750-840 plain
+    // (8k prompt 2,031 / 2,199 tok/s against 1,851 / 2,025); for Ling the two ways were level (737 / 789 against 739 / 791)
+    pring_mode.store(1, std::memory_order_relaxed);
+    fprintf(stderr, "llama_moe_stream: RAM -> GPU expert copies go through the page-locked staging ring (Windows: not timed; "
+            "--moe-stream-pinned-ring 0 turns it off)\n");
+    return true;
+#endif
     const size_t n = std::min(std::min(nbytes, ring_bytes), (size_t) 8 << 20);
     if (n < ((size_t) 1 << 20) || ring == nullptr) {
         return false;   // too little to time: the plain way now, decided at a later copy

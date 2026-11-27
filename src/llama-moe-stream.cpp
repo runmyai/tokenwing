@@ -21325,7 +21325,8 @@ static int64_t el_meminfo_bytes(const char * key) {
 // the free the buffer reads as another program's. *lag gets what this process's shared memory fell by in the last two seconds: growth
 // of the returned number up to *lag may be that, and is not taken for another program's.
 // Not seen: memory another program holds inside the system (an integrated GPU's buffers) - a memory-pressure event still answers it
-static int64_t el_read_others_held(int64_t memtotal, int64_t * lag) {
+static int64_t el_read_others_held(int64_t memtotal, int64_t * lag, int64_t * in_ram) {
+    GGML_UNUSED(in_ram);
     GGML_UNUSED(memtotal);
     enum { K_ANON, K_SHMEM, K_SWAPTOTAL, K_SWAPFREE, K_SWAPCACHED, K_N };
     static const char * const keys[K_N] = { "AnonPages", "Shmem", "SwapTotal", "SwapFree", "SwapCached" };
@@ -21545,8 +21546,10 @@ static int64_t el_meminfo_bytes(const char * key) {
 // Windows: the system's commit charge less this process's private commit - what programs hold in RAM or in the pagefile. The
 // memory in use less our working set fell 1.9 GB on a quiet PC while the pools filled (Windows moves idle programs' pages out to make
 // room), read as a release; the commit charge does not change when pages move to the pagefile, and our commit (the pools, the
-// page-locked buffers, the GPU memory WDDM charges to us) leaves with ours: 176 MiB of drift over a whole run on Ling
-static int64_t el_read_others_held(int64_t memtotal, int64_t * lag) {
+// page-locked buffers, the GPU memory WDDM charges to us) leaves with ours: 176 MiB of drift over a whole run on Ling.
+// The commit charge also counts memory a program has reserved and never used (4 GiB committed and not touched read as 4 GiB taken), so
+// the memory in use less our working set is handed out beside it (*in_ram): growth counts only as far as both show it
+static int64_t el_read_others_held(int64_t memtotal, int64_t * lag, int64_t * in_ram) {
     GGML_UNUSED(memtotal);
     GGML_UNUSED(lag);
     PERFORMANCE_INFORMATION pi{};
@@ -21557,6 +21560,7 @@ static int64_t el_read_others_held(int64_t memtotal, int64_t * lag) {
             !K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *) &pc, sizeof(pc))) {
         return INT64_MIN;
     }
+    *in_ram = ((int64_t) pi.PhysicalTotal - (int64_t) pi.PhysicalAvailable) * (int64_t) pi.PageSize - (int64_t) pc.WorkingSetSize;
     return (int64_t) pi.CommitTotal * (int64_t) pi.PageSize - (int64_t) pc.PrivateUsage;
 }
 static int el_read_swap_kind(std::string & desc) {
@@ -21626,7 +21630,8 @@ static int64_t el_meminfo_bytes(const char * key) {
     return -1;
 }
 // macOS: the memory not available less this process's footprint (what the compressor and the swap hold is not counted yet)
-static int64_t el_read_others_held(int64_t memtotal, int64_t * lag) {
+static int64_t el_read_others_held(int64_t memtotal, int64_t * lag, int64_t * in_ram) {
+    GGML_UNUSED(in_ram);
     GGML_UNUSED(lag);
     const int64_t avail = el_meminfo_bytes("MemAvailable");
     task_vm_info_data_t ti{};
@@ -21670,7 +21675,7 @@ static void el_os_zero_unreturned(void * p, size_t n) {
 static int64_t el_os_default_keep_bytes() { return (int64_t) 3 << 29; }
 static int64_t el_win_commit_free() { return INT64_MAX; }
 static int64_t el_meminfo_bytes(const char * key) { GGML_UNUSED(key); return -1; }
-static int64_t el_read_others_held(int64_t memtotal, int64_t * lag) { GGML_UNUSED(memtotal); GGML_UNUSED(lag); return INT64_MIN; }
+static int64_t el_read_others_held(int64_t memtotal, int64_t * lag, int64_t * in_ram) { GGML_UNUSED(memtotal); GGML_UNUSED(lag); GGML_UNUSED(in_ram); return INT64_MIN; }
 static int el_read_swap_kind(std::string & desc) { desc = "not read on this system"; return 0; }
 static std::string el_cgroup_dir() { return ""; }
 static int64_t el_cgroup_room(const std::string & cg) { GGML_UNUSED(cg); return INT64_MAX; }
@@ -21740,13 +21745,15 @@ int64_t llama_moe_stream::el_os_avail() {
 }
 
 // The other programs' memory (el_read_others_held; INT64_MIN when not read; *lag: growth of it up to that much may be this process's
-// own free still under way) - in the fake squeeze what the pretend program has taken
-int64_t llama_moe_stream::el_os_others(int64_t * lag) {
-    *lag = 0;
+// own free still under way; *in_ram: where the number counts memory that is only reserved, what the other programs hold in RAM, else
+// INT64_MIN) - in the fake squeeze what the pretend program has taken
+int64_t llama_moe_stream::el_os_others(int64_t * lag, int64_t * in_ram) {
+    *lag    = 0;
+    *in_ram = INT64_MIN;
     if (el_test_fake_squeeze > 0) {
         return el_os_avail() >= 0 ? el_fk_took.load() : INT64_MIN;
     }
-    return el_read_others_held(el_memtotal, lag);
+    return el_read_others_held(el_memtotal, lag, in_ram);
 }
 
 // the memory a take-back looks at, read through the OS layer BEFORE the engine lock
@@ -23174,6 +23181,7 @@ void llama_moe_stream::el_take(int mode, const el_mem & m) {
         if (freed >= el_follow && room < (int64_t) blk) {
             // released, but the free room is not there (it was held in swap, or the engine's own memory grew): nothing to follow
             el_ref_others = el_others_seen;
+            el_ref_ram_d  = el_ram_seen != INT64_MIN ? el_ram_seen - el_others_seen : 0;
         }
         if (el_taking) {
             el_taking = false;
@@ -23212,6 +23220,7 @@ void llama_moe_stream::el_take(int mode, const el_mem & m) {
     if (got == 0) {   // every layer at its ceiling: nothing to follow
         el_taking     = false;
         el_ref_others = el_test_keep_skip ? el_ref_others : el_others_seen;
+        el_ref_ram_d  = el_test_keep_skip || el_ram_seen == INT64_MIN ? el_ref_ram_d : el_ram_seen - el_others_seen;
         return;
     }
     el_recount();
@@ -24511,6 +24520,8 @@ void llama_moe_stream::el_loop() {
             el_mac_src ? "armed" : el_test_psi_off ? "not armed (TEST ONLY: MOE_STREAM_TEST_PSI_OFF)" : "not available");
 #endif
     int64_t others_last = INT64_MIN;   // the other programs' memory at the look before
+    int64_t ram_last    = INT64_MIN;   // its in-RAM part at the look before (where the system's number has one)
+    bool    reserved_said = false;
     int64_t below = 0;
     bool psi_gone_said = false;
     GGML_UNUSED(psi_gone_said);
@@ -24578,8 +24589,8 @@ void llama_moe_stream::el_loop() {
             dz_band(el_test_unlock_every ? INT64_MAX : el_band_pace, &taken, recon_win);
             const int64_t avail  = el_os_avail();
             const int64_t room   = el_room();
-            int64_t lag = 0;
-            const int64_t others = el_os_others(&lag);
+            int64_t lag = 0, in_ram = INT64_MIN;
+            const int64_t others = el_os_others(&lag, &in_ram);
             const int64_t now    = ggml_time_us();
             std::lock_guard<std::mutex> lock(mtx);
             const int64_t committed = el_x_committed();
@@ -24602,15 +24613,34 @@ void llama_moe_stream::el_loop() {
             const bool filling    = now < el_quiet_until_us.load();   // the fill at start: only a memory-pressure event is answered
             if (has_others && !filling && el_ref_others == INT64_MIN) {
                 el_ref_others  = others;
+                el_ref_ram_d   = in_ram != INT64_MIN ? in_ram - others : 0;
                 el_last_obj_us = now;
                 fprintf(stderr, "llama_moe_stream: elastic RAM: the other programs hold %.0f MiB (in RAM or swap) at %.3f s - the pools follow a "
                         "change of %.0f MiB or more from here\n", others/1048576.0, now/1e6, el_follow/1048576.0);
             }
             const int64_t raw   = has_others && el_ref_others != INT64_MIN ? others - el_ref_others : 0;
-            const int64_t grown = raw > 0 ? std::max<int64_t>(0, raw - lag) : raw;
-            const bool    moved = has_others && others_last != INT64_MIN && std::llabs(others - others_last) >= el_follow/8;
+            int64_t       grown = raw > 0 ? std::max<int64_t>(0, raw - lag) : raw;
+            // Where the number counts memory a program only reserved (in_ram is read), growth is the other programs' only as far as it
+            // also came out of RAM since the pools' size was matched to them: reserved and not used, it takes nothing from anyone. As
+            // the program uses it the in-RAM part grows and that much is given; a release is followed by the number itself, as before
+            // (the in-RAM part alone falls whenever the system moves idle programs' pages out)
+            const int64_t ram_grown = in_ram != INT64_MIN && el_ref_others != INT64_MIN ? std::max<int64_t>(0, in_ram - (el_ref_others + el_ref_ram_d)) : INT64_MAX;
+            if (grown >= el_follow && ram_grown < el_follow && !reserved_said) {
+                reserved_said = true;
+                fprintf(stderr, "llama_moe_stream: elastic RAM: the other programs reserved %.0f MiB more at %.3f s but hold %.0f MiB more in "
+                        "RAM: nothing is given back until they use it\n", grown/1048576.0, now/1e6, ram_grown/1048576.0);
+            }
+            reserved_said = reserved_said && raw >= el_follow;
+            if (grown > ram_grown) {
+                grown = ram_grown;
+            }
+            // (while a reservation is waiting to be used, a move of the in-RAM part keeps the looks at the fastest pace too)
+            const bool    moved = has_others && others_last != INT64_MIN && (std::llabs(others - others_last) >= el_follow/8 ||
+                                  (raw >= el_follow && in_ram != INT64_MIN && ram_last != INT64_MIN && std::llabs(in_ram - ram_last) >= el_follow/8));
             others_last    = others;
+            ram_last       = in_ram;
             el_others_seen = others;
+            el_ram_seen    = in_ram;
             el_others_grown.store(grown, std::memory_order_relaxed);
             if (el_test_look_log) {   // TEST ONLY: one line per look - the engine's own view
                 fprintf(stderr, "llama_moe_stream: elastic RAM look at %.3f s: the other programs hold %lld MiB, %lld MiB %s the pools' size is "

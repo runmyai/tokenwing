@@ -2443,7 +2443,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             // Windows: a job memory cap counts committed memory - the KV cache's whole buffer from its allocation on - where Linux's
             // cgroup, and the measured reserve above, count the pages written. Under a cap the whole cache is counted on top: an 11 GiB
             // cap stopped CPU-only Flint (64k context) at load; uncapped it committed 23.4 GiB for 20.7 GiB written
-            if (params.moe_stream_srv && llama_moe_stream_win_job_capped()) {
+            // (only with no GPU: there the KV cache is in VRAM, which the cap's plan already charges as the free VRAM it takes)
+            if (params.moe_stream_srv && devices.empty() && llama_moe_stream_win_job_capped()) {
                 const uint32_t n_ctx_kv = params.moe_stream_srv->n_ctx > 0 ? params.moe_stream_srv->n_ctx : hparams.n_ctx_train;
                 const int64_t  kv_whole = llama_moe_stream_srv_compute(hparams, arch, *params.moe_stream_srv).kv_tok * (int64_t) n_ctx_kv;
                 other_bytes += kv_whole;

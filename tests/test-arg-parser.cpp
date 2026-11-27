@@ -391,7 +391,7 @@ static void test(void) {
         assert(p2.cache_ram_mib == 1024);
     }
 
-    // Group disables, internal overrides, and elastic->window guard
+    // Group disables, internal overrides, and the window staying on with elastic RAM
     {
         common_params p;
         argv = {"binary_name", "-m", "m.gguf", "--moe-stream", "model",
@@ -416,7 +416,7 @@ static void test(void) {
         assert(p_ov.moe_stream_copy_ahead == 2);
         assert(p_ov.moe_stream_gpu_layers == 0);
         assert(p_ov.moe_stream_elastic == 1);
-        assert(p_ov.moe_stream_window == 0);
+        assert(p_ov.moe_stream_window == 1);
         assert(p_ov.moe_stream_gpu_layers_floor == (3LL << 30));
         assert(p_ov.moe_stream_gpu_layers_uniform_max == 4);
         assert(p_ov.moe_stream_gpu_layers_lend_reclaim == (512LL << 20));

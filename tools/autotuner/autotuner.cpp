@@ -140,23 +140,96 @@ struct GgufModelInfo {
     bool     parsed        = false;
 };
 
-static FILE * open_cfile_ro(const std::string & path, uint64_t * out_size) {
+// The model's header, read in order. On Windows without the file cache: a buffered read leaves the file with a cache section for
+// some seconds, and while it is there Windows sends the storage probe's unbuffered reads to the drive one at a time (8 readers:
+// 1.3 GB/s instead of 5.0), so the probe right after the header would measure that and pick too few I/O threads.
+struct HdrFile {
+#ifdef _WIN32
+    HANDLE   h = INVALID_HANDLE_VALUE;
+    uint8_t * buf = nullptr;   // page-aligned: unbuffered reads need aligned memory, offsets and sizes
+    uint64_t size = 0, buf_at = 0, buf_len = 0, pos = 0;
+#else
+    FILE * f = nullptr;
+#endif
+};
+#ifdef _WIN32
+static constexpr size_t HDR_BUF = 1u << 20;
+#endif
+
+static HdrFile * hdr_open(const std::string & path, uint64_t * out_size) {
+    auto * r = new HdrFile;
 #ifdef _WIN32
     const std::wstring wp = utf8_to_wide(path);
-    FILE * f = _wfopen(wp.c_str(), L"rb");
-    if (!f) return nullptr;
-    _fseeki64(f, 0, SEEK_END);
-    const int64_t sz = _ftelli64(f);
-    _fseeki64(f, 0, SEEK_SET);
-    *out_size = sz > 0 ? (uint64_t) sz : 0;
-    return f;
+    r->h = CreateFileW(wp.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                       FILE_FLAG_NO_BUFFERING, nullptr);
+    LARGE_INTEGER sz{};
+    r->buf = (uint8_t *) VirtualAlloc(nullptr, HDR_BUF, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (r->h == INVALID_HANDLE_VALUE || !GetFileSizeEx(r->h, &sz) || !r->buf) {
+        if (r->buf) VirtualFree(r->buf, 0, MEM_RELEASE);
+        if (r->h != INVALID_HANDLE_VALUE) CloseHandle(r->h);
+        delete r;
+        return nullptr;
+    }
+    r->size = (uint64_t) sz.QuadPart;
+    *out_size = r->size;
 #else
-    FILE * f = fopen(path.c_str(), "rb");
-    if (!f) return nullptr;
+    r->f = fopen(path.c_str(), "rb");
+    if (!r->f) { delete r; return nullptr; }
     struct stat st{};
-    *out_size = (fstat(fileno(f), &st) == 0 && st.st_size > 0) ? (uint64_t) st.st_size : 0;
-    return f;
+    *out_size = (fstat(fileno(r->f), &st) == 0 && st.st_size > 0) ? (uint64_t) st.st_size : 0;
 #endif
+    return r;
+}
+
+static bool hdr_read(HdrFile * r, void * dst, size_t n) {
+#ifdef _WIN32
+    auto * out = (uint8_t *) dst;
+    while (n > 0) {
+        if (r->pos < r->buf_at || r->pos >= r->buf_at + r->buf_len) {   // the aligned 1 MiB around pos
+            r->buf_at = r->pos / 4096 * 4096;
+            OVERLAPPED ov{};
+            ov.Offset     = (DWORD) (r->buf_at & 0xffffffffu);
+            ov.OffsetHigh = (DWORD) (r->buf_at >> 32);
+            DWORD got = 0;
+            if (!ReadFile(r->h, r->buf, (DWORD) HDR_BUF, &got, &ov) || r->buf_at + got <= r->pos) return false;
+            r->buf_len = got;
+        }
+        const size_t take = (size_t) std::min<uint64_t>(n, r->buf_at + r->buf_len - r->pos);
+        memcpy(out, r->buf + (r->pos - r->buf_at), take);
+        out += take; r->pos += take; n -= take;
+    }
+    return true;
+#else
+    return fread(dst, 1, n, r->f) == n;
+#endif
+}
+
+static bool hdr_skip(HdrFile * r, uint64_t n) {
+#ifdef _WIN32
+    if (n > r->size - std::min(r->pos, r->size)) return false;
+    r->pos += n;
+    return true;
+#else
+    return fseeko(r->f, (off_t) n, SEEK_CUR) == 0;
+#endif
+}
+
+static int64_t hdr_tell(HdrFile * r) {
+#ifdef _WIN32
+    return (int64_t) r->pos;
+#else
+    return (int64_t) ftello(r->f);
+#endif
+}
+
+static void hdr_close(HdrFile * r) {
+#ifdef _WIN32
+    VirtualFree(r->buf, 0, MEM_RELEASE);
+    CloseHandle(r->h);
+#else
+    fclose(r->f);
+#endif
+    delete r;
 }
 
 static GgufModelInfo inspect_gguf(const std::string & path) {
@@ -164,17 +237,11 @@ static GgufModelInfo inspect_gguf(const std::string & path) {
     if (path.empty()) return info;
 
     uint64_t file_size = 0;
-    FILE * f = open_cfile_ro(path, &file_size);
-    if (!f || file_size < 64) { if (f) fclose(f); return info; }
+    HdrFile * f = hdr_open(path, &file_size);
+    if (!f || file_size < 64) { if (f) hdr_close(f); return info; }
 
-    auto rd = [&](void * dst, size_t n) -> bool { return fread(dst, 1, n, f) == n; };
-    auto skip = [&](uint64_t n) -> bool {
-#ifdef _WIN32
-        return _fseeki64(f, (int64_t) n, SEEK_CUR) == 0;
-#else
-        return fseeko(f, (off_t) n, SEEK_CUR) == 0;
-#endif
-    };
+    auto rd = [&](void * dst, size_t n) -> bool { return hdr_read(f, dst, n); };
+    auto skip = [&](uint64_t n) -> bool { return hdr_skip(f, n); };
     auto rd_str = [&](std::string & out) -> bool {
         uint64_t len = 0;
         if (!rd(&len, 8) || len > (1ull << 20)) return false;
@@ -208,7 +275,7 @@ static GgufModelInfo inspect_gguf(const std::string & path) {
     uint64_t n_tensors = 0, n_kv = 0;
     if (!rd(magic, 4) || memcmp(magic, "GGUF", 4) != 0 || !rd(&version, 4) || version < 2 || version > 3 ||
         !rd(&n_tensors, 8) || !rd(&n_kv, 8) || n_tensors > (1ull << 20) || n_kv > (1ull << 20)) {
-        fclose(f);
+        hdr_close(f);
         return info;
     }
 
@@ -216,7 +283,7 @@ static GgufModelInfo inspect_gguf(const std::string & path) {
     for (uint64_t i = 0; i < n_kv; i++) {
         std::string key;
         uint32_t vtype = 0;
-        if (!rd_str(key) || !rd(&vtype, 4)) { fclose(f); return info; }
+        if (!rd_str(key) || !rd(&vtype, 4)) { hdr_close(f); return info; }
         auto rd_u32_like = [&](uint32_t & dst) -> bool {
             if (vtype == 4 || vtype == 5) return rd(&dst, 4);
             if (vtype == 10 || vtype == 11) { uint64_t v = 0; if (!rd(&v, 8)) return false; dst = (uint32_t) v; return true; }
@@ -224,14 +291,14 @@ static GgufModelInfo inspect_gguf(const std::string & path) {
         };
         if (key == "general.alignment") {
             uint32_t a = 32;
-            if (!rd_u32_like(a)) { fclose(f); return info; }
+            if (!rd_u32_like(a)) { hdr_close(f); return info; }
             if (a >= 4 && (a & (a - 1)) == 0) alignment = a;
         } else if (key.size() > 13 && key.compare(key.size() - 13, 13, ".expert_count") == 0) {
-            if (!rd_u32_like(info.n_experts)) { fclose(f); return info; }
+            if (!rd_u32_like(info.n_experts)) { hdr_close(f); return info; }
         } else if (key.size() > 18 && key.compare(key.size() - 18, 18, ".expert_used_count") == 0) {
-            if (!rd_u32_like(info.n_used)) { fclose(f); return info; }
+            if (!rd_u32_like(info.n_used)) { hdr_close(f); return info; }
         } else {
-            if (!skip_val(skip_val, vtype)) { fclose(f); return info; }
+            if (!skip_val(skip_val, vtype)) { hdr_close(f); return info; }
         }
     }
 
@@ -245,21 +312,17 @@ static GgufModelInfo inspect_gguf(const std::string & path) {
         RawTensor rt;
         uint32_t n_dims = 0, ttype = 0;
         uint64_t ne[4] = {1, 1, 1, 1};
-        if (!rd_str(rt.name) || !rd(&n_dims, 4) || n_dims == 0 || n_dims > 4) { fclose(f); return info; }
-        for (uint32_t d = 0; d < n_dims; d++) { if (!rd(&ne[d], 8)) { fclose(f); return info; } }
-        if (!rd(&ttype, 4) || !rd(&rt.offset, 8)) { fclose(f); return info; }
+        if (!rd_str(rt.name) || !rd(&n_dims, 4) || n_dims == 0 || n_dims > 4) { hdr_close(f); return info; }
+        for (uint32_t d = 0; d < n_dims; d++) { if (!rd(&ne[d], 8)) { hdr_close(f); return info; } }
+        if (!rd(&ttype, 4) || !rd(&rt.offset, 8)) { hdr_close(f); return info; }
         rt.ne2 = ne[2];
         rt.is_exp = (rt.name.find("_exps.weight") != std::string::npos && rt.ne2 > 1);
         offsets.push_back(rt.offset);
         tensors.push_back(std::move(rt));
     }
 
-#ifdef _WIN32
-    const int64_t hdr_end = _ftelli64(f);
-#else
-    const off_t hdr_end = ftello(f);
-#endif
-    fclose(f);
+    const int64_t hdr_end = hdr_tell(f);
+    hdr_close(f);
     if (hdr_end <= 0) return info;
 
     const uint64_t data_start = (((uint64_t) hdr_end) + alignment - 1) / alignment * alignment;

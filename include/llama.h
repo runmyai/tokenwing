@@ -551,9 +551,9 @@ extern "C" {
         // A CPU split's output in the GPU's pinned host buffer goes to the next GPU split with an
         // async H2D on that GPU's stream and no host wait (one GPU, no pipeline parallelism); 0 = off (a synchronous copy)
         int32_t      moe_stream_async_h2d;
-        // Elastic RAM - the pools give RAM back on memory pressure / low headroom and take it back smoothly when calm;
-        // 0 = off (fixed pools). ram_margin: bytes to leave free (0 = OS default: 1.25 GiB Linux / 1.5 GiB Win & macOS);
-        // elastic_opts: "keep=..,gap=..,again=..,settle=..,refillstep=..,refillms=..,softmin=..,min=.." (NULL = defaults)
+        // Elastic RAM - the pools follow the other programs' memory: RAM is given back when they take some and taken back in steps
+        // when they release it; 0 = off (fixed pools). ram_margin: bytes to leave free (0 = OS default: 1.25 GiB Linux / 1.5 GiB
+        // Win & macOS); elastic_opts: "keep=..,follow=..,settle=..,refillstep=..,refillms=..,softmin=..,min=.." (NULL = defaults)
         int32_t      moe_stream_elastic;
         int64_t      moe_stream_ram_margin;
         const char * moe_stream_elastic_opts;
@@ -2319,8 +2319,7 @@ extern "C" {
     LLAMA_API int32_t llama_moe_stream_gpu_layer_to_drop(const struct llama_model * model);
 
     // The RAM to pass as ram_free: ram_free when it is not 0; else the RAM headroom (ram_margin, else opts keep=, else 1280 MiB on
-    // Linux, 1536 MiB on Windows / macOS, 2 GiB with no swap), with --moe-stream-elastic 1 and no --moe-stream-slots plus half the
-    // gap (opts gap=, at most 256 MiB)
+    // Linux, 1536 MiB on Windows / macOS, 2 GiB with no swap). The same with elastic RAM on or off (elastic and slots are not read)
     LLAMA_API int64_t llama_moe_stream_start_ram_free(int32_t elastic, int32_t slots, int64_t ram_free, int64_t ram_margin,
                                                       const char * elastic_opts);
 

@@ -1070,7 +1070,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             if (!has("--moe-stream-wave-plan"))         { params.moe_stream_wave_plan         = 1; }
             if (!has("--moe-stream-read-ahead"))        { params.moe_stream_read_ahead        = 1; }
             if (!has("--moe-stream-window") && params.moe_stream_layer_major == 1 && params.moe_stream_wave_plan == 1 &&
-                params.moe_stream_elastic == 0 && params.moe_stream_shares == 0 &&
+                params.moe_stream_shares == 0 &&
                 params.moe_stream_hugepages == 0 && params.moe_stream_pin == 0 && params.moe_stream_uma == 0) {
                 params.moe_stream_window = 1;
             }
@@ -4584,8 +4584,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "pools are one window over the layers (the same total): while a layer computes, the next streamed layers' most-used experts "
         "(the usage table) are read into room taken from finished layers, empty slots and - in a full RAM - the layers farthest ahead, "
         "below the running layer's needed reads; a finished layer keeps its share's worth of the call's experts by the prompt-end "
-        "weight, set for the reply. Needs --moe-stream-layer-major 1 and --moe-stream-wave-plan 1; not with --moe-stream-elastic / "
-        "--moe-stream-shares / --moe-stream-hugepages / --moe-stream-pin (default: 0)",
+        "weight, set for the reply. Needs --moe-stream-layer-major 1 and --moe-stream-wave-plan 1; not with --moe-stream-shares / "
+        "--moe-stream-hugepages / --moe-stream-pin; with --moe-stream-elastic 1 a window call switches no slot off (what elastic RAM "
+        "is asked for then is given at the call's end) (default: 0)",
         [](common_params & params, int value) {
             if (value != 0 && value != 1) {   // clamped with a warning
                 const int v0 = value;
@@ -5489,10 +5490,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--moe-stream-elastic"}, "0|1",
-        "1 = elastic RAM (Linux, Windows, macOS): routed-expert RAM pools keep up to band% of the slots whose experts went unused for age reply words "
-        "discardable for instant zero-write OS reclaim (the age falls as free RAM nears the floor; a guessed expert in such a slot is taken back ahead by a reader), "
-        "give RAM back immediately when free RAM dips under --moe-stream-ram-margin or the system swaps out (as much as was swapped), and take RAM back in paced steps once free RAM stays "
-        "calm for settle seconds above again; never above the process's cgroup or job memory limit; tunables in --moe-stream-elastic-opts (default: 0)",
+        "1 = elastic RAM (Linux, Windows, macOS): the routed-expert RAM pools start at the size the fixed pools get and then follow the other programs' memory "
+        "(what they hold in RAM or in swap, without the file cache; the engine's own memory does not count): nothing is done while it has moved by less than "
+        "the follow step (a fifth of --moe-stream-ram-free, a third on Windows), so with no other program taking or releasing memory elastic RAM acts as the fixed pools do; a follow "
+        "step more held by them = that much given back at once, that much less = taken back in paced steps after settle calm seconds, never leaving less than "
+        "--moe-stream-ram-free free; up to band% of the coldest slots stay discardable for the system to take by itself, and a memory-pressure event with less than "
+        "--moe-stream-ram-free free gives back too; never above the process's cgroup or job memory limit; tunables in --moe-stream-elastic-opts (default: 0)",
         [](common_params & params, int value) {
             if (value != 0 && value != 1) {   // clamped with a warning
                 const int v0 = value;
@@ -5504,18 +5507,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--moe-stream-ram-margin"}, "SIZE",
-        "RAM kept free: elastic RAM's floor (with --moe-stream-elastic 1) and the prompt guard's margin (default: --moe-stream-ram-free when given, else 1280MiB Linux, 1536MiB Windows/macOS, 2GiB with no swap/pagefile)",
+        "RAM kept free: what a take-back of elastic RAM never goes under (with --moe-stream-elastic 1) and the prompt guard's margin (default: --moe-stream-ram-free when given, else 1280MiB Linux, 1536MiB Windows/macOS, 2GiB with no swap/pagefile)",
         [](common_params & params, const std::string & value) {
             params.moe_stream_ram_margin = (int64_t) moe_stream_parse_size(value);
         }
     ).set_internal());
     add_opt(common_arg(
         {"--moe-stream-elastic-opts"}, "K=V,...",
-        "elastic RAM tunables: keep=SIZE free-RAM trigger floor, gap=SIZE deadband above keep (512MiB), again=SIZE free RAM needed to start taking back (keep+1GiB), "
-        "settle=SECONDS calm window before taking back (30), refillstep=SIZE max take-back step (256MiB), refillms=MS between take-back steps (5000), "
+        "elastic RAM tunables: keep=SIZE RAM kept free, follow=SIZE the change of the other programs' memory that is followed (a fifth of keep, a third on Windows), "
+        "settle=SECONDS time nothing needed RAM before a take-back (30), refillstep=SIZE max take-back step (256MiB), refillms=MS between take-back steps (5000), "
+        "psi=SIZE a memory-pressure event's give-back (128MiB), psifloor=SIZE such an event counts only with less free (keep), "
         "band=PCT discardable cold band per layer at most (20), age=N reply words a slot's expert goes unused before it joins the band, falling to 0 "
-        "as free RAM falls from again to keep (1024; 0 = the coldest band% at any time), refillio=N take-back refill reads in flight at most, behind every other read (2), softmin=PCT soft warning floor (25), step=SIZE give-back step (512MiB), lookmin=MS/lookmax=MS (25/250), ceiling=N max slots/layer, "
-        "cache=0|1 old file cache (not mapped, nothing to write) counts as free room on Linux (1)",
+        "as the other programs' growth nears the follow step (1024; 0 = the coldest band% at any time), refillio=N take-back refill reads in flight at most, behind every other read (2), softmin=PCT soft warning floor (25), lookmin=MS/lookmax=MS/idlelook=MS (25/250/250), ceiling=N max slots/layer",
         [](common_params & params, const std::string & value) {
             params.moe_stream_elastic_opts = value;
         }

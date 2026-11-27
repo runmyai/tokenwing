@@ -2440,6 +2440,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 other_bytes += srv_bytes;
                 np_srv_need = llama_moe_stream_srv_compute(hparams, arch, *params.moe_stream_srv).need;
             }
+            // Windows: a job memory cap counts committed memory - the KV cache's whole buffer from its allocation on - where Linux's
+            // cgroup, and the measured reserve above, count the pages written. Under a cap the whole cache is counted on top: an 11 GiB
+            // cap stopped CPU-only Flint (64k context) at load; uncapped it committed 23.4 GiB for 20.7 GiB written
+            // (only with no GPU: there the KV cache is in VRAM, which the cap's plan already charges as the free VRAM it takes)
+            if (params.moe_stream_srv && devices.empty() && llama_moe_stream_win_job_capped()) {
+                const uint32_t n_ctx_kv = params.moe_stream_srv->n_ctx > 0 ? params.moe_stream_srv->n_ctx : hparams.n_ctx_train;
+                const int64_t  kv_whole = llama_moe_stream_srv_compute(hparams, arch, *params.moe_stream_srv).kv_tok * (int64_t) n_ctx_kv;
+                other_bytes += kv_whole;
+                fprintf(stderr, "%s: a job memory cap counts committed memory: the KV cache's whole %.2f GiB (%u tokens) counted in the "
+                        "non-pool memory on top of the reserve\n", __func__, kv_whole/1024.0/1024.0/1024.0, n_ctx_kv);
+            }
             if (params.moe_stream_nonpool) {   // from the record, or the fixed reserve without one
                 np_planned = llama_moe_stream_np_bytes(*params.moe_stream_nonpool, llama_moe_stream_sidecar_arg(params.moe_stream, ml.file_paths[0]).c_str(),
                         np_srv_need, srv_bytes, __func__);

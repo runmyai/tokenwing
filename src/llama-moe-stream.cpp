@@ -757,6 +757,14 @@ static os_mem_cap os_mem_cap_get() {
 #else
 static os_mem_cap os_mem_cap_get() { return os_mem_cap(); }   // macOS: no such limit
 #endif
+// Windows: a job memory cap applies (the RAM plan then counts the KV cache whole: a job counts commit); elsewhere always false
+bool llama_moe_stream_win_job_capped() {
+#if defined(_WIN32)
+    return os_mem_cap_get().has;
+#else
+    return false;
+#endif
+}
 // Windows, under a job memory cap: an allocation refused late in the load (another program in the job, or the plan's estimate short of the
 // margin) can fail anywhere - a small malloc in ggml_init asserts, an unchecked one faults - so no single place can stop cleanly. When the
 // process dies (a crash, or abort from an assert) with less room under the cap than the plan's margin, one line says so with the numbers,
@@ -954,7 +962,6 @@ static bool os_slot_taken(const void * p, size_t n, bool reconcile_win = false) 
 #ifndef MADV_PAGEOUT
 #define MADV_PAGEOUT 21
 #endif
-static bool os_band_pageout_probe() { return true; }
 static void os_test_force_discard(void * p, size_t n, intptr_t * saved = nullptr) {
     GGML_UNUSED(saved);
     const size_t pg = os_page_size();
@@ -1071,7 +1078,6 @@ static void os_test_force_discard(void * p, size_t n, intptr_t * saved = nullptr
         if (saved)       { saved[0] = 1; }
     }
 }
-static bool os_band_pageout_probe() { return true; }
 static void os_pool_small_pages(void * p, size_t n, bool t) { GGML_UNUSED(p); GGML_UNUSED(n); GGML_UNUSED(t); }
 static void os_pool_test_huge(void * p, size_t n) { GGML_UNUSED(p); GGML_UNUSED(n); }
 #elif defined(__APPLE__) && defined(MADV_FREE_REUSABLE) && defined(MADV_FREE_REUSE)
@@ -1160,7 +1166,6 @@ static void os_test_force_discard(void * p, size_t n, intptr_t * saved = nullptr
         mmap((void *) a0, np*pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     }
 }
-static bool os_band_pageout_probe() { return true; }
 static void os_pool_small_pages(void * p, size_t n, bool t) { GGML_UNUSED(p); GGML_UNUSED(n); GGML_UNUSED(t); }
 static void os_pool_test_huge(void * p, size_t n) { GGML_UNUSED(p); GGML_UNUSED(n); }
 #else
@@ -1171,7 +1176,6 @@ static bool   os_slot_lock(void * p, size_t n, const intptr_t * saved) { GGML_UN
 static void   os_slot_cancel_offer(void * p, size_t n) { GGML_UNUSED(p); GGML_UNUSED(n); }
 static bool   os_slot_taken(const void * p, size_t n, bool rw = false) { GGML_UNUSED(p); GGML_UNUSED(n); GGML_UNUSED(rw); return false; }
 static void   os_test_force_discard(void * p, size_t n, intptr_t * saved = nullptr) { GGML_UNUSED(p); GGML_UNUSED(n); GGML_UNUSED(saved); }
-static bool   os_band_pageout_probe() { return false; }
 static void   os_pool_small_pages(void * p, size_t n, bool t) { GGML_UNUSED(p); GGML_UNUSED(n); GGML_UNUSED(t); }
 static void   os_pool_test_huge(void * p, size_t n) { GGML_UNUSED(p); GGML_UNUSED(n); }
 #endif
@@ -3153,8 +3157,13 @@ llama_moe_stream::llama_moe_stream(
     el_cap = (el_on || sh_on) && n_streamed > 0 ? std::max<uint32_t>(n_slots, el_cap_slots(n_slots, block_total, n_streamed, n_expert))
            : win_on && n_streamed > 0          ? std::max<uint32_t>(n_slots, n_expert)   // a layer may hold all its experts in a window call
                                                 : n_slots;
+    if (el_on && win_on && n_streamed > 0 && el_cap < n_expert) {
+        // the window with elastic RAM: the address space covers a window call's widest layer, elastic RAM's own growth keeps its bound
+        el_grow_max = el_cap;
+        el_cap      = n_expert;
+    }
     // The GPU prompt-wave view reserved for the widest a layer can reach (VRAM fixed at start)
-    el_wide_w = std::min<uint32_t>(el_cap, n_expert_total > 0 ? n_expert_total : el_cap);
+    el_wide_w = std::min<uint32_t>(std::min(el_cap, el_grow_max), n_expert_total > 0 ? n_expert_total : el_cap);
     el_wide   = el_wide_opt && (el_on || sh_on) && el_has_gpu && n_streamed > 0 && el_wide_w > n_slots;
     if (el_on || sh_on) {
         fprintf(stderr, "%s: GPU prompt waves %s\n", __func__, el_wide ? format("follow the current size: their "
@@ -10309,7 +10318,7 @@ void llama_moe_stream::end_call(bool complete) {
     }
     if (tt) { moe_tt("E vf_pre"); }
     const el_mem self_end_mem = el_on && (el_self_budget.load(std::memory_order_relaxed) > 0 ||
-                                          el_self_lent_any.load(std::memory_order_relaxed))
+                                          el_self_lent_any.load(std::memory_order_relaxed) || el_req.load(std::memory_order_relaxed) > 0)
                                 ? el_read_mem() : el_mem{};
     std::unique_lock<std::mutex> lock(mtx);
     if (vf_wait_us >= 0) {   // (booked under the lock, which the stats read holds)
@@ -10468,10 +10477,6 @@ void llama_moe_stream::idle_setup() {
         }
         return;
     }
-    if (el_on && win_on) {   // the window's pass moves room between layers; it is not built for pools that elastic RAM shrinks and grows
-        win_on = false;
-        fprintf(stderr, "%s: --moe-stream-window is not used with --moe-stream-elastic 1 (its pass is not built for pools that shrink and grow)\n", __func__);
-    }
     idle_on       = p1.idle_load;
     ra_on         = p1.read_ahead;
     us_on         = true;
@@ -10584,8 +10589,8 @@ void llama_moe_stream::idle_arm(bool may_fill) {
     if (!us_on) {
         return;
     }
-    // elastic RAM watches free RAM from here on (else from the first call), so a real need during the fill or an idle load is answered;
-    // during the fill it gives back only for a swap-out or free RAM under the headroom (before the lock: its thread takes it)
+    // elastic RAM's thread runs from here on (else from the first call); during the fill it answers only a memory-pressure event,
+    // as the fixed pools' fill would go on undisturbed (before the lock: its thread takes it)
     const bool el_fill = el_on && idle_on && p1.fill_start && !fs_done && may_fill;
     if (el_fill) {
         el_quiet_until_us.store(INT64_MAX);
@@ -11275,6 +11280,11 @@ void llama_moe_stream::win_setup() {
     win_test_end_off = eo != nullptr && atoi(eo) != 0;
     const char * ws = getenv("MOE_STREAM_TEST_WINDOW_SHORT");   // test only: see win_layer_start
     win_test_short = ws != nullptr ? std::max(0, atoi(ws)) : 0;
+    if (const char * ak = getenv("MOE_STREAM_TEST_WINDOW_ASK")) {   // test only: see win_layer_start
+        const char * c2 = strchr(ak, ':');
+        win_test_ask_at = atoi(ak);
+        win_test_ask_n  = c2 != nullptr ? std::max(1, atoi(c2 + 1)) : 1;
+    }
     const char * kt = getenv("MOE_STREAM_TEST_WINDOW_KEEP_TAKE");
     win_keep_take = kt != nullptr && atoi(kt) != 0;
     // the read-back of a finished layer's kept experts that its waves evicted (and, with KEEP_TAKE, of kept experts taken for the last
@@ -11615,9 +11625,14 @@ void llama_moe_stream::win_layer_start(llama_moe_stream_layer & sl, const int32_
     if (win_active && win_pass_call != win_call_seq) {
         win_close(true);   // a pass left open by a call that did not end through end_call (not expected): closed first
     }
-    if (win_active && (sl.win_state == 2 || (el_on && el_req.load() > 0))) {
-        // A finished layer runs again in the same call, or elastic RAM has a pending give-back request: close the pass cleanly
-        // (every earlier layer's expert graph has finished) so shares return home and the remaining layers run without the window
+    if (win_test_ask_at >= 0 && el_on && win_active && sl.win_state == 0 && win_pos[sl.il] == win_test_ask_at && win_test_ask_call != win_call_seq) {
+        win_test_ask_call = win_call_seq;   // TEST ONLY: as if elastic RAM's thread asked for N slots while the pass runs
+        el_ask((int64_t) win_test_ask_n*(int64_t) sl.block_bytes);
+    }
+    if (win_active && sl.win_state == 2) {
+        // A finished layer runs again in the same call: close the pass (every earlier layer's expert graph has finished) so shares
+        // return home and the remaining layers run without the window. (Elastic RAM's give-backs never close a pass: a layer ahead has
+        // lent its room and cannot have it back while graphs are in flight. They wait for the pass's end - el_give - and are given there)
         for (const int32_t il : il_of_moe) {
             if ((size_t) il < layers.size() && layers[il] && layers[il]->win_ev != nullptr) {
                 ggml_backend_event_synchronize(layers[il]->win_ev);
@@ -11632,7 +11647,7 @@ void llama_moe_stream::win_layer_start(llama_moe_stream_layer & sl, const int32_
     if (!win_active) {
         // the call's size decides (a GPU run whose waves stay on the CPU runs each piece's own remap op - n_tok is a piece)
         if (win_skip_call == win_call_seq || il_of_moe.empty() || sl.il != il_of_moe[0] || win_call_ntok < (int64_t) p1.read_ahead_min ||
-                n_waves(n_tok) <= 1 || !us_loaded || (el_has_gpu && !win_host_call) || (el_on && (el_min_dirty || el_req.load() > 0))) {
+                n_waves(n_tok) <= 1 || !us_loaded || (el_has_gpu && !win_host_call)) {
             return;
         }
         if (win_gpu_blocked(n_tok)) {   // (with or without a VRAM tail)
@@ -11643,6 +11658,7 @@ void llama_moe_stream::win_layer_start(llama_moe_stream_layer & sl, const int32_
             }
             return;
         }
+        // (elastic RAM, which counts a layer's slots by their place, puts the layers back in order itself, when it changes a share: el_tidy)
         win_need_compact = win_test_compact || (el_has_gpu && ((n_waves(el_offload_min()) <= 1 && !tail_onewave_host) || (gpu_waves > 0 && !tailw_ready)));
         for (const int32_t il : il_of_moe) {   // no event of an earlier call (or context) is ever waited for
             if ((size_t) il < layers.size() && layers[il]) {
@@ -11907,11 +11923,13 @@ void llama_moe_stream::win_close(bool complete) {
             }
         }
     }
+    el_untidy = el_untidy || (el_on && !win_need_compact);
     for (llama_moe_stream_layer * x : L) {
         if (win_need_compact) {
             win_compact(*x);   // the layer's experts in its first n_slots slots (a one-wave GPU offload sees only those)
         }
-        n_win_end_short += x->share != x->win_home ? 1 : 0;   // (counted after the compaction)
+        const uint32_t hm_end = el_on && x->win_home == 0 ? x->share : x->win_home;   // (elastic RAM: cleared once the layer is back at it)
+        n_win_end_short += x->share != hm_end ? 1 : 0;   // (counted after the compaction)
         if (win_log) {   // TEST ONLY (MOE_STREAM_TEST_WINDOW_LOG=1)
             int64_t rd = 0, em = 0;
             for (uint32_t s2 = 0; s2 < x->n_slots; s2++) {
@@ -11923,7 +11941,7 @@ void llama_moe_stream::win_close(bool complete) {
                     x->win_union, (long long) x->win_tok, (long long) x->win_dbg[0], (long long) x->win_dbg[1], (long long) x->win_dbg[2],
                     (long long) x->win_dbg[3]);
         }
-        if (x->share > x->win_home) {   // why its slots could not go back (the stats line)
+        if (x->share > hm_end) {   // why its slots could not go back (the stats line)
             for (uint32_t s2 = 0; s2 < x->n_slots; s2++) {
                 if (x->slot_off[s2] || x->slot_state[s2] == MOE_STREAM_SLOT_READY) {
                     continue;
@@ -12016,7 +12034,9 @@ void llama_moe_stream::win_drain(llama_moe_stream_layer * only, const std::vecto
 
 // mtx held, a pass's end (no graph in flight): expert e moves from slot h (switched on, READY, droppable) to slot l (EMPTY, switched on,
 // below the zero block) - its bytes (the OS layer's page move, else a copy) and its slot state; h is emptied without counting an eviction
-void llama_moe_stream::win_relocate(llama_moe_stream_layer & sl, int32_t h, int32_t l) {
+void llama_moe_stream::win_relocate(llama_moe_stream_layer & sl, int32_t h, int32_t l,
+                                    std::vector<std::tuple<uint8_t *, const uint8_t *, size_t>> * copies,
+                                    std::vector<std::pair<llama_moe_stream_layer *, int32_t>> * rel) {
     if (!sl.dz.empty() && sl.dz[h] && !slot_use(sl, h)) {
         dz_forget(sl, l);
         sl.slot_off[h] = 1; sl.gsf_dirty = 1;
@@ -12036,7 +12056,11 @@ void llama_moe_stream::win_relocate(llama_moe_stream_layer & sl, int32_t h, int3
             if (win_page_move) {
                 win_page_move_failed();
             }
-            memcpy(dst, src, sl.weights[p].size);
+            if (copies != nullptr && rel != nullptr) {
+                copies->emplace_back(dst, src, sl.weights[p].size);
+            } else {
+                memcpy(dst, src, sl.weights[p].size);
+            }
         }
     }
     // (some per-slot arrays exist only with their feature on: copied only where both entries exist)
@@ -12064,6 +12088,8 @@ void llama_moe_stream::win_relocate(llama_moe_stream_layer & sl, int32_t h, int3
     sl.share      -= 1;
     if (moved == 3) {
         sl.el_res[h] = 0;   sl.el_zero_known[h] = 1;   sl.el_land[h] = 0;   // h's range is fresh again
+    } else if (copies != nullptr && rel != nullptr) {
+        rel->push_back({ &sl, h });   // released after its queued copy has run
     } else {
         el_release_slot(sl, h);
     }
@@ -12220,6 +12246,7 @@ void llama_moe_stream::win_compact(llama_moe_stream_layer & sl) {
     }
     size_t il = 0;
     std::vector<std::pair<llama_moe_stream_layer *, int32_t>> defer_rel;
+    std::vector<std::tuple<uint8_t *, const uint8_t *, size_t>> copies;
     for (uint32_t h = n_slots; h < sl.n_slots; h++) {
         if (sl.slot_off[h]) {
             continue;
@@ -12239,7 +12266,7 @@ void llama_moe_stream::win_compact(llama_moe_stream_layer & sl) {
             sl.share      += 1;
         }
         if (sl.slot_state[h] == MOE_STREAM_SLOT_READY && sl.slot_expert[h] >= 0) {
-            win_relocate(sl, (int32_t) h, l);
+            win_relocate(sl, (int32_t) h, l, &copies, &defer_rel);
         } else {   // an empty slot above: switched off, the hole below takes its place
             dz_forget(sl, (int32_t) h);
             sl.slot_off[h] = 1; sl.gsf_dirty = 1;
@@ -12247,7 +12274,47 @@ void llama_moe_stream::win_compact(llama_moe_stream_layer & sl) {
             defer_rel.push_back({ &sl, (int32_t) h });
         }
     }
+    // Where pages cannot be moved (Windows) the experts are copied, with the engine lock held: ~3,100 experts (9 GB) at an 8k Ling
+    // prompt's end took 1.17 s on one thread, 0.48-0.54 s on 8; the old slots are released after (still under the lock, no graph in flight)
+    if (!copies.empty()) {
+        const size_t nt = std::min<size_t>(copies.size(), std::max(1u, std::min(8u, std::thread::hardware_concurrency()/2)));
+        std::atomic<size_t> next{0};
+        const auto work = [&]() {
+            for (size_t i; (i = next.fetch_add(1)) < copies.size(); ) {
+                memcpy(std::get<0>(copies[i]), std::get<1>(copies[i]), std::get<2>(copies[i]));
+            }
+        };
+        std::vector<std::thread> th;
+        for (size_t t = 1; t < nt; t++) {
+            th.emplace_back(work);
+        }
+        work();
+        for (auto & t : th) {
+            t.join();
+        }
+    }
     el_release_slots_batch(defer_rel);
+}
+
+// mtx held, a boundary (no graph in flight). A window pass leaves a layer's experts where they landed: some above its start size, with
+// switched-off holes below. Nothing minds that while the pools stay as they are - the next pass starts from any layout, as with the
+// fixed pools. Elastic RAM gives and takes a layer's slots by their place, and a GPU view copies the low ones: before either, the
+// layers are put back in order here (win_compact: a page move per expert, a copy where the system has none). So a quiet machine never
+// pays for it - after every long prompt it cost Linux 1.5 % of an 8k prompt and Windows, which copies, 8 %
+void llama_moe_stream::el_tidy() {
+    if (!el_untidy) {
+        return;
+    }
+    el_untidy = false;
+    const int64_t t0 = ggml_time_us(), r0 = n_win_relocated;
+    for (const int32_t il : il_of_moe) {
+        win_compact(*layers[il]);
+    }
+    const double ms = (ggml_time_us() - t0)/1e3;
+    el_n_tidy  += 1;
+    el_tidy_ms += ms;
+    fprintf(stderr, "llama_moe_stream: elastic RAM: the layers put back in order before a share changes (%lld experts moved, %.1f ms)\n",
+            (long long) (n_win_relocated - r0), ms);
 }
 
 void llama_moe_stream::win_print_stats() const {
@@ -18758,6 +18825,16 @@ bool llama_moe_stream::pring_use(ggml_backend_t be, char * ring, size_t ring_byt
         pring_mode.store(1, std::memory_order_relaxed);
         return true;
     }
+#ifdef _WIN32
+    // Windows: the ring without the timing. One copy timed alone (waited for) cannot see the ring's host copy overlap the transfer of the
+    // one before, which a prompt's stream of copies does: on the laptop the timing picked plain copies for Flint half the time (ring
+    // 3-9 % ahead on one 1.4 MiB expert), yet in the prompt the ring took 440-490 ms for the tail waves' 345 MiB against 750-840 plain
+    // (8k prompt 2,031 / 2,199 tok/s against 1,851 / 2,025); for Ling the two ways were level (737 / 789 against 739 / 791)
+    pring_mode.store(1, std::memory_order_relaxed);
+    fprintf(stderr, "llama_moe_stream: RAM -> GPU expert copies go through the page-locked staging ring (Windows: not timed; "
+            "--moe-stream-pinned-ring 0 turns it off)\n");
+    return true;
+#endif
     const size_t n = std::min(std::min(nbytes, ring_bytes), (size_t) 8 << 20);
     if (n < ((size_t) 1 << 20) || ring == nullptr) {
         return false;   // too little to time: the plain way now, decided at a later copy
@@ -21231,36 +21308,76 @@ static int64_t el_meminfo_bytes(const char * key) {
     return v;
 }
 
-// the count of pages the system has swapped out since boot (Linux: pswpout in /proc/vmstat); -1 when it cannot be read. The OS layer
-// for elastic RAM's swap-out signal (Windows page-file writes, macOS the compressor / swap-out counts - to do)
-static int64_t el_read_pswpout() {
-    FILE * f = fopen("/proc/vmstat", "r");
+// The memory the other programs hold, in bytes: every page some program other than this process keeps for itself, in RAM or pushed
+// out to swap. INT64_MIN when it cannot be read. The OS layer for elastic RAM's one question: did the other programs' need for memory
+// change?
+//   all programs   AnonPages + Shmem                          their own pages and shared memory in RAM (/proc/meminfo)
+//                  + SwapTotal - SwapFree - SwapCached        and in swap (a page in RAM and in swap counts once)
+//   this process   - RssAnon - RssShmem - VmSwap              of /proc/self/status
+// Why these counters. A page of another program that the system pushes to swap - as it does while this process fills its pools -
+// leaves this number where it was: only a program taking or releasing memory moves it (the system's "available" number rises then, as
+// if that program had released its RAM). The file cache and the system's own memory are not in it: neither is a program's need, and
+// a GPU driver keeps part of every page-locked buffer this process frees for itself, which a count of "all that is not free" reads
+// as another program growing. This process's pages are on both sides wherever they are (filled, lazily
+// freed, swapped), so its loading, a prompt's working memory and its give-backs do not move it. One correction: when this process
+// frees shared memory (a page-locked buffer from the GPU driver), its own count falls before the system's does - for the length of
+// the free the buffer reads as another program's. *lag gets what this process's shared memory fell by in the last two seconds: growth
+// of the returned number up to *lag may be that, and is not taken for another program's.
+// Not seen: memory another program holds inside the system (an integrated GPU's buffers) - a memory-pressure event still answers it
+static int64_t el_read_others_held(int64_t memtotal, int64_t * lag) {
+    GGML_UNUSED(memtotal);
+    enum { K_ANON, K_SHMEM, K_SWAPTOTAL, K_SWAPFREE, K_SWAPCACHED, K_N };
+    static const char * const keys[K_N] = { "AnonPages", "Shmem", "SwapTotal", "SwapFree", "SwapCached" };
+    int64_t v[K_N];
+    std::fill(v, v + K_N, (int64_t) -1);
+    char line[512];
+    FILE * f = fopen("/proc/meminfo", "r");
     if (!f) {
-        return -1;
+        return INT64_MIN;
     }
-    char line[128];
-    int64_t v = -1;
     while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "pswpout ", 8) == 0) {
-            v = (int64_t) strtoll(line + 8, nullptr, 10);
-            break;
+        for (int k = 0; k < K_N; k++) {
+            const size_t kl = strlen(keys[k]);
+            if (v[k] < 0 && strncmp(line, keys[k], kl) == 0 && line[kl] == ':') {
+                v[k] = (int64_t) strtoll(line + kl + 1, nullptr, 10)*1024;
+                break;
+            }
         }
     }
     fclose(f);
-    return v;
-}
-
-// this process's own resident memory in bytes (Linux: the resident field of /proc/self/statm); -1 when it cannot be read. The OS layer
-// for elastic RAM's pacing: the fall of free RAM minus the growth of this process = what the other programs take
-static int64_t el_read_own_resident() {
-    FILE * f = fopen("/proc/self/statm", "r");
-    if (!f) {
-        return -1;
+    int64_t own_anon = -1, own_shm = 0, own_swap = 0;
+    f = fopen("/proc/self/status", "r");
+    if (f) {
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "RssAnon:", 8) == 0) {
+                own_anon = (int64_t) strtoll(line + 8, nullptr, 10)*1024;
+            } else if (strncmp(line, "RssShmem:", 9) == 0) {
+                own_shm = (int64_t) strtoll(line + 9, nullptr, 10)*1024;
+            } else if (strncmp(line, "VmSwap:", 7) == 0) {
+                own_swap = (int64_t) strtoll(line + 7, nullptr, 10)*1024;
+            }
+        }
+        fclose(f);
     }
-    long long size = 0, res = -1;
-    const int n = fscanf(f, "%lld %lld", &size, &res);
-    fclose(f);
-    return n == 2 && res >= 0 ? (int64_t) res*(int64_t) sysconf(_SC_PAGESIZE) : -1;
+    if (v[K_ANON] < 0 || v[K_SHMEM] < 0 || v[K_SWAPTOTAL] < 0 || v[K_SWAPFREE] < 0 || own_anon < 0) {
+        return INT64_MIN;
+    }
+    {   // this process's shared memory: the highest value before a fall is remembered for two seconds
+        static std::mutex hold_mtx;
+        static int64_t last = 0, hold = 0, hold_until_us = 0;
+        std::lock_guard<std::mutex> lock(hold_mtx);
+        const int64_t now = ggml_time_us();
+        if (now >= hold_until_us) {
+            hold = 0;
+        }
+        if (own_shm < last) {
+            hold          = std::max(hold, last);
+            hold_until_us = now + 2000000;
+        }
+        last = own_shm;
+        *lag = std::max<int64_t>(0, hold - own_shm);
+    }
+    return v[K_ANON] + v[K_SHMEM] + v[K_SWAPTOTAL] - v[K_SWAPFREE] - std::max<int64_t>(0, v[K_SWAPCACHED]) - own_anon - own_shm - own_swap;
 }
 
 // the machine's swap (Linux: /proc/swaps): 0 none, 1 compressed RAM only (zram devices), 2 any swap on a drive (a partition or a file;
@@ -21331,8 +21448,8 @@ static int64_t el_read_i64(const std::string & path) {   // "max" = no limit
     return v;
 }
 
-// review (minor, the OS layer): a cgroup's room (memory.max - memory.current; INT64_MAX with no limit or not read), its charge
-// (memory.current; -1), whether it holds only this process (1 / 0 / -1 not read), and this process's huge pages (AnonHugePages MiB; -1)
+// The OS layer: a cgroup's room (memory.max - memory.current; INT64_MAX with no limit or not read) and this process's huge pages
+// (AnonHugePages MiB; -1)
 static int64_t el_cgroup_room(const std::string & cg) {
     if (cg.empty()) {
         return INT64_MAX;
@@ -21340,23 +21457,6 @@ static int64_t el_cgroup_room(const std::string & cg) {
     const int64_t mx = el_read_i64(cg + "/memory.max"), cur = el_read_i64(cg + "/memory.current");
     const int64_t leaf = mx > 0 && mx != INT64_MAX && cur >= 0 ? mx - cur : INT64_MAX;
     return std::min<int64_t>(leaf, os_mem_cap_get().room());   // an ancestor's cap limits the take-backs too
-}
-static int64_t el_cgroup_current(const std::string & cg) {
-    return cg.empty() ? -1 : el_read_i64(cg + "/memory.current");
-}
-static int el_cgroup_only_me(const std::string & cg) {
-    FILE * f = cg.empty() ? nullptr : fopen((cg + "/cgroup.procs").c_str(), "r");
-    if (!f) {
-        return -1;
-    }
-    int pid = 0, n = 0;
-    bool only = true;
-    while (fscanf(f, "%d", &pid) == 1) {
-        n += 1;
-        only = only && pid == (int) getpid();
-    }
-    fclose(f);
-    return only && n == 1 ? 1 : 0;
 }
 static int64_t el_own_anon_huge_mib() {
     FILE * f = fopen("/proc/self/smaps_rollup", "r");
@@ -21426,202 +21526,6 @@ static void el_os_zero_unreturned(void * p, size_t n) {
     }
 }
 
-// The Senpai way (Meta's proactive reclaim): the OS layer of the trim - OTHER programs' old FILE cache dropped
-// through the kernel's own control (cgroup v2 memory.reclaim with swappiness=0: file pages only - merged in the Linux 6.11 cycle, probed), our own cgroup never.
-// The targets: our cgroup's parent (its own pages and the other children's - our cgroup protected by memory.min=max during each write),
-// and the other children of every ancestor above it whose memory.reclaim this process may write (the delegated tree: a desktop user's
-// user@UID.service; a root server: the whole machine). false + why when it cannot run here (the start-up line says it)
-static bool os_trim_setup(const std::string & cg, std::vector<std::string> & targets, std::string & guard, std::string & why) {
-    namespace fs = std::filesystem;
-    targets.clear();
-    guard.clear();
-    if (cg.empty() || cg == "/sys/fs/cgroup" || cg == "/sys/fs/cgroup/") {
-        why = "no cgroup v2 of our own";
-        return false;
-    }
-    const std::string parent = fs::path(cg).parent_path().string();
-    if (access((parent + "/memory.reclaim").c_str(), W_OK) != 0) {
-        why = format("%s/memory.reclaim is missing or not writable (cgroup v2 memory.reclaim: Linux 5.19+, a delegated cgroup)", parent.c_str());
-        return false;
-    }
-    if (access((cg + "/memory.min").c_str(), W_OK) != 0) {
-        why = format("our cgroup's memory.min is not writable (%s) - our own pages could not be protected", cg.c_str());
-        return false;
-    }
-    // the swappiness= argument (file pages only): asking for 0 bytes drops nothing; a kernel without it refuses the argument (EINVAL)
-    int fd = open((parent + "/memory.reclaim").c_str(), O_WRONLY | O_CLOEXEC);
-    const char probe[] = "0 swappiness=0";
-    const bool arg_ok = fd >= 0 && write(fd, probe, sizeof(probe) - 1) == (ssize_t) (sizeof(probe) - 1);
-    const int e = errno;
-    if (fd >= 0) {
-        close(fd);
-    }
-    if (!arg_ok) {
-        why = format("memory.reclaim refuses 'swappiness=0' (%s: the argument was merged in the Linux 6.11 cycle) - a trim could reach other programs' "
-                "working memory, so none", strerror(e));
-        return false;
-    }
-    guard = cg + "/memory.min";
-    targets.push_back(parent);
-    std::string on_path = parent;
-    for (std::string up = fs::path(parent).parent_path().string(); up.size() > strlen("/sys/fs/cgroup"); up = fs::path(up).parent_path().string()) {
-        std::error_code ec;
-        for (const auto & d : fs::directory_iterator(up, ec)) {
-            const std::string c = d.path().string();
-            if (d.is_directory(ec) && c != on_path && access((c + "/memory.reclaim").c_str(), W_OK) == 0) {
-                targets.push_back(c);
-            }
-        }
-        on_path = up;
-    }
-    why.clear();
-    return true;
-}
-
-// a cgroup's file cache in bytes (memory.stat "file"); -1 when it cannot be read
-static int64_t os_trim_file_bytes(const std::string & dir) {
-    FILE * f = fopen((dir + "/memory.stat").c_str(), "r");
-    if (!f) {
-        return -1;
-    }
-    char line[256];
-    int64_t v = -1;
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "file ", 5) == 0) {
-            v = (int64_t) strtoll(line + 5, nullptr, 10);
-            break;
-        }
-    }
-    fclose(f);
-    return v;
-}
-
-// the live child cgroups of `parent` whose memory.reclaim this process may write, `skip` (our own cgroup) left out - the programs beside us
-// (apps come and go: read at each keep-free trim)
-static std::vector<std::string> os_trim_children(const std::string & parent, const std::string & skip) {
-    namespace fs = std::filesystem;
-    std::vector<std::string> v;
-    std::error_code ec;
-    for (const auto & d : fs::directory_iterator(parent, ec)) {
-        const std::string c = d.path().string();
-        if (d.is_directory(ec) && c != skip && access((c + "/memory.reclaim").c_str(), W_OK) == 0) {
-            v.push_back(c);
-        }
-    }
-    return v;
-}
-
-// A cgroup the system protects (memory.min or memory.low above 0, e.g. a desktop session slice) - its cache is never trimmed
-// (memory.reclaim written into a cgroup ignores that cgroup's own protection)
-static bool os_trim_protected(const std::string & dir) {
-    for (const char * f : { "/memory.min", "/memory.low" }) {
-        FILE * x = fopen((dir + f).c_str(), "r");
-        char b[64] = "";
-        const bool got = x && fgets(b, sizeof(b), x);
-        if (x) {
-            fclose(x);
-        }
-        if (got && (strncmp(b, "max", 3) == 0 || strtoll(b, nullptr, 10) > 0)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// the file pages the system brought back right after they were dropped while they were still in use (Linux: workingset_activate_file
-// in /proc/vmstat - a refault short enough to count as the working set); -1 when it cannot be read. The keep-free trim's "not old" signal
-static int64_t os_refault_inuse_pages() {
-    FILE * f = fopen("/proc/vmstat", "r");
-    if (!f) {
-        return -1;
-    }
-    char line[128];
-    int64_t v = -1;
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, "workingset_activate_file ", 25) == 0) {
-            v = (int64_t) strtoll(line + 25, nullptr, 10);
-            break;
-        }
-    }
-    fclose(f);
-    return v;
-}
-
-// one trim: ask the kernel to drop `bytes` of file cache in `target` (oldest first: its own order). guard non-empty = the target holds our
-// cgroup: memory.min=max on it for the write, restored after. 0 = done, EAGAIN = less was there, else the errno; *cpu_ms = this
-// thread's system time (the reclaim runs in the writer). A restore that fails is fatal to the trim (returns EIO: the caller stops)
-static int os_trim_step(const std::string & target, const std::string & guard, int64_t bytes, double * cpu_ms) {
-    char old[64] = "0";
-    if (!guard.empty()) {
-        FILE * g = fopen(guard.c_str(), "r");
-        if (!g || !fgets(old, sizeof(old), g)) {
-            if (g) {
-                fclose(g);
-            }
-            return EIO;
-        }
-        fclose(g);
-        old[strcspn(old, "\n")] = 0;
-        int gf = open(guard.c_str(), O_WRONLY | O_CLOEXEC);
-        const bool okp = gf >= 0 && write(gf, "max", 3) == 3;
-        if (gf >= 0) {
-            close(gf);
-        }
-        if (!okp) {
-            return EIO;
-        }
-    }
-    struct rusage r0, r1;
-    getrusage(RUSAGE_THREAD, &r0);
-    int rc = 0;
-    errno = 0;
-    const std::string ask = format("%lld swappiness=0", (long long) bytes);
-    int fd = open((target + "/memory.reclaim").c_str(), O_WRONLY | O_CLOEXEC);
-    if (fd < 0 || write(fd, ask.c_str(), ask.size()) != (ssize_t) ask.size()) {
-        rc = errno ? errno : EIO;
-    }
-    if (fd >= 0) {
-        close(fd);
-    }
-    getrusage(RUSAGE_THREAD, &r1);
-    if (cpu_ms) {
-        *cpu_ms = (r1.ru_stime.tv_sec - r0.ru_stime.tv_sec)*1e3 + (r1.ru_stime.tv_usec - r0.ru_stime.tv_usec)/1e3;
-    }
-    if (!guard.empty()) {
-        int gf = open(guard.c_str(), O_WRONLY | O_CLOEXEC);
-        const bool okr = gf >= 0 && write(gf, old, strlen(old)) == (ssize_t) strlen(old);
-        if (gf >= 0) {
-            close(gf);
-        }
-        if (!okr) {
-            return EIO;
-        }
-    }
-    return rc;
-}
-
-// the memory-stall time of the whole system and of the desktop session (PSI "some" totals in microseconds; -1 = not read): the trim's
-// stop signal. The session = user@UID.service/session.slice above our cgroup (a desktop); none elsewhere
-static void os_stall_us(const std::string & cg, int64_t * sys_us, int64_t * ses_us) {
-    auto rd = [](const std::string & path) -> int64_t {
-        FILE * f = fopen(path.c_str(), "r");
-        if (!f) {
-            return -1;
-        }
-        char line[256] = "";
-        int64_t v = -1;
-        if (fgets(line, sizeof(line), f)) {
-            const char * t = strstr(line, "total=");
-            v = t ? (int64_t) strtoll(t + 6, nullptr, 10) : -1;
-        }
-        fclose(f);
-        return v;
-    };
-    *sys_us = rd("/proc/pressure/memory");
-    const size_t u = cg.find("/user@");
-    const size_t e = u == std::string::npos ? u : cg.find(".service", u);
-    *ses_us = e == std::string::npos ? -1 : rd(cg.substr(0, e + 8) + "/session.slice/memory.pressure");
-}
 #elif EL_OS_WIN32
 static int64_t el_os_default_keep_bytes() { return (int64_t) 3 << 29; }   // 1.5 GiB on Windows
 static int64_t el_win_commit_free() {
@@ -21637,26 +21541,22 @@ static int64_t el_meminfo_bytes(const char * key) {
     if (strcmp(key, "MemAvailable") == 0 || strcmp(key, "MemFree") == 0) { return (int64_t) ms.ullAvailPhys; }
     return -1;
 }
-static int64_t el_read_pswpout() {
-    using fn_ntqsi_t = LONG (WINAPI *)(ULONG, PVOID, ULONG, PULONG);
-    static const fn_ntqsi_t fn = []() -> fn_ntqsi_t {
-        HMODULE h = GetModuleHandleW(L"ntdll.dll");
-        return h ? reinterpret_cast<fn_ntqsi_t>(GetProcAddress(h, "NtQuerySystemInformation")) : nullptr;
-    }();
-    if (!fn) { return -1; }
-    alignas(8) uint8_t buf[640] = {};
-    ULONG ret = 0;
-    if (fn(2 /* SystemPerformanceInformation */, buf, (ULONG) sizeof(buf), &ret) != 0 || ret < 104) {
-        return -1;
-    }
-    uint32_t dirty_pages_written = 0;
-    memcpy(&dirty_pages_written, buf + 96, sizeof(uint32_t));   // SYSTEM_PERFORMANCE_INFORMATION::DirtyPagesWriteCount
-    return (int64_t) dirty_pages_written;
-}
-static int64_t el_read_own_resident() {
-    PROCESS_MEMORY_COUNTERS pc{};
+// Windows: the system's commit charge less this process's private commit - what programs hold in RAM or in the pagefile. The
+// memory in use less our working set fell 1.9 GB on a quiet PC while the pools filled (Windows moves idle programs' pages out to make
+// room), read as a release; the commit charge does not change when pages move to the pagefile, and our commit (the pools, the
+// page-locked buffers, the GPU memory WDDM charges to us) leaves with ours: 176 MiB of drift over a whole run on Ling
+static int64_t el_read_others_held(int64_t memtotal, int64_t * lag) {
+    GGML_UNUSED(memtotal);
+    GGML_UNUSED(lag);
+    PERFORMANCE_INFORMATION pi{};
+    pi.cb = sizeof(pi);
+    PROCESS_MEMORY_COUNTERS_EX pc{};
     pc.cb = sizeof(pc);
-    return K32GetProcessMemoryInfo(GetCurrentProcess(), &pc, sizeof(pc)) ? (int64_t) pc.WorkingSetSize : -1;
+    if (!K32GetPerformanceInfo(&pi, sizeof(pi)) ||
+            !K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *) &pc, sizeof(pc))) {
+        return INT64_MIN;
+    }
+    return (int64_t) pi.CommitTotal * (int64_t) pi.PageSize - (int64_t) pc.PrivateUsage;
 }
 static int el_read_swap_kind(std::string & desc) {
     desc.clear();
@@ -21678,8 +21578,6 @@ static int el_read_swap_kind(std::string & desc) {
 }
 static std::string el_cgroup_dir() { return ""; }
 static int64_t el_cgroup_room(const std::string & cg) { GGML_UNUSED(cg); return os_mem_cap_get().room(); }
-static int64_t el_cgroup_current(const std::string & cg) { GGML_UNUSED(cg); const os_mem_cap c = os_mem_cap_get(); return c.has ? c.cur : -1; }
-static int el_cgroup_only_me(const std::string & cg) { GGML_UNUSED(cg); return 0; }
 static int64_t el_own_anon_huge_mib() { return -1; }
 static bool el_os_release_pages(void * p, size_t n, bool decommit_win) {
     const size_t pg = os_page_size();
@@ -21709,10 +21607,6 @@ static void el_os_zero_unreturned(void * p, size_t n) {
         memset(p, 0, n);
     }
 }
-static bool os_trim_setup(const std::string & cg, std::vector<std::string> & targets, std::string & guard, std::string & why) {
-    GGML_UNUSED(cg); targets.clear(); guard.clear(); why = "Windows Standby cache is repurposed by the kernel without trim writes"; return false;
-}
-static void os_stall_us(const std::string & cg, int64_t * sys_us, int64_t * ses_us) { GGML_UNUSED(cg); *sys_us = -1; *ses_us = -1; }
 #elif EL_OS_MACOS
 static int64_t el_os_default_keep_bytes() { return (int64_t) 3 << 29; }   // 1.5 GiB on macOS
 static int64_t el_win_commit_free() { return INT64_MAX; }
@@ -21730,15 +21624,16 @@ static int64_t el_meminfo_bytes(const char * key) {
     if (strcmp(key, "MemAvailable") == 0) { return ((int64_t) vm.free_count + (int64_t) vm.speculative_count + (int64_t) vm.external_page_count) * (int64_t) pg; }
     return -1;
 }
-static int64_t el_read_pswpout() {
-    vm_statistics64_data_t vm{};
-    mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
-    return host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vm, &cnt) == KERN_SUCCESS ? (int64_t) vm.swapouts : -1;
-}
-static int64_t el_read_own_resident() {
+// macOS: the memory not available less this process's footprint (what the compressor and the swap hold is not counted yet)
+static int64_t el_read_others_held(int64_t memtotal, int64_t * lag) {
+    GGML_UNUSED(lag);
+    const int64_t avail = el_meminfo_bytes("MemAvailable");
     task_vm_info_data_t ti{};
     mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
-    return task_info(mach_task_self(), TASK_VM_INFO, (task_info_t) &ti, &cnt) == KERN_SUCCESS ? (int64_t) ti.phys_footprint : -1;
+    if (memtotal <= 0 || avail < 0 || task_info(mach_task_self(), TASK_VM_INFO, (task_info_t) &ti, &cnt) != KERN_SUCCESS) {
+        return INT64_MIN;
+    }
+    return memtotal - avail - (int64_t) ti.phys_footprint;
 }
 static int el_read_swap_kind(std::string & desc) {
     if (getenv("MOE_STREAM_TEST_NO_SWAP") && atoi(getenv("MOE_STREAM_TEST_NO_SWAP")) != 0) {
@@ -21750,8 +21645,6 @@ static int el_read_swap_kind(std::string & desc) {
 }
 static std::string el_cgroup_dir() { return ""; }
 static int64_t el_cgroup_room(const std::string & cg) { GGML_UNUSED(cg); return INT64_MAX; }
-static int64_t el_cgroup_current(const std::string & cg) { GGML_UNUSED(cg); return -1; }
-static int el_cgroup_only_me(const std::string & cg) { GGML_UNUSED(cg); return 0; }
 static int64_t el_own_anon_huge_mib() { return -1; }
 static bool el_os_release_pages(void * p, size_t n, bool decommit_win) {
     GGML_UNUSED(decommit_win);
@@ -21772,29 +21665,18 @@ static void el_os_zero_unreturned(void * p, size_t n) {
         memset(p, 0, n);
     }
 }
-static bool os_trim_setup(const std::string & cg, std::vector<std::string> & targets, std::string & guard, std::string & why) {
-    GGML_UNUSED(cg); targets.clear(); guard.clear(); why = "macOS XNU reclaims file cache without cgroup trim"; return false;
-}
-static void os_stall_us(const std::string & cg, int64_t * sys_us, int64_t * ses_us) { GGML_UNUSED(cg); *sys_us = -1; *ses_us = -1; }
 #else
 static int64_t el_os_default_keep_bytes() { return (int64_t) 3 << 29; }
 static int64_t el_win_commit_free() { return INT64_MAX; }
 static int64_t el_meminfo_bytes(const char * key) { GGML_UNUSED(key); return -1; }
-static int64_t el_read_pswpout() { return -1; }
-static int64_t el_read_own_resident() { return -1; }
+static int64_t el_read_others_held(int64_t memtotal, int64_t * lag) { GGML_UNUSED(memtotal); GGML_UNUSED(lag); return INT64_MIN; }
 static int el_read_swap_kind(std::string & desc) { desc = "not read on this system"; return 0; }
 static std::string el_cgroup_dir() { return ""; }
 static int64_t el_cgroup_room(const std::string & cg) { GGML_UNUSED(cg); return INT64_MAX; }
-static int64_t el_cgroup_current(const std::string & cg) { GGML_UNUSED(cg); return -1; }
-static int el_cgroup_only_me(const std::string & cg) { GGML_UNUSED(cg); return -1; }
 static int64_t el_own_anon_huge_mib() { return -1; }
 static bool el_os_release_pages(void * p, size_t n, bool decommit_win) {
     GGML_UNUSED(decommit_win); GGML_UNUSED(p); GGML_UNUSED(n); return false; }
 static void el_os_zero_unreturned(void * p, size_t n) { memset(p, 0, n); }
-static bool os_trim_setup(const std::string & cg, std::vector<std::string> & targets, std::string & guard, std::string & why) {
-    GGML_UNUSED(cg); targets.clear(); guard.clear(); why = "not built for this system yet"; return false;
-}
-static void os_stall_us(const std::string & cg, int64_t * sys_us, int64_t * ses_us) { GGML_UNUSED(cg); *sys_us = -1; *ses_us = -1; }
 #endif
 
 static int64_t el_parse_size(const std::string & v) {
@@ -21831,10 +21713,11 @@ static void el_parse_kv(const std::string & s, const std::function<void(const st
     }
 }
 
-// Elastic RAM's view of the OS layer: MemAvailable and the swapped-out page count - the real ones (el_meminfo_bytes, el_read_pswpout), or
-// TEST ONLY (MOE_STREAM_TEST_FAKE_SQUEEZE=<MiB/s>) a pretend machine: 3 s after the first look another program starts taking RAM at
-// that rate until 2 GiB are left (counting the engine's own take-backs and give-backs since the first look), and the pretend kernel
-// swaps out a fifth of the shortfall under keep-free at every look. Its total swap is checked at the end (el_print_stats)
+// Elastic RAM's view of the OS layer: the system's available memory and the other programs' memory - the real ones (el_meminfo_bytes,
+// el_read_others_held), or TEST ONLY (MOE_STREAM_TEST_FAKE_SQUEEZE=<MiB/s>) a pretend machine: 3 s after the first look another
+// program starts taking RAM at that rate until 2 GiB are left (counting the engine's own take-backs and give-backs since the first
+// look), and the pretend kernel swaps out a fifth of what free RAM lacks under the lowest level the rule lets it reach (keep-free less
+// the follow step) at every look. Its total swap is checked at the end (el_print_stats)
 int64_t llama_moe_stream::el_os_avail() {
     const int64_t real = el_meminfo_bytes("MemAvailable");
     if (el_test_fake_squeeze <= 0 || real < 0) {
@@ -21850,64 +21733,19 @@ int64_t llama_moe_stream::el_os_avail() {
     const double  t     = std::max(0.0, (now - el_fk_t0_us.load())/1e6 - 3.0);
     const int64_t took  = std::min<int64_t>((int64_t) (t*el_test_fake_squeeze*1048576.0), el_fk_a0 - ((int64_t) 2 << 30));
     const size_t  blk   = il_of_moe.empty() ? 0 : layers[il_of_moe[0]]->block_bytes;
+    el_fk_took.store(took);
     return el_fk_a0 - took - (el_taken_slots - el_fk_taken0)*(int64_t) blk + (el_given_slots - el_fk_given0)*(int64_t) blk +
            el_dz_now*(int64_t) blk;   // the OS counts our discardable slots as available (the pretend machine too)
 }
 
-// Elastic RAM's view of this process's own resident bytes (the rate of the OTHER programs' growth excludes ours) - the real one, or
-// in the fake squeeze the engine's own changes its pretend MemAvailable counts (the slots taken back minus the slots given back)
-int64_t llama_moe_stream::el_os_own() {
-    if (el_test_fake_squeeze <= 0) {
-        return el_read_own_resident();
-    }
-    const size_t blk = il_of_moe.empty() ? 0 : layers[il_of_moe[0]]->block_bytes;
-    return (el_taken_slots - el_given_slots)*(int64_t) blk;
-}
-
-int64_t llama_moe_stream::el_os_memfree() {
-    return el_meminfo_bytes("MemFree");
-}
-
-// Linux: file cache nobody has used for a while, which the kernel drops by itself, without writing anything, when a program needs
-// the page: the inactive file pages (Cached - Shmem - Active(file); not Inactive(file), which also holds lazily freed anonymous
-// pages such as our discardable band) minus pages waiting to be written (Dirty, Writeback) and minus all mapped file pages (programs'
-// code and mapped files, left alone). 0 when a field cannot be read
-int64_t llama_moe_stream::el_old_file_cache() {
-    const int64_t cached = el_meminfo_bytes("Cached"), shmem = el_meminfo_bytes("Shmem"), active = el_meminfo_bytes("Active(file)");
-    const int64_t dirty = el_meminfo_bytes("Dirty"), wb = el_meminfo_bytes("Writeback"), mapped = el_meminfo_bytes("Mapped");
-    if (cached < 0 || shmem < 0 || active < 0 || dirty < 0 || wb < 0 || mapped < 0) {
-        return 0;
-    }
-    return std::max<int64_t>(0, cached - shmem - active - dirty - wb - mapped);
-}
-
-// The OS layer: the memory the OTHER programs use - MemTotal - MemFree - our own, our own = this process's cgroup's charge
-// (memory.current) when the cgroup holds only this process (e.g. a systemd-run scope), else our resident size. Our
-// pools filling, our give-backs and our band change both sides alike (a page is charged to us until it is really freed); an app
-// growing - also by taking our band pages - shows. (MemAvailable minus our band lagged: a band slot written by a read stays "available"
-// until the kernel's next scan - +-100..600 MiB of noise between two looks in the real rule runs)
-int64_t llama_moe_stream::el_os_others() {
+// The other programs' memory (el_read_others_held; INT64_MIN when not read; *lag: growth of it up to that much may be this process's
+// own free still under way) - in the fake squeeze what the pretend program has taken
+int64_t llama_moe_stream::el_os_others(int64_t * lag) {
+    *lag = 0;
     if (el_test_fake_squeeze > 0) {
-        const int64_t a = el_os_avail(), o = el_os_own();
-        return a >= 0 && o >= 0 ? -(a + o) : INT64_MIN;   // (the pretend machine: its own fall, our share taken out)
+        return el_os_avail() >= 0 ? el_fk_took.load() : INT64_MIN;
     }
-    const int64_t mf = el_os_memfree();
-    if (mf < 0 || el_memtotal <= 0) {
-        return INT64_MIN;
-    }
-    int64_t own = -1;
-    if (el_own_cg < 0) {   // once: does the cgroup hold only this process?
-        el_own_cg = el_cgroup_only_me(el_cgroup_dir()) == 1 ? 1 : 0;
-        fprintf(stderr, "llama_moe_stream: elastic RAM: our own memory for the settle rule: %s\n", el_own_cg ? "this process's cgroup (memory.current)" :
-                "this process's resident size (the cgroup holds other processes too)");
-    }
-    if (el_own_cg == 1) {
-        own = el_cgroup_current(el_cgroup_dir());
-    }
-    if (own < 0) {
-        own = el_os_own();
-    }
-    return own >= 0 ? el_memtotal - mf - own : INT64_MIN;
+    return el_read_others_held(el_memtotal, lag);
 }
 
 // the memory a take-back looks at, read through the OS layer BEFORE the engine lock
@@ -21918,22 +21756,10 @@ llama_moe_stream::el_mem llama_moe_stream::el_read_mem() {
     return m;
 }
 
-int64_t llama_moe_stream::el_os_pswpout() {
-    if (el_test_fake_squeeze <= 0) {
-        return el_read_pswpout();
-    }
-    const int64_t avail = el_os_avail();
-    const int64_t low   = p1.ram_margin;   // the pretend machine swaps under keep-free (the line elastic RAM holds)
-    if (avail < low) {
-        const int64_t pages = (low - avail)/4096/5;
-        el_fk_swp += pages;
-        el_fk_swapped += pages*4096;
-    }
-    return el_fk_swp.load();
-}
-
-// the free room elastic RAM compares with its margin: the smaller of the machine's MemAvailable and this process's cgroup room (memory.max -
-// memory.current, when the cgroup has a limit); -1 when MemAvailable cannot be read
+// The free room elastic RAM compares with its margin: what the system itself counts as available to a program (free pages plus the file
+// cache it drops at once - the number the fixed pools are planned with at start, so both modes mean the same by "free"), less our
+// discardable band (the system counts those pages as available too), and never more than the room under this process's memory cap
+// (below); -1 when it cannot be read
 int64_t llama_moe_stream::el_room() {
     const int64_t avail = el_os_avail();
     if (avail < 0) {
@@ -21946,21 +21772,23 @@ int64_t llama_moe_stream::el_room() {
         // Windows OfferVirtualMemory moves band pages to Standby immediately (raising ullAvailPhys), so room = ullAvailPhys - band.
         // The commit rooms (ullAvailPageFile, the job's) already count our switched-on empty slots, which every caller subtracts from
         // this room again: so their bound goes to el_x_committed as a shortfall, not here (else those slots count twice)
-        const int64_t cr = std::min<int64_t>(el_win_commit_free(), el_cgroup_room(el_cgroup_dir()));
+        // (a job cap's room on the keep-free scale, as for Linux below: else the pools stop 1.5 GiB short of the cap, not the plan's margin -
+        // CPU-only Flint under an 11 GiB cap switched off 807 slots of its 2,162 at the start)
+        const int64_t cap_room = el_cgroup_room(el_cgroup_dir());
+        const int64_t cr = std::min<int64_t>(el_win_commit_free(),
+                                             cap_room == INT64_MAX ? INT64_MAX : cap_room - os_plan_cap_margin() + p1.ram_margin);
         el_win_cshort.store(std::max<int64_t>(0, room - cr), std::memory_order_relaxed);
         return room;
-#else
-        const int64_t mf = el_os_memfree();
-        if (mf < 0) {
-            return -1;
-        }
-        room = mf + (EL_OS_LINUX && el_cache_opt ? el_old_file_cache() : 0);
 #endif
     }
     if (el_test_fake_squeeze > 0) {
         return room;   // the fake squeeze is a pretend machine - its MemAvailable only, not the real cgroup's room
     }
-    return std::min<int64_t>(room, el_cgroup_room(el_cgroup_dir()));
+    // The room under this process's own memory cap is no other program's to use: there the pools may come as close to the cap as the
+    // fixed pools' plan does (the cap margin), not keep-free. So the cap's room goes on the keep-free scale: its margin counts as
+    // keep-free (the callers compare this room with keep-free)
+    const int64_t cap_room = el_cgroup_room(el_cgroup_dir());
+    return cap_room == INT64_MAX ? room : std::min<int64_t>(room, cap_room - os_plan_cap_margin() + p1.ram_margin);
 }
 
 bool llama_moe_stream_cap_margin(int64_t * cap_max, int64_t * peak, int64_t * margin) {
@@ -21986,31 +21814,26 @@ bool llama_moe_stream_cap_now(int64_t * use, int64_t * file_cache) {
 }
 
 // One RAM headroom in both modes: --moe-stream-ram-free when given; else --moe-stream-ram-margin / keep=, else the OS default (2 GiB
-// with no swap). Elastic RAM with no pinned slots starts a little under it (half the gap, at most 256 MiB) and fills up to it
+// with no swap). Elastic RAM starts with the same plan as the fixed pools
 int64_t llama_moe_stream_start_ram_free(int32_t elastic, int32_t slots, int64_t ram_free, int64_t ram_margin, const char * elastic_opts) {
     if (ram_free != 0) {
         return ram_free;
     }
+    GGML_UNUSED(elastic);
+    GGML_UNUSED(slots);
     int64_t keep = ram_margin > 0 ? ram_margin : el_os_default_keep_bytes();
-    int64_t gap  = (int64_t) 512 << 20;
     bool keep_set = ram_margin > 0;
     el_parse_kv(elastic_opts ? elastic_opts : "", [&](const std::string & k, const std::string & v) {
         if (k == "keep") {
             keep = el_parse_size(v);
             keep_set = true;
-        } else if (k == "gap") {
-            gap = std::max<int64_t>(0, el_parse_size(v));
         }
     });
     std::string sdesc;
     if (!keep_set && el_read_swap_kind(sdesc) == 0) {
         keep = std::max<int64_t>(keep, (int64_t) 2 << 30);   // no swap / pagefile: 2 GiB
     }
-    if (elastic != 1 || slots > 0) {
-        return keep > 0 ? keep : el_os_default_keep_bytes();
-    }
-    const int64_t start_free = keep + std::min<int64_t>(gap / 2, (int64_t) 256 << 20);
-    return start_free > 0 ? start_free : el_os_default_keep_bytes();
+    return keep > 0 ? keep : el_os_default_keep_bytes();
 }
 
 void llama_moe_stream::el_parse_opts() {
@@ -22018,45 +21841,29 @@ void llama_moe_stream::el_parse_opts() {
     sh_on = p1.shares;
     el_parse_kv(p1.elastic_opts, [this](const std::string & k, const std::string & v) {
         if      (k == "step")    { el_step     = el_parse_size(v); }
-        else if (k == "again" || k == "growmin") { el_growmin = el_parse_size(v); el_growmin_set = true; }
+        else if (k == "follow")  { el_follow   = el_parse_size(v); }
         else if (k == "keep")    { p1.ram_margin = el_parse_size(v); p1.ram_margin_set = true; }
         else if (k == "fill")    { }
         else if (k == "discard") { el_dz_opt = atoi(v.c_str()) != 0; }
-        else if (k == "cache")   { el_cache_opt = atoi(v.c_str()) != 0; }
         else if (k == "band")    { el_band_pct = atof(v.c_str()); }
         else if (k == "age")     { el_band_age = atoll(v.c_str()); }
         else if (k == "refillio") { el_refill_io = atoi(v.c_str()); }
         else if (k == "bandpace") { el_band_pace = std::max<int64_t>(1, atoll(v.c_str())); }
         else if (k == "psifloor") { el_psi_floor = el_parse_size(v); }
         else if (k == "settle")  { el_cool_s = atof(v.c_str()); }
-        else if (k == "settlefall") { el_settle_fall = el_parse_size(v); }
-        else if (k == "selfdiscard") { el_sd_opt = atoi(v.c_str()) != 0; }
-        else if (k == "selfnear") { el_sd_near = el_parse_size(v); }
-        else if (k == "trim")    { el_tr_opt = atoi(v.c_str()) != 0; }
-        else if (k == "trimstep") { el_tr_step0 = el_parse_size(v); }
-        else if (k == "trimmax") { el_tr_max = el_parse_size(v); }
-        else if (k == "trimpsi") { el_tr_psi_us = atoll(v.c_str()); }
-        else if (k == "trimback") { el_tr_back_s = atof(v.c_str()); }
-        else if (k == "trimbackmax") { el_tr_back_max_s = atof(v.c_str()); }
         else if (k == "min")     { el_min_opt = v == "auto" ? -1 : el_parse_size(v); }
         else if (k == "softmin") { el_soft_min_pct = atof(v.c_str()); el_soft_min_set = true; }
-        else if (k == "gap")     { el_gap = el_parse_size(v); el_gap_set = true; }
         else if (k == "psi")     { el_psi_base = el_parse_size(v); }
         else if (k == "idlelook") { el_idle_look_ms = atoi(v.c_str()); }
         else if (k == "wide")    { el_wide_opt = atoi(v.c_str()) != 0; }
-        else if (k == "fastrate") { el_fast_rate = el_parse_size(v); }
         else if (k == "cool")    { el_cool_s   = atof(v.c_str()); }
         else if (k == "stall")   { el_stall_us = atoi(v.c_str()); }
         else if (k == "ceiling") { el_ceiling  = (uint32_t) atoi(v.c_str()); }
-        else if (k == "swap")    { el_swap_on = atoi(v.c_str()) != 0; }
-        else if (k == "pace")    { el_pace = atof(v.c_str()); }
-        else if (k == "drop")    { el_drop = el_parse_size(v); }
         else if (k == "lookmin") { el_look_min_ms = atoi(v.c_str()); }
         else if (k == "lookmax") { el_look_max_ms = atoi(v.c_str()); }
-        else if (k == "ratewin") { el_rate_win_ms = atoi(v.c_str()); }
         else if (k == "refillstep") { el_refill_step = el_parse_size(v); }
         else if (k == "refillms")   { el_refill_ms = atoi(v.c_str()); }
-        else { fprintf(stderr, "llama_moe_stream: --moe-stream-elastic-opts: unknown key '%s' ignored (keys: keep, again, gap, psi, psifloor, settle, settlefall, trim, trimstep, trimmax, trimpsi, trimback, trimbackmax, min, softmin, selfdiscard, selfnear, discard, cache, band, age, bandpace, refillio, idlelook, fastrate, wide, fill, step, refillstep, refillms, cool, stall, ceiling, swap, pace, drop, lookmin, lookmax, ratewin)\n", k.c_str()); }
+        else { fprintf(stderr, "llama_moe_stream: --moe-stream-elastic-opts: unknown key '%s' ignored (keys: keep, follow, psi, psifloor, settle, min, softmin, discard, band, age, bandpace, refillio, idlelook, wide, fill, step, refillstep, refillms, cool, stall, ceiling, lookmin, lookmax)\n", k.c_str()); }
     });
     el_parse_kv(p1.share_opts, [this](const std::string & k, const std::string & v) {
         if      (k == "step")  { sh_step_pct  = atof(v.c_str()); }
@@ -22070,9 +21877,6 @@ void llama_moe_stream::el_parse_opts() {
         else if (k == "min")   { sh_min       = (uint32_t) atoi(v.c_str()); }
         else { fprintf(stderr, "llama_moe_stream: --moe-stream-share-opts: unknown key '%s' ignored (keys: step, every, gap, hits, cool, half, floor, ceil, min)\n", k.c_str()); }
     });
-    if (el_drop == 0) {
-        el_drop = el_step/2;   // by default free RAM may fall at most half a give-back step between two looks
-    }
     if (!p1.ram_margin_set) {   // the same default as llama_moe_stream_start_ram_free, with or without elastic RAM
         p1.ram_margin = el_os_default_keep_bytes();
         std::string sdesc;
@@ -22091,35 +21895,27 @@ void llama_moe_stream::el_parse_opts() {
                 fixed += (fixed.empty() ? "" : ", ") + std::string(name);
             }
         };
-        fix(el_pace < 0, el_pace, 2.0, "pace");
-        fix(el_drop < 0, el_drop, el_step/2, "drop");
         fix(el_look_min_ms < 1, el_look_min_ms, 25, "lookmin");
         fix(el_look_max_ms < el_look_min_ms, el_look_max_ms, std::max(el_look_min_ms, 250), "lookmax");
         fix(el_idle_look_ms < el_look_min_ms, el_idle_look_ms, std::max(el_look_min_ms, 250), "idlelook");
-        fix(el_rate_win_ms < 0, el_rate_win_ms, 1000, "ratewin");
-        fix(el_gap < 0, el_gap, (int64_t) 512 << 20, "gap");
         fix(el_psi_base <= 0, el_psi_base, (int64_t) 128 << 20, "psi");
-        fix(el_psi_floor < 0, el_psi_floor, (int64_t) 2 << 30, "psifloor");
         fix(el_band_pct < 0 || el_band_pct > 100, el_band_pct, 20.0, "band");
         fix(el_band_age < 0, el_band_age, (int64_t) 1024, "age");
         fix(el_refill_io < 1, el_refill_io, 2, "refillio");
         fix(el_soft_min_pct < 0 || el_soft_min_pct > 100, el_soft_min_pct, 25.0, "softmin");
-        fix(el_settle_fall <= 0, el_settle_fall, (int64_t) 64 << 20, "settlefall");
-        fix(el_tr_step0 < 4096, el_tr_step0, (int64_t) 64 << 20, "trimstep");
-        fix(el_tr_max < el_tr_step0, el_tr_max, std::max<int64_t>(el_tr_step0, (int64_t) 1 << 30), "trimmax");
-        fix(el_tr_psi_us < 0, el_tr_psi_us, (int64_t) 1000, "trimpsi");
-        fix(!(el_tr_back_s > 0.0), el_tr_back_s, 10.0, "trimback");
-        fix(el_tr_back_max_s < el_tr_back_s, el_tr_back_max_s, std::max(el_tr_back_s, 160.0), "trimbackmax");
-        fix(el_sd_near < 0, el_sd_near, (int64_t) 512 << 20, "selfnear");
         fix(el_band_pace < 1, el_band_pace, (int64_t) 64, "bandpace");
         fix(p1.ram_margin <= 0, p1.ram_margin, el_os_default_keep_bytes(), "keep");
         fix(el_step <= 0, el_step, (int64_t) 512 << 20, "step");
         fix(el_refill_step <= 0, el_refill_step, (int64_t) 256 << 20, "refillstep");
         fix(el_refill_ms < 0, el_refill_ms, 5000, "refillms");
-        if (!el_growmin_set) {
-            el_growmin = p1.ram_margin + el_gap + ((int64_t) 512 << 20);
+        if (el_follow <= 0) {
+            // not set: a fifth of keep-free - a change that small stays inside what is kept free anyway. Windows: a third (its own
+            // background work - updates, the virus scanner - commits 300-500 MiB at a time, and no program needs RAM then)
+            el_follow = std::max<int64_t>(1, p1.ram_margin/(EL_OS_WIN32 ? 3 : 5));
         }
-        fix(el_growmin < 0, el_growmin, p1.ram_margin + el_gap + ((int64_t) 512 << 20), "again");
+        if (el_psi_floor < 0) {   // not set: under keep-free
+            el_psi_floor = p1.ram_margin;
+        }
         fix(el_cool_s < 0, el_cool_s, 30.0, "settle");
         fix(el_stall_us <= 0 || el_stall_us > 2000000, el_stall_us, 100000, "stall");
         fix(sh_step_pct <= 0, sh_step_pct, 1.0, "share step");
@@ -22165,7 +21961,6 @@ void llama_moe_stream::el_parse_opts() {
     el_check      = envi("MOE_STREAM_TEST_ELASTIC_CHECK") != 0;
     el_test_lowskip = envi("MOE_STREAM_TEST_LOWONLY_SKIP") != 0;
     sh_test_log     = envi("MOE_STREAM_TEST_SHARE_LOG") != 0;
-    el_test_fake_swap   = std::max(0, envi("MOE_STREAM_TEST_FAKE_SWAP"));
     el_test_give_one    = envi("MOE_STREAM_TEST_GIVE_ONE_LAYER") != 0;
     el_test_fake_squeeze = std::max(0, envi("MOE_STREAM_TEST_FAKE_SQUEEZE"));
     el_test_fake_a0      = std::max(0, envi("MOE_STREAM_TEST_FAKE_SQUEEZE_A0"));   // MiB free at the first look (default the real)
@@ -22179,17 +21974,14 @@ void llama_moe_stream::el_parse_opts() {
                 sh_test_lowfirst ? " SHARE_LOWFIRST (a share move gives below the start size first: the check must stop the run)" : "");
     }
     el_test_give_ignore  = envi("MOE_STREAM_TEST_GIVE_IGNORE_LEVEL") != 0;
-    el_test_pace_off     = envi("MOE_STREAM_TEST_PACE_OFF") != 0;
     el_test_pending_ignore = envi("MOE_STREAM_TEST_PENDING_IGNORE") != 0;
     el_test_free_pinned    = envi("MOE_STREAM_TEST_FREE_PINNED") != 0;
-    el_test_give_noreason  = envi("MOE_STREAM_TEST_GIVE_NOREASON") != 0;  // the failure test
     el_test_wide_fail      = envi("MOE_STREAM_TEST_WIDE_FAIL") != 0;
     el_test_give_oversize  = envi("MOE_STREAM_TEST_GIVE_OVERSIZE") != 0;
     el_test_psi_off        = envi("MOE_STREAM_TEST_PSI_OFF") != 0;        // identity runs (a real event's give-back moves the waves)
-    if (el_test_give_noreason || el_test_give_oversize) {
-        fprintf(stderr, "%s: TEST ONLY:%s%s\n", __func__,
-                el_test_give_noreason ? " GIVE_NOREASON (a swap-out of idle memory asks a step: the check must stop the run)" : "",
-                el_test_give_oversize ? " GIVE_OVERSIZE (under keep-free asks four times the need: the check must stop the run)" : "");
+    if (el_test_give_oversize) {
+        fprintf(stderr, "%s: TEST ONLY: GIVE_OVERSIZE (a give-back asks four times what the other programs took: the check must stop the run)\n",
+                __func__);
     }
     el_test_discard        = envi("MOE_STREAM_TEST_DISCARD") != 0;        // the forced discard (MADV_PAGEOUT after every unlock)
     el_test_discard_nolock = envi("MOE_STREAM_TEST_DISCARD_NOLOCK") != 0; // the failure test - a hit skips the lock
@@ -22197,7 +21989,6 @@ void llama_moe_stream::el_parse_opts() {
     el_test_thp_always     = envi("MOE_STREAM_TEST_THP_ALWAYS") != 0;     // the pools as on a THP "always" distro (MADV_HUGEPAGE)
     el_test_thp_keep       = envi("MOE_STREAM_TEST_THP_KEEP") != 0;       // the failure test - no MADV_NOHUGEPAGE on the pools
     el_test_look_log       = envi("MOE_STREAM_TEST_LOOK_LOG") != 0;       // a line per look (the engine's free RAM over time)
-    el_test_self_discard   = envi("MOE_STREAM_TEST_SELF_DISCARD") != 0;   // elastic RAM discards 128 MiB of our band at every look
     if (el_test_discard || el_test_discard_nolock || el_test_unlock_every || el_test_thp_always || el_test_thp_keep) {
         fprintf(stderr, "%s: TEST ONLY:%s%s%s%s%s\n", __func__,
                 el_test_discard ? " DISCARD (every unlocked slot is discarded at once: every later use must read it again)" : "",
@@ -22219,19 +22010,13 @@ void llama_moe_stream::el_parse_opts() {
         fprintf(stderr, "%s: TEST ONLY: PENDING_IGNORE (every ask adds all it wants: the pending check "
                 "must stop the run when several looks ask during one call)\n", __func__);
     }
-    if (el_test_pace_off) {
-        fprintf(stderr, "%s: TEST ONLY: PACE_OFF (the looks unpaced and no early give-back, while the pacing check stays "
-                "armed: it must stop the run when free RAM falls fast)\n", __func__);
-    }
     if (el_test_fake_squeeze || el_test_give_ignore) {
         fprintf(stderr, "%s: TEST ONLY:%s%s\n", __func__,
                 el_test_fake_squeeze ? format(" FAKE_SQUEEZE %d MiB/s (a pretend machine)", el_test_fake_squeeze).c_str() : "",
-                el_test_give_ignore ? " GIVE_IGNORE_LEVEL (no give-back under the trigger: the check must stop the run)" : "");
+                el_test_give_ignore ? " GIVE_IGNORE_LEVEL (no give-back when the other programs took RAM: the check must stop the run)" : "");
     }
-    if (el_test_fake_swap || el_test_give_one) {
-        fprintf(stderr, "%s: TEST ONLY:%s%s\n", __func__,
-                el_test_fake_swap ? format(" FAKE_SWAP every %d decode words", el_test_fake_swap).c_str() : "",
-                el_test_give_one ? " GIVE_ONE_LAYER (give-backs below the start size from one layer: the check must stop the run)" : "");
+    if (el_test_give_one) {
+        fprintf(stderr, "%s: TEST ONLY: GIVE_ONE_LAYER (give-backs below the start size from one layer: the check must stop the run)\n", __func__);
     }
     el_test_inuse = envi("MOE_STREAM_TEST_SHRINK_INUSE") != 0;
     el_test_fake  = std::max(0, envi("MOE_STREAM_TEST_FAKE_ALARM"));
@@ -22250,51 +22035,21 @@ void llama_moe_stream::el_parse_opts() {
         el_dz_ok = el_dz_opt && os_discard_probe();
         el_dz_on = el_dz_ok;   // (off again in create_pool if a pool is not fresh)
         el_dz_touch = os_dio_needs_touch();
-        fprintf(stderr, "%s: elastic RAM on - keep the RAM filled and keep-free %.0f MiB "
-                "TRULY free%s (free RAM = %s minus our switched-on empty slots; the "
-                "gap %.0f MiB); %s; a memory-pressure event (PSI) is a need only with less than %.0f MiB free (%.0f MiB, doubling "
-                "while it goes on); swap-outs of idle memory are logged, not answered; a take-back once nothing needed RAM for %.0f s (no "
-                "give-back, no pressure event, free RAM not falling by %.0f MiB or more between two looks); the free-RAM check every %d ms (%d "
-                "ms with no request running), faster only while free RAM falls faster than %.0f MiB/s; %s\n", __func__,
-                p1.ram_margin/1048576.0, p1.ram_margin_set ? " (set)" : "", "MemFree - RAM nobody uses", el_gap/1048576.0,
+        fprintf(stderr, "%s: elastic RAM on - the pools start as the fixed pools do (keep-free %.0f MiB%s) and then follow the other "
+                "programs' memory (what they hold in RAM or in swap, without the file cache; the engine's own memory does not move it): "
+                "once they hold %.0f MiB more than the pools' size is matched to, that much is given back; once they hold that much less "
+                "and nothing needed RAM for %.0f s, it is taken back in steps of %.0f MiB, never past keep-free; a memory-pressure event "
+                "with less than %.0f MiB free gives back %.0f MiB (doubling while it goes on); a look every %d ms (%d ms with no request "
+                "running, %d ms while the other programs' memory moves); %s\n", __func__,
+                p1.ram_margin/1048576.0, p1.ram_margin_set ? ", set" : "", el_follow/1048576.0, el_cool_s, el_refill_step/1048576.0,
+                el_psi_floor/1048576.0, el_psi_base/1048576.0, el_look_max_ms, el_idle_look_ms, el_look_min_ms,
                 el_dz_ok ? format("the discardable BAND: up to %.0f %% of each layer's slots marked discardable, least valuable first, once their "
-                "expert went unused for %lld reply words (fewer as free RAM falls from again= to keep-free, none at keep-free) (MADV_FREE: the OS "
-                "takes their pages itself, when and as much as an app outruns keep-free needs; a later use locks one back - a guess has a reader "
+                "expert went unused for %lld reply words (fewer as the other programs' growth nears the follow step) (MADV_FREE: the OS takes "
+                "their pages itself, at once, when a program needs RAM before a give-back; a later use locks one back - a guess has a reader "
                 "do it ahead - or reads it again); a give-back switches off empty slots, then band slots, then the least valuable", el_band_pct,
                 (long long) el_band_age).c_str() : el_dz_opt ?
                 "discardable slots NOT available here (the kernel's MADV_FREE probe failed): a give-back switches slots off" :
-                "discard=0: a give-back switches slots off",
-                el_psi_floor/1048576.0, el_psi_base/1048576.0, el_cool_s, el_settle_fall/1048576.0, el_look_max_ms, el_idle_look_ms, el_fast_rate/1048576.0,
-                el_dz_ok ? "the band frees RAM at any moment, a prompt too" : "no band here: a give-back switches slots off");
-        fprintf(stderr, "%s: elastic RAM: looks %s, every %d..%d ms\n", __func__, el_pace > 0 ? format("paced by how fast "
-                "the other programs take RAM (the rate over the last %d ms; the next look before free RAM can reach the trigger at %.1f x "
-                "that rate, or fall more than %.0f MiB; within two steps of the trigger at the fastest pace; a crossing foreseen even at "
-                "the fastest pace gives back at once)", el_rate_win_ms, el_pace, el_drop/1048576.0).c_str() : "unpaced (pace=0: the "
-                "slowest pace far from the trigger, the fastest within two steps of it)", el_look_min_ms, el_look_max_ms);
-        // Elastic RAM discards our band itself while the system swaps other apps out (MADV_PAGEOUT) - said once
-        el_sd_ok = el_sd_opt && el_dz_ok && el_test_fake_squeeze == 0 && os_band_pageout_probe();
-        fprintf(stderr, "%s: our band discarded by elastic RAM itself while the system swaps other apps out %s\n", __func__,
-                el_sd_ok ? format("ON - with free RAM under keep-free + %.0f MiB, as much as was swapped out since the last look (at most 1 GiB), "
-                "coldest first (MADV_PAGEOUT)", el_sd_near/1048576.0).c_str() : !el_sd_opt ? "OFF (selfdiscard=0)" : !el_dz_ok ?
-                "OFF (no band here)" : "OFF (MADV_PAGEOUT not available: Linux 5.4+)");
-        // The trim (the "Senpai way") - where it can run, said once
-        el_tr_ok = el_tr_opt && el_test_fake_squeeze == 0 && os_trim_setup(el_cgroup_dir(), el_tr_targets, el_tr_guard, el_tr_why);
-        if (el_tr_ok) {
-            std::string tl;
-            for (size_t i = 0; i < el_tr_targets.size(); i++) {
-                tl += format("%s%s", i ? ", " : "", el_tr_targets[i].substr(el_tr_targets[i].find_last_of('/') + 1).c_str());
-            }
-            fprintf(stderr, "%s: elastic RAM: the TRIM on - other programs' old file cache dropped in steps of %.0f..%.0f MiB "
-                    "(memory.reclaim, swappiness=0: file pages only, oldest first) while the engine is under its ceiling or free RAM under "
-                    "keep-free, the freed RAM taken back as slots; stopped by %lld us of memory stall between two looks (the system or the "
-                    "desktop session), then a pause of %.0f s (doubling, at most %.0f s); our own cgroup protected (memory.min during each "
-                    "step); where: %s (the first holds our cgroup)\n", __func__, el_tr_step0/1048576.0, el_tr_max/1048576.0,
-                    (long long) el_tr_psi_us, el_tr_back_s, el_tr_back_max_s, tl.c_str());
-        } else {
-            fprintf(stderr, "%s: elastic RAM: the trim OFF - %s; other programs' file cache is left to the OS (it can take the "
-                    "engine's RAM for as long as it stays)\n", __func__, !el_tr_opt ? "trim=0" : el_test_fake_squeeze ? "the fake squeeze (TEST ONLY)" :
-                    el_tr_why.c_str());
-        }
+                "discard=0: a give-back switches slots off");
     }
     if (sh_on) {
         fprintf(stderr, "%s: moving slot shares on - every %d decode words, %.1f %% of the giving layer per move, "
@@ -22775,7 +22530,7 @@ int64_t llama_moe_stream::dz_band(int64_t budget, int64_t * taken_out, bool reco
     if (!el_dz_on || il_of_moe.empty()) {
         return 0;
     }
-    const bool dz_test_force = el_test_unlock_every || el_test_discard || el_test_self_discard || el_test_fake_squeeze > 0;
+    const bool dz_test_force = el_test_unlock_every || el_test_discard || el_test_fake_squeeze > 0;
     if (!dz_test_force && !reconcile_win) {
         std::lock_guard<std::mutex> lock(mtx);
         if (el_in_call) {   // never contend with remap / I/O threads on mtx during an active call unless RAM is near keep-free
@@ -22786,15 +22541,12 @@ int64_t llama_moe_stream::dz_band(int64_t budget, int64_t * taken_out, bool reco
     int64_t done = 0, taken = 0;
     const int64_t t0 = ggml_time_us();
     int64_t probed = 0;
-    // Full band age (1024 words) whenever free RAM sits comfortably at or above startup headroom (keep + 64 MiB),
-    // scaling down to 0 only as free RAM is squeezed into keep-free (or under test flags).
+    // The full band age while the other programs hold no more than the pools' size is matched to; fewer words as their growth nears
+    // the follow step (what a give-back is about to give, the system may already take by itself), none at it
     int64_t age_uses = el_test_unlock_every ? 0 : el_band_age*(int64_t) n_expert_used;
-    const int64_t x_last = el_last_room_bytes.load(std::memory_order_relaxed);   // free RAM at the last look (-1: none yet)
-    const int64_t band_full_above = dz_test_force ? el_growmin
-                                                  : (p1.ram_margin + std::min<int64_t>(el_gap / 2, (int64_t) 128 << 20));
-    if (age_uses > 0 && x_last >= 0 && band_full_above > p1.ram_margin && x_last < band_full_above) {
-        const double f = std::min(1.0, std::max(0.0, (double) (x_last - p1.ram_margin)/(double) (band_full_above - p1.ram_margin)));
-        age_uses = (int64_t) (age_uses*f);
+    const int64_t grown = el_others_grown.load(std::memory_order_relaxed);
+    if (age_uses > 0 && grown > 0) {
+        age_uses = (int64_t) (age_uses*std::max(0.0, 1.0 - (double) grown/(double) el_follow));
     }
     dz_age_used = age_uses;
     const bool has_dz_any = el_dz_now.load(std::memory_order_relaxed) > 0;
@@ -22844,6 +22596,7 @@ int64_t llama_moe_stream::dz_band(int64_t budget, int64_t * taken_out, bool reco
         // Windows OfferVirtualMemory eagerly unmaps PTEs from WorkingSet to Standby immediately, causing ~175 us/slot
         // ReclaimVirtualMemory + soft-fault stalls on later prompts. Keep warm PTEs mapped while free RAM sits safely
         // above keep-free + 64 MiB, ramping Standby offers in only when free RAM nears keep-free or a pressure event fires.
+        const int64_t x_last = el_last_room_bytes.load(std::memory_order_relaxed);   // free RAM at the last look (-1: none yet)
         if (!dz_test_force && !reconcile_win && (x_last < 0 || x_last >= p1.ram_margin + ((int64_t) 64 << 20))) {
             want = 0;
         }
@@ -23045,8 +22798,11 @@ void llama_moe_stream::el_recount() {
     for (const int32_t il : il_of_moe) {
         const auto & sl = *layers[il];
         uint32_t lo = 0;
-        for (uint32_t s = 0; s < (el_wide ? sl.n_slots : std::min<uint32_t>(sl.n_slots, n_slots)); s++) {
+        for (uint32_t s = 0; s < (el_wide || el_untidy ? sl.n_slots : std::min<uint32_t>(sl.n_slots, n_slots)); s++) {
             lo += sl.slot_off[s] ? 0 : 1;
+        }
+        if (el_untidy && !el_wide) {   // (out of order after a window pass: place says nothing, the layer has that many slots)
+            lo = std::min(lo, n_slots);
         }
         if (el_wide) {
             lo = (uint32_t) std::max<int64_t>(2*(int64_t) n_expert_used + 4, (int64_t) lo);
@@ -23113,12 +22869,14 @@ int64_t llama_moe_stream::el_give(int64_t bytes, bool boundary, llama_moe_stream
     if (bytes <= 0 || il_of_moe.empty() || win_active) {
         return 0;
     }
-    if (!boundary && el_hold_gives) {
+    if (!boundary && (el_hold_gives || el_untidy)) {
         // a prompt call with GPU-wave copies runs (tail waves, copy-ahead - they copy from the slots, sized for the call's waves): no slot
-        // is switched off until it ends, where what is pending is given (a prompt call lasts seconds; the band frees RAM meanwhile)
+        // is switched off until it ends, where what is pending is given (a prompt call lasts seconds; the band frees RAM meanwhile).
+        // The same while the layers are out of order after a window pass: they are put back in order at the call's end, then given
         el_n_held_gives += 1;
         return 0;
     }
+    el_tidy();
 
     const size_t blk = layers[il_of_moe[0]]->block_bytes;
     int64_t n = (bytes + (int64_t) blk - 1)/(int64_t) blk;
@@ -23150,9 +22908,7 @@ int64_t llama_moe_stream::el_give(int64_t bytes, bool boundary, llama_moe_stream
             el_given_slots += got;
             el_n_give      += 1;
             el_last_give_us = ggml_time_us();
-            if (got*(int64_t) blk >= el_settle_fall) {   // the settle wait restarts on RAM really given, settlefall or more
-                el_last_big_give_us = el_last_give_us;
-            }
+            el_ref_others  += el_ref_others != INT64_MIN ? got*(int64_t) blk : 0;   // the size now matches that much more held by the others
             el_events_unanswered = 0;
             if (el_check) {
                 el_check_shares("give back in a prompt");
@@ -23316,8 +23072,7 @@ int64_t llama_moe_stream::el_give(int64_t bytes, bool boundary, llama_moe_stream
                            // what cannot be freed at once stays pending for the call's end (q14: it was dropped, nothing waited)
     }
     if (got > 0 && el_taking) {
-        // A give-back ends a take-back in progress - the next one needs take-again free again (the server chat: a step took to
-        // keep-free, a few MiB of the server's own growth gave back to the band's middle, the next reply word's step took it again)
+        // A give-back ends a take-back in progress - the next one starts when the other programs have released the follow step again
         el_taking = false;
         fprintf(stderr, "llama_moe_stream: elastic RAM: a give-back ends the take-back (after %lld steps)\n", (long long) el_take_steps);
     }
@@ -23342,9 +23097,7 @@ int64_t llama_moe_stream::el_give(int64_t bytes, bool boundary, llama_moe_stream
         el_given_slots     += got;
         el_n_give          += 1;
         el_last_give_us     = ggml_time_us();
-        if (got*(int64_t) layers[il_of_moe[0]]->block_bytes >= el_settle_fall) {   // RAM really given, settlefall or more
-            el_last_big_give_us = el_last_give_us;
-        }
+        el_ref_others      += el_ref_others != INT64_MIN ? got*(int64_t) blk : 0;   // the size now matches that much more held by the others
         el_last_change_word = n_tok_outer;
         el_events_unanswered = 0;
         if (el_check) {
@@ -23364,7 +23117,7 @@ void llama_moe_stream::el_take(int mode, const el_mem & m) {
         return;   // (m.room < 0: not read - a step was filling; !el_ctx_ready: preserve load-time context reserve until context allocates)
     }
     const int64_t now_us = ggml_time_us();
-    const int64_t last_ev = std::max(el_last_big_give_us, el_last_obj_us);
+    const int64_t last_ev = std::max(el_last_give_us, el_last_obj_us);
     if (el_req.load() > 0 || (last_ev > 0 && (now_us - last_ev)/1e6 < el_cool_s)) {
         el_n_settle_wait += mode == 3 ? 1 : 0;
         return;
@@ -23396,10 +23149,17 @@ void llama_moe_stream::el_take(int mode, const el_mem & m) {
         el_take_t0_us   = now_us;
     }
     const int64_t xc   = el_test_fake_squeeze > 0 ? 0 : el_x_committed();
-    const int64_t floor_b = p1.ram_margin + el_gap;
-    const int64_t room = free_now - xc - floor_b + (el_test_keep_skip ? (el_gap + 2*el_step) : 0);
+    // What a take-back may take: what the other programs released since the pools' size last matched them - a release of the follow
+    // step or more starts one, and once started it goes on until all of it is taken - and never more than leaves keep-free free
+    // (TEST ONLY KEEP_SKIP: two steps past keep-free, whatever was released)
+    const int64_t room  = free_now - xc - p1.ram_margin + (el_test_keep_skip ? 2*el_step : 0);
+    const int64_t freed = el_test_keep_skip ? room : el_ref_others != INT64_MIN && el_others_seen != INT64_MIN ? el_ref_others - el_others_seen : 0;
     const int64_t avail_now = m.avail;
-    if ((!el_taking && free_now - xc < el_growmin) || room < (int64_t) blk) {
+    if ((!el_taking && freed < el_follow) || freed < (int64_t) blk || room < (int64_t) blk) {
+        if (freed >= el_follow && room < (int64_t) blk) {
+            // released, but the free room is not there (it was held in swap, or the engine's own memory grew): nothing to follow
+            el_ref_others = el_others_seen;
+        }
         if (el_taking) {
             el_taking = false;
             fprintf(stderr, "llama_moe_stream: elastic RAM take-back done after %lld steps, %.1f s (word %lld); shares min %u, total %u\n",
@@ -23407,8 +23167,9 @@ void llama_moe_stream::el_take(int mode, const el_mem & m) {
         }
         return;
     }
-    const int64_t step_cap = std::max<int64_t>((int64_t) blk, el_refill_step);
-    int64_t n = (el_test_keep_skip ? room : std::min<int64_t>(room, step_cap))/(int64_t) blk;
+    el_tidy();
+    const int64_t step_cap = el_test_keep_skip ? room : std::max<int64_t>((int64_t) blk, el_refill_step);
+    int64_t n = std::min<int64_t>(std::min(room, freed), step_cap)/(int64_t) blk;
     std::vector<int32_t> order(il_of_moe.begin(), il_of_moe.end());
     if (sh_on) {
         std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return layers[a]->gh_score > layers[b]->gh_score; });
@@ -23434,13 +23195,13 @@ void llama_moe_stream::el_take(int mode, const el_mem & m) {
     for (const auto & a : add) {
         got += a.second > 0 ? el_grow_layer(*layers[a.first], a.second, /* boundary = */ true) : 0;
     }
-    if (got == 0) {
-        if (el_taking) {
-            el_taking = false;
-        }
+    if (got == 0) {   // every layer at its ceiling: nothing to follow
+        el_taking     = false;
+        el_ref_others = el_test_keep_skip ? el_ref_others : el_others_seen;
         return;
     }
     el_recount();
+    el_ref_others      -= el_ref_others != INT64_MIN && !el_test_keep_skip ? got*(int64_t) blk : 0;   // the size matches that much less held by the others
     el_taken_slots     += got;
     el_n_take          += 1;
     el_last_change_word = n_tok_outer;
@@ -23448,7 +23209,7 @@ void llama_moe_stream::el_take(int mode, const el_mem & m) {
     for (const int32_t il : il_of_moe) {
         more_ceil = more_ceil || (int32_t) layers[il]->share < el_ceil(*layers[il]);
     }
-    el_taking           = more_ceil && (room - got*(int64_t) blk >= (int64_t) blk);
+    el_taking           = more_ceil && room - got*(int64_t) blk >= (int64_t) blk && freed - got*(int64_t) blk >= (int64_t) blk;
     el_take_steps      += 1;
     el_take_step_us     = ggml_time_us();
     el_last_take_step_us = el_take_step_us;
@@ -23617,11 +23378,7 @@ void llama_moe_stream::el_note_ctx_host(int64_t kv_host, int64_t compute_host) {
     }
     std::lock_guard<std::mutex> lock(mtx);
     const int64_t xc = el_x_committed();
-    // Preserve a safe cushion above keep-free after host KV + compute buffers fault in so minor allocator/stack pages never trip a gap give-back
-    const int64_t cushion     = p1.ram_margin_set ? std::min<int64_t>(el_gap / 4, (int64_t) 128 << 20)
-                                                  : std::min<int64_t>(el_gap / 2, (int64_t) 256 << 20);
-    const int64_t target_free = p1.ram_margin + cushion;
-    const int64_t short_b     = target_free - (room - xc);
+    const int64_t short_b = p1.ram_margin - (room - xc);   // what keep-free lacks once the host KV + compute buffers are in
     if (short_b <= 0) {
         return;
     }
@@ -23685,11 +23442,11 @@ void llama_moe_stream::el_self_call_start(int64_t need, const el_mem & m) {
         return;
     }
     const int64_t xc    = el_x_committed();
-    const int64_t guard = std::min<int64_t>(el_gap / 4, (int64_t) 128 << 20);
-    const int64_t spare = (m.room - xc) - (p1.ram_margin + guard);
+    const int64_t spare = (m.room - xc) - p1.ram_margin;
     if (need_padded <= spare) {
-        return;   // fits inside current spare RAM above keep-free + guard without touching expert slots
+        return;   // fits inside the spare RAM above keep-free without touching expert slots
     }
+    el_tidy();
     const int64_t short_b = need_padded - std::max<int64_t>(0, spare);
     const size_t blk = layers[il_of_moe[0]]->block_bytes;
     const int64_t want_slots = (short_b + (int64_t) blk - 1) / (int64_t) blk;
@@ -24082,12 +23839,6 @@ void llama_moe_stream::el_at_call_end(bool complete, const el_mem & end_mem) {
     if (el_min_dirty) {
         el_finish_prompt_gives();
     }
-    if (el_on && el_test_fake_swap > 0 && complete && decode_phase && n_tok_outer > 0 && n_tok_outer % el_test_fake_swap == 0) {
-        // TEST ONLY: a pretend swap-out at the free RAM now (no stray bound: its level is the real free RAM, so a take-back after it
-        // has nothing to take and the LEVEL_SKIP failure test's take-back goes under the level)
-        const int64_t g = el_swap_look(64, p1.ram_margin - 1);   // as if free RAM were just under keep-free
-        el_ask_r(g, 0, g);   // (through the rule's checks - a swap-out is no reason)
-    }
     if (el_dz_on && el_test_unlock_every) {   // TEST ONLY: every droppable filled slot discardable at every call's end
         for (const int32_t il : il_of_moe) {
             auto & sl = *layers[il];
@@ -24104,7 +23855,7 @@ void llama_moe_stream::el_at_call_end(bool complete, const el_mem & end_mem) {
     }
     if (el_on) {
         if (el_req.load() > 0) {
-            el_serve_pending();
+            el_serve_pending();   // what was asked while the call ran and could not be given then (a GPU-wave prompt, a window pass)
         }
         // Restore any slots lent for the engine's own ephemeral prompt working memory (~lm_reset_t already freed lm_hbuf)
         el_self_release(end_mem);
@@ -24149,6 +23900,7 @@ void llama_moe_stream::el_at_call_end(bool complete, const el_mem & end_mem) {
 // below n_slots only, and an expert of a wave that sits higher is dropped and read again low (remap). No expert ever moves; the
 // GPU copy never grows. mtx held (lock), at the call's start: the reads in flight into those slices land first.
 void llama_moe_stream::el_low_start(std::unique_lock<std::mutex> & lock) {
+    el_tidy();   // (the view copies the low slots)
     const uint32_t k = n_expert_used;
     const int64_t t0 = ggml_time_us();
     const int64_t z0 = el_n_zero_done, sk0 = el_n_zero_skip;
@@ -24358,6 +24110,7 @@ void llama_moe_stream::sh_tick() {
         return;
     }
     sh_next_word = n_tok_outer + sh_every;
+    el_tidy();   // (a share move counts slots by their place)
     const double f = std::exp2(-(double) sh_every/sh_half);
     for (const int32_t il : il_of_moe) {
         auto & sl = *layers[il];
@@ -24507,37 +24260,18 @@ void llama_moe_stream::el_check_wave_need(const char * where) const {
     }
 }
 
-// mtx held: a look found `pages` new swapped-out pages (x = the free room minus our switched-on empty slots). The rule:
-// a swap-out of idle memory is not an app needing RAM - logged, never answered (the obey mode, which answered them, is
-// removed - no stutter is the default's job). Returns the bytes to give back: 0 (TEST ONLY GIVE_NOREASON: a step - the check's failure test)
-int64_t llama_moe_stream::el_swap_look(int64_t pages, int64_t x) {
-    el_n_swap_idle += 1;
-    fprintf(stderr, "llama_moe_stream: elastic RAM swap-out of %lld pages at %.3f s with %.0f MiB free (our empty slots counted as used): "
-            "that much handed back, the discardable band first%s\n", (long long) pages,
-            ggml_time_us()/1e6, x/1048576.0, el_test_give_noreason ? "; TEST: GIVE_NOREASON asks a step anyway" : "");
-    return el_test_give_noreason ? el_step : 0;   // (TEST ONLY: the failure test asks with no reason - the check must stop the run)
-}
-
-// mtx held: an ask with its reason - the checks: no give-back unless free RAM is under keep-free (or foreseen
-// there) or a memory-pressure event came; and never more than that need asked (+ one slot)
+// mtx held: an ask with its reason (1: the other programs took RAM, 3: a memory-pressure event). The check: never more asked than that
+// need (+ one slot)
 void llama_moe_stream::el_ask_r(int64_t bytes, int reason, int64_t allowed) {
     if (bytes <= 0) {
         return;
     }
-    if (el_check && reason == 0) {
-        moe_stream_fail("elastic check (the rule): a give-back of %.0f MiB with no need - free RAM was not under keep-free and no "
-                "memory-pressure event came", bytes/1048576.0);
-    }
     const int64_t blk = il_of_moe.empty() ? 0 : (int64_t) layers[il_of_moe[0]]->block_bytes;
-    if (el_check && reason >= 1 && reason <= 3 && bytes > allowed + blk) {
+    if (el_check && bytes > allowed + blk) {
         moe_stream_fail("elastic check (the rule): a give-back of %.0f MiB, more than its need asked (%.0f MiB, %s)", bytes/1048576.0,
-                allowed/1048576.0, reason == 1 ? "under keep-free" : reason == 2 ? "foreseen under keep-free" : "a memory-pressure event");
+                allowed/1048576.0, reason == 1 ? "what the other programs took" : "a memory-pressure event");
     }
-    {
-        (reason == 1 ? el_n_need_a : reason == 2 ? el_n_need_pred : el_n_need_psi) += reason >= 1 && reason <= 3 ? 1 : 0;
-        // (an ask no longer restarts the settle wait - RAM really given of settlefall or more does, el_give: elastic RAM's own
-        // few-MiB corrections after a take-back, and the asks at the engine's floor that nothing can meet, restarted it every look)
-    }
+    (reason == 1 ? el_n_need_a : el_n_need_psi) += 1;
     el_ask(bytes);
 }
 
@@ -24633,354 +24367,35 @@ void llama_moe_stream::el_pend_note() {
     }
 }
 
-#if EL_OS_LINUX
-// The trim's decision at a look (mtx held; the OS layer read before the lock): the bytes of other programs' old file cache to
-// drop now (0: none). A memory stall since the last look (system or desktop session over trimpsi) stops it at once: a pause of trimback
-// s, doubling while stalls follow our own trims; the step back to trimstep. Otherwise, with no give-back under way and things settled
-// (the settle rule), it trims what free RAM lacks under keep-free, plus - while the engine is under its ceiling (and our cgroup's
-// limit) and the take-back not waiting for its last step to fill - one step for the take-back minus what is free above keep-free
-// already; the step doubling while nobody waits, at most trimmax
-int64_t llama_moe_stream::el_tr_decide(int64_t now, int64_t x, int64_t memfree, int64_t cgroom, int64_t committed, bool give,
-        int64_t sys_us, int64_t ses_us) {
-    if (!el_tr_ok || il_of_moe.empty()) {
-        return 0;
-    }
-    const int64_t ds = sys_us >= 0 && el_tr_sys_last >= 0 ? sys_us - el_tr_sys_last : 0;
-    const int64_t dn = ses_us >= 0 && el_tr_ses_last >= 0 ? ses_us - el_tr_ses_last : 0;
-    el_tr_sys_last = sys_us;
-    el_tr_ses_last = ses_us;
-    const bool after = el_tr_after;
-    el_tr_after = false;
-    const bool stalled = ds > el_tr_psi_us || dn > el_tr_psi_us;
-    if (stalled) {   // a stall stops the GROWTH trim; restoring keep-free goes on (below)
-        el_tr_back_now = after && el_tr_back_now > 0.0 ? std::min(2.0*el_tr_back_now, el_tr_back_max_s) : el_tr_back_s;
-        el_tr_next_us  = now + (int64_t) (el_tr_back_now*1e6);
-        if (el_tr_step > 0) {
-            el_tr_n_stop += 1;
-            fprintf(stderr, "llama_moe_stream: elastic RAM trim stopped at %.3f s: memory stall %lld us (system), %lld us (desktop session) since the "
-                    "last look%s - growth paused %.0f s\n", now/1e6, (long long) ds, (long long) dn, after ? " (it trimmed at that look)" : "",
-                    el_tr_back_now);
-        }
-        el_tr_step = 0;
-    }
-    auto why = [&](int r) {   // TEST ONLY (LOOK_LOG): the decision's reason, when it changes
-        if (el_test_look_log && r != el_tr_last_why) {
-            static const char * names[] = { "trims", "a pause after a stop", "a give-back under way", "the settle rule", "nothing to take",
-                                            "the take-back waits for its last step to fill" };
-            fprintf(stderr, "llama_moe_stream: elastic RAM trim decision at %.3f s: %s\n", now/1e6, names[r]);
-        }
-        el_tr_last_why = r;
-    };
-    if (memfree < 0) {
-        return 0;
-    }
-    const bool paused = stalled || now < el_tr_next_us;
-    const bool giving = give || el_req.load() > 0;   // a give-back under way: only what keep-free lacks (at the engine's floor the
-                                                     // give-back cannot meet it - the trim can)
-    // the settle rule: an app may still be opening - its files are being read, not old (a give-back of settlefall or more, a fall of free
-    // RAM, a PSI need). It holds the growth part only: what keep-free lacks is trimmed at once (in smoke runs, at the floor,
-    // free RAM stayed under keep-free for minutes)
-    const int64_t last_ev = std::max(el_last_big_give_us, el_last_obj_us);
-    const bool settling = (last_ev > 0 && (now - last_ev)/1e6 < el_cool_s) || now < el_quiet_until_us.load();   // (the fill at start too)
-    const int64_t blk = (int64_t) layers[il_of_moe[0]]->block_bytes;
-    int64_t growth = 0;   // what the engine could still take: each layer up to the take-back's own ceiling (el_ceil - with slot shares a share
-    for (const int32_t il : il_of_moe) {   // of the current total; counting the pool's top instead could disagree)
-        growth += std::max<int64_t>(0, (int64_t) el_ceil(*layers[il]) - (int64_t) layers[il]->share)*blk;
-    }
-    const int64_t keep = el_target_rule();
-    const int64_t lim  = cgroom >= 0 && cgroom != INT64_MAX ? std::max<int64_t>(0, cgroom - committed - keep) : growth;
-    const int64_t want = std::min(growth, lim);
-    // never ahead of the take-back (the smoke run: 15 GB trimmed while the take-back waited for its last step's empty slots, which fill
-    // only in a reply - MemFree sat at 18 GB): beyond what keep-free lacks, one step only, and only while free RAM is at keep-free and
-    // the take-back can take it now
-    // (no take-back during a call - it runs at a reply's end and while idle - so no growth trim during one either)
-    const bool take_waits = (el_taking && committed > el_step/2) || el_growmin > el_tr_max || el_in_call;   // (take-again above a step: held still)
-    const int64_t step = el_tr_step > 0 ? std::min(2*el_tr_step, el_tr_max) : el_tr_step0;
-    const int64_t grow = paused || take_waits || giving || settling ? 0 :
-            std::max<int64_t>(0, std::min(want, step) - std::max<int64_t>(0, x - keep));   // minus what is free above keep-free already
-    const int64_t kp   = std::max<int64_t>(0, keep - x);   // restoring keep-free: never paused
-    const int64_t need = kp + grow;
-    el_tr_kp = kp;   // (el_loop: this part through the keep-free trim - the programs beside us, no protection window)
-    if (need < blk) {
-        why(paused ? 1 : giving ? 2 : settling ? 3 : take_waits ? 5 : 4);
-        return 0;
-    }
-    why(0);
-    if (grow > 0) {   // only the growth part steps up and counts as "trimmed at that look" (a stall after it doubles the pause)
-        el_tr_step  = step;
-        el_tr_after = true;
-    }
-    const int64_t pg = (int64_t) sysconf(_SC_PAGESIZE);
-    return (need + pg - 1)/pg*pg;   // (grow <= one step; what keep-free lacks in full)
-}
-
-// one trim (elastic RAM's thread, no lock): the target with the most file cache (ours taken off the first), the kernel's own reclaim there
-int64_t llama_moe_stream::el_tr_run(int64_t bytes, bool * none_left, bool keep_mode) {
-    if (none_left) {
-        *none_left = false;
-    }
-    // the candidates: the programs' own cgroups beside us and the other targets of os_trim_setup - never ours, no protection window (the
-    // real squeeze test: our cgroup's memory.min held during back-to-back protected steps kept the kernel off our band, other apps swapped
-    // 216 MiB). The GROWTH trim also reaches our parent - with our cgroup protected by memory.min for the step,
-    // a window in which the system cannot take our band - but only when the programs' own cgroups hold less old cache than it asks: what
-    // is left then belongs to programs that have exited ("dying" cgroups, reachable only through the parent); there in steps of at most
-    // 256 MiB (~20 ms of window), and only at calm times (the decision's settle rule)
-    const std::string cg = el_cgroup_dir();
-    std::vector<std::string> kids = os_trim_children(el_tr_targets[0], cg);
-    std::vector<std::string> cand;
-    for (const auto & c : kids) {   // never a cgroup the system protects (its own memory.min / memory.low above 0)
-        if (!os_trim_protected(c)) {
-            cand.push_back(c);
-        }
-    }
-    kids = cand;
-    for (size_t k2 = 1; k2 < el_tr_targets.size(); k2++) {
-        if (!os_trim_protected(el_tr_targets[k2])) {
-            cand.push_back(el_tr_targets[k2]);
-        }
-    }
-    int64_t parent_own = -1;   // the parent's file cache not in a live child: the exited programs' (and ours, taken off)
-    if (!keep_mode) {
-        int64_t avail_f = 0, kids_f = 0;
-        for (size_t k2 = 0; k2 < cand.size(); k2++) {
-            const int64_t f = std::max<int64_t>(0, os_trim_file_bytes(cand[k2]));
-            avail_f += f;
-            kids_f  += k2 < kids.size() ? f : 0;
-        }
-        if (avail_f < bytes && !os_trim_protected(el_tr_targets[0])) {
-            const int64_t pf = os_trim_file_bytes(el_tr_targets[0]), own = os_trim_file_bytes(cg);
-            if (pf >= 0) {
-                parent_own = pf - kids_f - std::max<int64_t>(0, own);
-                cand.insert(cand.begin(), el_tr_targets[0]);
-                bytes = std::min<int64_t>(bytes, (int64_t) 256 << 20);
-            }
-        }
-    }
-    const bool use_parent = parent_own >= 0;
-    size_t best = 0;
-    int64_t best_f = -1;
-    for (size_t i = 0; i < cand.size(); i++) {
-        const int64_t f = use_parent && i == 0 ? parent_own : os_trim_file_bytes(cand[i]);
-        if (f > best_f) {
-            best_f = f;
-            best   = i;
-        }
-    }
-    const int64_t now = ggml_time_us();
-    if (cand.empty() || best_f < (int64_t) sysconf(_SC_PAGESIZE)*16) {   // nothing left to drop: a pause, as after a stop (no step growth)
-        el_tr_next_us = now + (int64_t) (el_tr_back_s*1e6);
-        el_tr_step = 0;
-        if (none_left) {
-            *none_left = true;
-        }
-        return 0;
-    }
-    const bool guard = use_parent && best == 0;
-    const int64_t ask = std::min(bytes, best_f);
-    const int64_t mf0 = el_os_memfree();
-    const int64_t f0  = os_trim_file_bytes(cand[best]);
-    double cpu = 0.0;
-    const int rc = os_trim_step(cand[best], guard ? el_tr_guard : std::string(), ask, &cpu);
-    const double wall = (ggml_time_us() - now)/1e3;
-    const int64_t mf1 = el_os_memfree();
-    const int64_t f1  = os_trim_file_bytes(cand[best]);
-    // what the cache lost: a write that returned success reclaimed all it asked (the kernel's own answer); after EAGAIN, the target's
-    // cache before - after (a program reading while we trim adds pages to its own cache during the step, so before - after
-    // alone undercounted a full step - the file-cache test's reader: asked 76 MiB, "dropped" 20, and the engine gave back the rest)
-    const int64_t dropped = rc == 0 ? ask : f0 >= 0 && f1 >= 0 ? std::max<int64_t>(0, f0 - f1) : std::max<int64_t>(0, mf1 - mf0);
-    el_tr_n += 1;
-    el_tr_bytes += ask;
-    el_tr_got += dropped;
-    el_tr_cpu_ms += cpu;
-    el_tr_wall_ms += wall;
-    el_tr_wall_max = std::max(el_tr_wall_max, wall);
-    if (el_test_look_log) {   // TEST ONLY: one line per trim (trims over time)
-        const std::string & t = cand[best];
-        fprintf(stderr, "llama_moe_stream: elastic RAM trim at %.3f s (%s): %.0f MiB asked from %s (its file cache %.0f MiB%s): %s, the cache -%.0f MiB, "
-                "MemFree %+.0f MiB, %.1f ms (CPU %.1f ms)\n", now/1e6, keep_mode ? "keep-free" : "growth", ask/1048576.0,
-                t.substr(t.find_last_of('/') + 1).c_str(), best_f/1048576.0, guard ? ", ours protected" : "",
-                rc == 0 ? "done" : rc == EAGAIN ? "less was there (EAGAIN)" : strerror(rc), dropped/1048576.0, (mf1 - mf0)/1048576.0, wall, cpu);
-    }
-    if (rc == EAGAIN || dropped < ask/2) {   // less than half of the ask was there: nothing more to take now
-        el_tr_n_again += rc == EAGAIN ? 1 : 0;
-        el_tr_next_us = now + (int64_t) (el_tr_back_s*1e6);
-        el_tr_step = 0;
-        if (none_left) {
-            *none_left = true;
-        }
-    }
-    if (rc != 0 && rc != EAGAIN) {
-        if (none_left) {
-            *none_left = true;
-        }
-        if (guard && rc == EIO) {   // only our own protection failing is fatal - the trim off for good
-            el_tr_ok = false;
-            fprintf(stderr, "llama_moe_stream: elastic RAM: the trim OFF from now on: our cgroup's memory.min could not be set or restored (%s)\n",
-                    cand[best].c_str());
-        } else {   // a target that went away (ENOENT / ENODEV), a busy or interrupted write (EBUSY / EINTR), ...: skip it this time
-            el_tr_n_skip += 1;
-            if (el_test_look_log) {
-                fprintf(stderr, "llama_moe_stream: elastic RAM trim target skipped: %s on %s\n", strerror(rc), cand[best].c_str());
-            }
-        }
-    }
-    return dropped;
-}
-
-// Free RAM under keep-free - other programs' OLD file cache is trimmed FIRST (the programs' own cgroups beside
-// us, never our own, with no protection window), in steps of at most trimmax until `bytes` are dropped or none is left; the engine gives
-// back its own slots only for what is still missing (the caller re-reads the memory). Never paused by a memory stall (it relieves it),
-// but "old" is checked: when the file pages dropped by the last keep-free trims come back as the working set (the system's activated
-// refaults >= half of what was dropped, within 10 s) the cache was in use - no keep-free trim for trimback s, the slots go back. Returns
-// what the cache lost
-int64_t llama_moe_stream::el_tr_keep(int64_t bytes, bool parent_ok) {
-    const int64_t now = ggml_time_us();
-    const int64_t pg  = (int64_t) sysconf(_SC_PAGESIZE);
-    const int64_t act = os_refault_inuse_pages();
-    // (11b: only a trim of settlefall or more is judged - after a tiny one the system's background refaults tripped it, check 4)
-    if (act >= 0 && el_tr_act_last >= 0 && el_tr_keep_last_got >= el_settle_fall && now - el_tr_keep_last_us < 10000000 &&
-            (act - el_tr_act_last)*pg >= el_tr_keep_last_got/2) {
-        el_tr_keep_hold_us = now + (int64_t) (el_tr_back_s*1e6);
-        el_tr_n_inuse += 1;
-        fprintf(stderr, "llama_moe_stream: elastic RAM keep-free trim held at %.3f s: %.0f MiB of the file cache it dropped came back as the working set "
-                "(of %.0f MiB) - in use, not old: the engine gives back for %.0f s\n", now/1e6, (act - el_tr_act_last)*pg/1048576.0,
-                el_tr_keep_last_got/1048576.0, el_tr_back_s);
-        el_tr_keep_last_got = 0;
-    }
-    if (now < el_tr_keep_hold_us) {
-        el_tr_act_last = act;
-        return 0;
-    }
-    int64_t got = 0;
-    for (int i = 0; i < 64 && got < bytes && el_tr_ok; i++) {
-        bool none = false;
-        const int64_t g = el_tr_run(std::min(bytes - got, std::max(el_tr_max, el_tr_step0)), &none, /* keep_mode = */ !parent_ok);
-        got += std::max<int64_t>(0, g);
-        if (none || g <= 0) {
-            break;
-        }
-    }
-    el_tr_n_keep += 1;
-    el_tr_keep_bytes += got;
-    el_tr_act_last = os_refault_inuse_pages();
-    el_tr_keep_last_got = got;
-    el_tr_keep_last_us = ggml_time_us();
-    return got;
-}
-#else
-int64_t llama_moe_stream::el_tr_decide(int64_t, int64_t, int64_t, int64_t, int64_t, bool, int64_t, int64_t) { return 0; }
-int64_t llama_moe_stream::el_tr_run(int64_t bytes, bool * none_left, bool keep_mode) { GGML_UNUSED(bytes); GGML_UNUSED(keep_mode); if (none_left) { *none_left = true; } return 0; }
-int64_t llama_moe_stream::el_tr_keep(int64_t bytes, bool parent_ok) { GGML_UNUSED(bytes); GGML_UNUSED(parent_ok); return 0; }
-#endif
-
 #if EL_OS_ACTIVE
-// Zero-disk-write band release: drops cold band slots under mtx and releases their physical RAM immediately
-// (MADV_DONTNEED / DiscardVirtualMemory / MAP_FIXED - never MADV_PAGEOUT, which can write dirty pages to swap)
-void llama_moe_stream::el_self_discard(int64_t bytes) {
-    const int64_t t0 = ggml_time_us();
-    struct c_t { float v; int32_t il; int32_t s; };
-    std::vector<c_t> cand;
-    for (const int32_t il : il_of_moe) {
-        std::lock_guard<std::mutex> lock(mtx);
-        const auto & sl = *layers[il];
-        for (int32_t s = 0; s < (int32_t) sl.n_slots; s++) {
-            if (!sl.dz.empty() && sl.dz[s] && !sl.slot_off[s] && sl.slot_state[s] == MOE_STREAM_SLOT_READY && el_droppable(sl, s)) {
-                cand.push_back({ policy == MOE_STREAM_POLICY_DECAY ? p1_value(sl, s) : (float) sl.slot_last_use[s], il, s });
-            }
-        }
-    }
-    std::sort(cand.begin(), cand.end(), [](const c_t & a, const c_t & b) { return a.v != b.v ? a.v < b.v : a.il != b.il ? a.il < b.il : a.s < b.s; });
-    const int64_t blk = il_of_moe.empty() ? 1 : (int64_t) layers[il_of_moe[0]]->block_bytes;
-    const int64_t n = std::min<int64_t>((int64_t) cand.size(), (bytes + blk - 1)/blk);
-    int64_t done = 0;
-    for (int64_t i0 = 0; i0 < n; i0 += 8) {
-        std::lock_guard<std::mutex> lock(mtx);
-        for (int64_t i = i0; i < std::min<int64_t>(n, i0 + 8); i++) {
-            auto & sl = *layers[cand[i].il];
-            const int32_t s = cand[i].s;
-            if (!sl.dz.empty() && sl.dz[s] && !sl.slot_off[s] && sl.slot_state[s] == MOE_STREAM_SLOT_READY && el_droppable(sl, s)) {
-                dz_forget(sl, s);
-                drop_slot(sl, s, -1, /* taker_guess = */ false);
-                el_release_slot(sl, s);
-                done += 1;
-            }
-        }
-    }
-    el_sd_n += 1;
-    el_sd_slots += done;
-    const double ms = (ggml_time_us() - t0)/1e3;
-    el_sd_ms += ms;
-    fprintf(stderr, "llama_moe_stream: elastic RAM: the system swaps other apps out (%.0f MiB since the last look) with free RAM near keep-free: our "
-            "band released by elastic RAM (zero disk writes) - %lld coldest slots (%.0f MiB) of %zu in %.1f ms\n", bytes/1048576.0, (long long) done,
-            done*blk/1048576.0, cand.size(), ms);
-}
-
+// Elastic RAM's thread, no lock held: `bytes` go back to the system. The order: our switched-on empty slots first (they hold no RAM
+// yet - only their promise goes), then what is still missing is asked of the filled slots, the coldest first (el_ask_r: given at once,
+// or at the end of the call that runs)
 void llama_moe_stream::el_short(int64_t bytes, int reason, int64_t allowed) {
     const int64_t t0 = ggml_time_us();
-    int64_t allow_left = allowed >= 0 ? allowed : bytes;
-    int64_t pre = 0;
-    bool calm = false;
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        const int64_t last_ev = std::max(el_last_big_give_us, el_last_obj_us);
-        calm = !(last_ev > 0 && (t0 - last_ev)/1e6 < el_cool_s);
+    std::lock_guard<std::mutex> lock(mtx);
+    el_give_empty = true;
+    const int64_t eg = el_give(bytes, /* boundary = */ !el_in_call, nullptr);
+    el_give_empty = false;
+    const int64_t ask = std::max<int64_t>(0, bytes - eg), pend0 = el_req.load();
+    const char * what = ask > 0 ? "still to give" : "covered";
+    if (ask > 0 && el_givable_any()) {
+        el_ask_r(ask, reason, std::max<int64_t>(0, (allowed >= 0 ? allowed : bytes) - eg));
+    } else if (ask > 0) {
+        what = "still to give, nothing of ours left to give";
     }
-    if (reason != 3 && el_tr_ok && calm) {
-        const int64_t real = el_room();
-        const int64_t ours = real >= 0 ? bytes - std::max<int64_t>(0, std::min<int64_t>(bytes, p1.ram_margin - real)) : 0;
-        if (ours > 0) {
-            pre = std::min(ours, el_tr_keep(ours, /* parent_ok = */ true));
-            bytes -= pre;
-            allow_left -= pre;
-            if (bytes <= 0) {
-                fprintf(stderr, "llama_moe_stream: elastic RAM keep-free short by %.0f MiB at %.3f s, only our own empty slots: old file cache trimmed "
-                        "for them - the cache -%.0f MiB; %.1f ms; covered\n", pre/1048576.0, t0/1e6, pre/1048576.0, (ggml_time_us() - t0)/1e3);
-                return;
-            }
-        }
+    if (eg == 0 && ask > 0 && pend0 > 0 && el_req.load() >= pend0 && el_req.load() - pend0 < el_follow) {
+        return;   // (said already: the same need, still waiting for the running call's end)
     }
-    int64_t eg = 0;
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        el_give_empty = true;
-        eg = el_give(bytes, /* boundary = */ !el_in_call, nullptr);
-        el_give_empty = false;
-    }
-    if (eg > 0) {
-        el_tr_n_empty += 1;
-        el_tr_empty_bytes += eg;
-    }
-    const int64_t tgt = el_target_rule();
-    int64_t need2 = std::max<int64_t>(0, bytes - eg);
-    if (reason == 1 && eg > 0) {
-        dz_band(0, nullptr, /* reconcile_win = */ true);
-        const int64_t room1 = el_room();
-        std::lock_guard<std::mutex> lock(mtx);
-        need2 = room1 >= 0 ? std::min<int64_t>(need2, std::max<int64_t>(0, tgt - (room1 - el_x_committed()))) : need2;
-    }
-    const int64_t got = el_tr_ok && need2 > 0 ? el_tr_keep(need2) : 0;
-    int64_t ask = std::max<int64_t>(0, need2 - got);
-    allow_left = std::max<int64_t>(0, allow_left - eg - got);
-    const char * what = ask > 0 ? "still short" : "covered";
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        if (ask > 0 && el_givable_any()) {
-            el_tr_keep_short += 1;
-            el_ask_r(ask, reason, allow_left);
-        } else if (ask > 0) {
-            what = "still short, nothing of ours to give";
-        }
-    }
-    fprintf(stderr, "llama_moe_stream: elastic RAM %s %.0f MiB at %.3f s: our empty slots switched off first %.0f MiB, then other programs' old file "
-            "cache trimmed - the cache -%.0f MiB; %.1f ms; %s%s\n", reason == 3 ? "memory-pressure event," : reason == 1 ?
-            "keep-free short by" : "keep-free (foreseen) short by", bytes/1048576.0, t0/1e6, eg/1048576.0, (pre + got)/1048576.0,
+    fprintf(stderr, "llama_moe_stream: elastic RAM %s %.0f MiB at %.3f s: our empty slots switched off first %.0f MiB; %.1f ms; %s%s\n",
+            reason == 3 ? "memory-pressure event," : "the other programs took", bytes/1048576.0, t0/1e6, eg/1048576.0,
             (ggml_time_us() - t0)/1e3, what, ask > 0 ? format(": give back %.0f MiB", ask/1048576.0).c_str() : "");
 }
 
 void llama_moe_stream::el_start() {
     if (!il_of_moe.empty()) {
         const int64_t blk = (int64_t) layers[il_of_moe[0]]->block_bytes, nl = (int64_t) il_of_moe.size();
-        const int64_t auto_slots = el_tr_ok ? 0 : std::min<int64_t>((int64_t) std::ceil(0.125 * n_expert_total), (int64_t) std::floor(0.35 * n_slots));
+        const int64_t auto_slots = std::min<int64_t>((int64_t) std::ceil(0.125 * n_expert_total), (int64_t) std::floor(0.35 * n_slots));
         const int64_t mn = el_min_opt >= 0 ? el_min_opt : auto_slots * nl * blk;
         el_min_layer = (int32_t) std::min<int64_t>(n_slots, (mn + blk*nl - 1)/(blk*nl));
         const int32_t hard_fl = std::max<int32_t>(el_min_layer, 2*(int32_t) n_expert_used + 4);
@@ -25054,9 +24469,11 @@ void llama_moe_stream::el_stop() {
 #endif
 }
 
-// the pressure thread: sleeps in poll() on the kernel's PSI triggers (the system's /proc/pressure/memory and this process's own
-// cgroup memory.pressure: "some <stall> 2000000", the shortest window an unprivileged process may use) - no polling of memory.
-// An event asks for el_step more bytes back; while no call runs, the give-back is made here at once, else at the next boundary
+// Elastic RAM's thread: at every look (a few a second) it reads the other programs' memory and applies the rule - the follow step
+// more held by them = that much given back, that much less = taken back after the settle time. Between looks it sleeps in poll() on
+// the kernel's PSI triggers (the system's /proc/pressure/memory and this process's own cgroup memory.pressure: "some <stall> 2000000",
+// the shortest window an unprivileged process may use): a memory-pressure event with free RAM under keep-free gives back too, whatever
+// the other programs' memory reads. While no call runs a give-back is made here at once, else at the next boundary
 void llama_moe_stream::el_loop() {
 #if EL_OS_LINUX
     const std::string trig = format("some %d 2000000", el_stall_us);
@@ -25079,14 +24496,11 @@ void llama_moe_stream::el_loop() {
     fprintf(stderr, "llama_moe_stream: elastic RAM: macOS DISPATCH_SOURCE_TYPE_MEMORYPRESSURE: %s\n",
             el_mac_src ? "armed" : el_test_psi_off ? "not armed (TEST ONLY: MOE_STREAM_TEST_PSI_OFF)" : "not available");
 #endif
-    int64_t swp_last = el_swap_on ? el_os_pswpout() : -1;
+    int64_t others_last = INT64_MIN;   // the other programs' memory at the look before
     int64_t below = 0;
     bool psi_gone_said = false;
     GGML_UNUSED(psi_gone_said);
     const int64_t t_start = ggml_time_us();
-    struct el_sample { int64_t t, v, own; bool from_others; };
-    std::vector<el_sample> smp;
-    const bool paced = el_pace > 0 && !el_test_pace_off;
     int wait = el_look_max_ms;
     for (;;) {
         bool stop_now = false, wait_failed = false, ev_sys = false, ev_cg = false;
@@ -25108,7 +24522,7 @@ void llama_moe_stream::el_loop() {
         }
         if (fds[0] < 0 && fds[1] < 0 && !psi_gone_said) {
             psi_gone_said = true;
-            fprintf(stderr, "llama_moe_stream: elastic RAM: no PSI trigger left - the swap-out count and the keep-free trigger remain\n");
+            fprintf(stderr, "llama_moe_stream: elastic RAM: no PSI trigger left - the other programs' memory is still followed\n");
         }
         ev_sys = fds[0] >= 0 && (p[1].revents & POLLPRI);
         ev_cg  = fds[1] >= 0 && (p[2].revents & POLLPRI);
@@ -25141,201 +24555,90 @@ void llama_moe_stream::el_loop() {
         }
 #endif
         el_looks += 1;
-        int64_t tr_bytes = 0, tr_first = 0, sd_bytes = 0, tr_allow = -1;
-        bool took_look = false;
-        int tr_reason = 0;
+        int64_t short_bytes = 0, short_allow = 0;
         if (!stop_now) {
             int64_t taken = 0;
             const int64_t prev_room = el_last_room_bytes.load(std::memory_order_relaxed);
-            const bool recon_win = ev_sys || el_test_discard || el_test_self_discard || el_test_fake_squeeze > 0 ||
+            const bool recon_win = ev_sys || el_test_discard || el_test_fake_squeeze > 0 ||
                                    (prev_room >= 0 && prev_room < p1.ram_margin + ((int64_t) 64 << 20));
             dz_band(el_test_unlock_every ? INT64_MAX : el_band_pace, &taken, recon_win);
-            const int64_t swp   = el_swap_on ? el_os_pswpout() : -1;
-            const int64_t avail = el_os_avail();
-            const int64_t room  = el_room();
-            const int64_t own   = el_os_own();
-            const int64_t others = el_os_others();
-            const int64_t now   = ggml_time_us();
-            const bool    quiet = now < el_quiet_until_us.load();   // the fill at start: no give-back or trim from the rate (below)
-            const int64_t self_b = el_test_fake_squeeze > 0 ? 0 : std::max<int64_t>(0, el_self_budget.load(std::memory_order_relaxed));
-            double rate = 0.0;
-            const bool has_others = others != INT64_MIN;
-            const bool has_meas   = has_others || avail >= 0;
-            const int64_t meas    = has_others ? others + el_tr_got : (avail >= 0 ? -avail : 0);
-            if (has_meas) {
-                if (!smp.empty() && smp.back().from_others != has_others) {
-                    smp.clear();   // never subtract samples across different measurement domains (others vs -avail)
-                }
-                while (smp.size() > 1 && now - smp[1].t >= (int64_t) el_rate_win_ms*1000) {
-                    smp.erase(smp.begin());
-                }
-                if (!smp.empty() && now > smp[0].t) {
-                    const int64_t d_own = has_others ? 0 : (own >= 0 && smp[0].own >= 0 ? own - smp[0].own : 0);
-                    const int64_t ext_delta = (meas - smp[0].v) - d_own - self_b;
-                    rate = std::max(0.0, (double) ext_delta/((now - smp[0].t)/1e6));
-                }
-                smp.push_back({ now, meas, own, has_others });
-            }
-            int64_t tr_mf = -1, tr_cg = INT64_MAX, tr_sys = -1, tr_ses = -1;
-            if (el_tr_ok) {
-                tr_mf = el_os_memfree();
-                const std::string cgd = el_cgroup_dir();
-                tr_cg = el_cgroup_room(cgd);
-                os_stall_us(cgd, &tr_sys, &tr_ses);
-            }
+            const int64_t avail  = el_os_avail();
+            const int64_t room   = el_room();
+            int64_t lag = 0;
+            const int64_t others = el_os_others(&lag);
+            const int64_t now    = ggml_time_us();
             std::lock_guard<std::mutex> lock(mtx);
-            const int64_t room_t = room;
             const int64_t committed = el_x_committed();
-            const int64_t x         = room_t >= 0 ? room_t - committed : -1;
+            const int64_t x         = room >= 0 ? room - committed : -1;
             el_last_room_bytes.store(x, std::memory_order_relaxed);
-            el_last_room_raw.store(room_t, std::memory_order_relaxed);   // (a word's end takes back from these - no OS read under the lock)
+            el_last_room_raw.store(room, std::memory_order_relaxed);   // (a word's end takes back from these - no OS read under the lock)
             el_last_avail.store(avail, std::memory_order_relaxed);
             el_last_look_us.store(now, std::memory_order_relaxed);
-            // The settle rule: the OTHER programs' memory growing by settlefall or more since the last look (an app opening)
-            // holds take-backs back as a give-back does (el_last_obj_us) - discount the engine's own in-flight prompt working memory
-            // (self_b) so per-thread RSS accounting lag never triggers a false 30s settle freeze.
-            const int64_t raw_ofall = has_others && el_others_last != INT64_MIN ? others - el_others_last : 0;
-            const int64_t ofall     = std::max<int64_t>(0, raw_ofall - self_b);
-            if (ofall >= el_settle_fall) {
+            if (el_test_fake_squeeze > 0 && avail >= 0 && avail < p1.ram_margin - el_follow) {   // TEST ONLY: the pretend kernel swaps
+                el_fk_swapped += (p1.ram_margin - el_follow - avail)/5;
+            }
+            // The rule. The pools were sized for the memory the other programs held then, and while that has moved by less than the
+            // follow step nothing is done: elastic RAM acts as the fixed pools do. The engine's own memory - the pools filling, a
+            // prompt's working memory - is not in that number. The level the pools' size is matched to (el_ref_others) is noted at
+            // the first look after the fill at start (a take-back waits the settle time from then, as after any need); it goes up by
+            // what a give-back gives and down by what a take-back takes, so `grown` is always what the other programs took (> 0) or
+            // released (< 0) that the size has not followed yet. Growth that may be this process's own free still under way (lag) is
+            // not taken for theirs
+            const bool has_others = others != INT64_MIN;
+            const bool filling    = now < el_quiet_until_us.load();   // the fill at start: only a memory-pressure event is answered
+            if (has_others && !filling && el_ref_others == INT64_MIN) {
+                el_ref_others  = others;
                 el_last_obj_us = now;
-                dz_n_falls += 1;
+                fprintf(stderr, "llama_moe_stream: elastic RAM: the other programs hold %.0f MiB (in RAM or swap) at %.3f s - the pools follow a "
+                        "change of %.0f MiB or more from here\n", others/1048576.0, now/1e6, el_follow/1048576.0);
             }
-            if (el_test_look_log) {   // TEST ONLY: one line per look - the engine's own view (free RAM over time)
-                fprintf(stderr, "llama_moe_stream: elastic RAM look at %.3f s: free %lld MiB (room %lld, our empty slots %lld), the band %lld slots, taken "
-                        "by the OS %lld, others' fall %lld MiB, %s\n", now/1e6, (long long) ((room_t - committed) >> 20), (long long) (room_t >> 20),
-                        (long long) (committed >> 20), (long long) el_dz_now.load(), (long long) taken, (long long) (ofall >> 20),
-                        el_in_call ? "in a call" : "idle");
+            const int64_t raw   = has_others && el_ref_others != INT64_MIN ? others - el_ref_others : 0;
+            const int64_t grown = raw > 0 ? std::max<int64_t>(0, raw - lag) : raw;
+            const bool    moved = has_others && others_last != INT64_MIN && std::llabs(others - others_last) >= el_follow/8;
+            others_last    = others;
+            el_others_seen = others;
+            el_others_grown.store(grown, std::memory_order_relaxed);
+            if (el_test_look_log) {   // TEST ONLY: one line per look - the engine's own view
+                fprintf(stderr, "llama_moe_stream: elastic RAM look at %.3f s: the other programs hold %lld MiB, %lld MiB %s the pools' size is "
+                        "matched to (our own free under way: up to %lld MiB taken off); free %lld MiB (room %lld, our empty slots %lld), the band "
+                        "%lld slots, taken by the OS %lld, %s\n", now/1e6, has_others ? (long long) (others >> 20) : -1LL,
+                        (long long) (std::llabs(grown) >> 20), grown >= 0 ? "more than" : "less than", (long long) (lag >> 20),
+                        (long long) ((room - committed) >> 20), (long long) (room >> 20), (long long) (committed >> 20),
+                        (long long) el_dz_now.load(), (long long) taken, el_in_call ? "in a call" : "idle");
             }
-            el_others_last = others;
-            const int64_t keep      = p1.ram_margin;
-            const int64_t mid       = el_target_rule();   // keep-free + the gap
-            int64_t give = 0, allow = 0;
-            int reason = 0;   // 0 none (the check), 1 under keep-free, 2 foreseen under it, 3 PSI
-            // Windows' modified-page writer writes changed pages of idle programs to the page file at any free level, to keep that
-            // list short: there a page-file write tells of a short system only with free RAM near keep-free (under keep-free + the gap)
-            const bool swap_means_short = !EL_OS_WIN32 || (room_t >= 0 && x < mid);
-            if (el_swap_on && swap_means_short && swp >= 0 && swp_last >= 0 && swp - swp_last >= 64) {   // 64 pages = 256 KiB, not noise
-                // A swap-out means the system is short, whatever free RAM reads: elastic RAM hands back as much as was swapped out,
-                // its discardable band first (discarded by itself after the lock, no write), the rest as slots - at any free level
-                const int64_t blk_b   = il_of_moe.empty() ? 0 : (int64_t) layers[il_of_moe[0]]->block_bytes;
-                const int64_t swapped = std::min<int64_t>((swp - swp_last)*4096, (int64_t) 1 << 30);
-                el_swap_look(swp - swp_last, x);   // logged
-                if (el_sd_ok && el_dz_now.load() > 0) {
-                    sd_bytes = std::min<int64_t>(swapped, el_dz_now.load()*blk_b);
-                }
-                if (swapped - sd_bytes > 0 && el_givable_any()) {
-                    give   = swapped - sd_bytes;
-                    allow  = give;
-                    reason = 3;   // counted with the memory-pressure events
-                }
-            }
-            if (el_test_self_discard && el_sd_ok && el_dz_now.load() > 0) {   // TEST ONLY: at every look, during calls too (the race with a use)
-                sd_bytes = std::max<int64_t>(sd_bytes, (int64_t) 128 << 20);
-            }
-            swp_last = swp >= 0 ? swp : swp_last;
-            // the trigger: free RAM under keep-free -> give back to the band's middle
-            const bool xok   = room_t >= 0;   // the reading is valid - x itself may be negative (see the room check in end_call)
-            const bool under = xok && x < keep;
+            // (a) the other programs took the follow step or more: that much goes back (el_short, after the lock: our empty slots,
+            // then our filled ones), and a take-back waits until nothing needed RAM for the settle time
             const bool above = el_givable_any();
-            const bool trig = under && above && !el_test_give_ignore;
-            if (trig && mid - x > give) {   // (a): back to keep-free + the gap - in proportion
-                give   = el_test_give_oversize ? 4*(mid - x) : mid - x;   // (TEST ONLY: the failure test asks four times what (a) needs)
-                allow  = mid - x;
-                reason = 1;
+            const bool trig  = grown >= el_follow && above && !el_test_give_ignore;
+            if (trig) {
+                short_bytes    = el_test_give_oversize ? 4*grown : grown;   // (TEST ONLY: the failure test asks four times the need)
+                short_allow    = grown;
+                el_last_obj_us = now;
+                el_n_trigger  += 1;
             }
-            el_n_trigger += trig ? 1 : 0;
-            // the next look's pace. Unpaced: the slowest pace farther than two steps from keep-free, else the fastest.
-            // Paced: also before free RAM can reach keep-free at el_pace x the rate, and before it can fall el_drop
-            const int64_t dist = xok ? x - keep : INT64_MAX;
-            // The rule: no blind fast polling near keep-free - every lookmax ms (every idle_look ms with no request
-            // running); the fast pace only while free RAM falls faster than fastrate
+            // the check: with that much taken by the other programs and a layer above its floor, a look must ask for a give-back
+            below = grown >= el_follow && above && !trig ? below + 1 : 0;
+            if (el_check && below >= 3) {
+                moe_stream_fail("elastic check: the other programs have held %.0f MiB more than the pools' size is matched to (the follow "
+                        "step is %.0f MiB) for %lld looks with no give-back asked", grown/1048576.0, el_follow/1048576.0, (long long) below);
+            }
+            // The next look: every lookmax ms (every idlelook ms with no request running), and at the fastest pace while the other
+            // programs' memory moves - by an eighth of the follow step or more since the look before - or a give-back was just asked
             const bool idle_now = !el_in_call && el_last_call_end_us > 0 && now - el_last_call_end_us > 2000000;
-            double w = idle_now ? el_idle_look_ms : el_look_max_ms;
             el_n_looks_idle += idle_now ? 1 : 0;
-            if (paced && rate > 0.0 && rate >= (double) el_fast_rate) {
-                w = std::min(w, 1000.0*std::max<int64_t>(dist, 0)/(el_pace*rate));
-                if (el_drop > 0) {
-                    w = std::min(w, 1000.0*el_drop/rate);
-                }
-            }
-            const double w_cap = idle_now ? std::max(el_look_max_ms, el_idle_look_ms) : el_look_max_ms;
-            wait = (int) std::max<double>(el_look_min_ms, std::min<double>(w_cap, w));
+            wait = moved || trig ? el_look_min_ms : idle_now ? el_idle_look_ms : el_look_max_ms;
             el_n_fast_looks += wait <= el_look_min_ms ? 1 : 0;
-            el_rate_max = std::max(el_rate_max, rate);
-            // the crossing foreseen: at el_pace x the rate free RAM falls under keep-free before even the next look - give back now
-            // to the band's middle as it will be then
-            const bool fast = rate >= (double) el_fast_rate;   // a fall below fastrate is noise, not a need
-            const int64_t fall = dist == INT64_MAX ? 0 : (int64_t) (el_pace*rate*wait/1000.0);
-            if (paced && fast && !quiet && !under && dist != INT64_MAX && fall > dist && above && !el_test_give_ignore) {
-                const int64_t g = mid - (x - fall);
-                if (g > give) {   // (a) foreseen: back to keep-free + the gap as free RAM will be by the next look
-                    give   = g;
-                    allow  = g;
-                    reason = 2;
-                    el_n_early += 1;
-                    fprintf(stderr, "llama_moe_stream: elastic RAM early give-back at %.3f s: the other programs take %.0f MiB/s, free %.0f MiB is "
-                            "%.0f MiB above keep-free %.0f MiB, the next look in %d ms: give back %.0f MiB\n", now/1e6, rate/1048576.0,
-                            x/1048576.0, dist/1048576.0, keep/1048576.0, wait, g/1048576.0);
-                }
-            }
-            if ((reason == 1 || reason == 2) && give > 0) {   // (review: always the order - with the trim off, empties then our slots)
-                tr_first = give;   // other programs' old file cache first - trimmed after the lock, then what is
-                tr_allow = allow;
-                tr_reason = reason;   // still missing is given back (below)
-            } else {
-                el_ask_r(give, reason, allow);   // during a call elastic RAM's thread frees at once what may be freed now (el_serve_in_call)
-            }
-            // the check: under keep-free (with a layer above its floor) the trigger itself must ask for a give-back at every look
-            below = under && above && !trig ? below + 1 : 0;
-            if (el_check && below >= 3) {   // the rule's looks are 2 s apart: 3 in a row
-                moe_stream_fail("elastic check: free RAM %.0f MiB (room %.0f MiB, our empty slots %.0f MiB) has been under keep-free %.0f MiB "
-                        "for %lld looks with no give-back asked by it", avail/1048576.0, room/1048576.0, committed/1048576.0, keep/1048576.0,
-                        (long long) below);
-            }
-            // The pacing check: with the pacing's own measure (a safety factor of el_pace, else 2), a look that foresees free RAM under
-            // keep-free before the next look must have looked sooner or given back (the failure test PACE_OFF must stop here)
-            const double pc = el_pace > 0 ? el_pace : 2.0;
-            if (el_check && el_pace > 0 && fast && !quiet && !under && above && give == 0 && dist != INT64_MAX && pc*rate*wait/1000.0 > (double) dist) {
-                moe_stream_fail("elastic check (pacing): the other programs take %.0f MiB/s and free RAM %.0f MiB is %.0f MiB above "
-                        "keep-free %.0f MiB: at %.1f x that rate it crosses before the next look in %d ms, and no give-back was asked",
-                        rate/1048576.0, x/1048576.0, dist/1048576.0, keep/1048576.0, pc, wait);
-            }
-            // Take again while idle, from this thread (a request, a reply's end and its words do it too) - el_take checks
-            // take-again, keep-free, a step still filling, a give-back asked for and the cool-down
-            if (!el_in_call && room_t >= 0) {
+            // (b) the other programs released the follow step or more: taken back while idle, from this thread (a request, a reply's
+            // end and its words do it too) - el_take checks the release, keep-free, a step still filling and the settle time
+            if (!el_in_call && room >= 0) {
                 el_mem m;
-                m.room    = room_t;
+                m.room    = room;
                 m.avail   = avail;
-                const int64_t nt0 = el_n_take;
-                el_take(3, m);
-                took_look = el_n_take != nt0;   // one take-back step per look at most
-            }
-            // The trim - decided here, run after the lock is released (the kernel's reclaim takes ms)
-            tr_bytes = xok && tr_first == 0 ? el_tr_decide(now, x, tr_mf, tr_cg, committed, give > 0, tr_sys, tr_ses) : 0;
-        }
-        if (sd_bytes > 0) {   // our band discarded by elastic RAM itself while the system swaps other apps out
-            el_self_discard(sd_bytes);
-        }
-        if (tr_first > 0) {   // free RAM under keep-free - the order (el_short)
-            el_short(tr_first, tr_reason, tr_allow);
-            tr_first = 0;
-            tr_bytes = 0;
-        }
-        if (tr_bytes > 0) {
-            const int64_t kp = std::min(el_tr_kp, tr_bytes);
-            if (kp > 0) {
-                el_tr_keep(kp);
-            }
-            if (tr_bytes - kp > 0) {
-                el_tr_run(tr_bytes - kp);
-            }
-            const el_mem m = el_read_mem();   // what it freed taken back at once while idle (in a call: at the call's end)
-            std::lock_guard<std::mutex> lock(mtx);
-            if (!el_in_call && !took_look) {   // (not a second step in the same look - its slots are still landing)
                 el_take(3, m);
             }
-            wait = std::min(wait, el_look_max_ms);   // the next look sooner while trimming
-            tr_bytes = 0;
+        }
+        if (short_bytes > 0) {
+            el_short(short_bytes, 1, short_allow);
         }
         if (wait_failed) {
             fprintf(stderr, "llama_moe_stream: elastic RAM's thread ends: wait failed (%s) - no more give-backs on pressure or swap\n",
@@ -25353,12 +24656,10 @@ void llama_moe_stream::el_loop() {
         std::unique_lock<std::mutex> plock(mtx);
         const int64_t x_ev = room >= 0 ? room - el_x_committed() : -1;
         plock.unlock();
-        const bool quiet_ev  = ggml_time_us() < el_quiet_until_us.load();   // the fill at start: a need only under the headroom
-        const bool short_ram = room >= 0 && x_ev < (quiet_ev ? p1.ram_margin : el_psi_floor);
+        const bool short_ram = room >= 0 && x_ev < el_psi_floor;
         fprintf(stderr, "llama_moe_stream: elastic RAM pressure event at %.3f s (%s%s%s), free room %.0f MiB (avail %.0f MiB): %s\n",
                 ggml_time_us()/1e6, ev_sys ? "system" : "", ev_sys && ev_cg ? " + " : "", ev_cg ? "this process's cgroup" : "",
-                x_ev/1048576.0, el_os_avail()/1048576.0, short_ram ? "a need - give back" :
-                quiet_ev ? "ignored (loading: more than keep-free free)" : "ignored (more than psifloor free)");
+                x_ev/1048576.0, el_os_avail()/1048576.0, short_ram ? "a need - give back" : "ignored (more than psifloor free)");
         if (!short_ram) {
             el_n_ignored += 1;
             continue;
@@ -25378,8 +24679,8 @@ void llama_moe_stream::el_loop() {
                 el_taking = false;
             }
             g = std::min<int64_t>(el_psi_base << std::min(el_psi_run - 1, 8), 4*el_step);
-            fprintf(stderr, "llama_moe_stream: elastic RAM memory-pressure event %d in a row: %.0f MiB - the order (our empty slots, other programs' "
-                    "old file cache, our filled slots)\n", el_psi_run, g/1048576.0);
+            fprintf(stderr, "llama_moe_stream: elastic RAM memory-pressure event %d in a row: %.0f MiB - the order (our empty slots, then our "
+                    "filled slots)\n", el_psi_run, g/1048576.0);
         }
         el_short(g, 3);
     }
@@ -25412,7 +24713,6 @@ void llama_moe_stream::el_loop() {
 #else
 void llama_moe_stream::el_start() {}
 void llama_moe_stream::el_short(int64_t bytes, int reason, int64_t allowed) { GGML_UNUSED(bytes); GGML_UNUSED(reason); GGML_UNUSED(allowed); }
-void llama_moe_stream::el_self_discard(int64_t bytes) { GGML_UNUSED(bytes); }
 void llama_moe_stream::el_stop() {}
 void llama_moe_stream::el_loop() {}
 #endif
@@ -25438,15 +24738,13 @@ void llama_moe_stream::el_print_stats() const {
                 (long long) el_n_ctx_trim, (long long) el_ctx_trim_slots,
                 (long long) el_n_self_lend, (long long) el_self_lent_slots, (long long) el_n_self_restore);
     }
-    fprintf(stderr, "llama_moe_stream: elastic RAM swap-out signal %s (answered: as much handed back); keep-free trigger give-backs %lld; frees during "
-            "a call by elastic RAM's thread %lld (%lld slots); take-backs while idle %lld, at a reply word's end %lld; the thread: %lld looks, %.3f s of CPU over %.1f s\n",
-            el_swap_on ? "on" : "off", (long long) el_n_trigger, (long long) el_n_now_give, (long long) el_n_now_slots,
-            (long long) el_n_idle_take, (long long) el_n_word_take, (long long) el_looks.load(), el_thread_cpu_s, el_thread_wall_s);
-    fprintf(stderr, "llama_moe_stream: elastic RAM: the rule: give-backs under keep-free %lld, foreseen under it %lld, on a "
-            "memory-pressure event %lld; swap-outs of idle memory logged %lld; looks %lld (%lld with no request running); the settle rule: "
-            "falls of free RAM %lld, idle looks that waited %lld\n",
-            (long long) el_n_need_a, (long long) el_n_need_pred, (long long) el_n_need_psi, (long long) el_n_swap_idle,
-            (long long) el_looks.load(), (long long) el_n_looks_idle, (long long) dz_n_falls, (long long) el_n_settle_wait);
+    fprintf(stderr, "llama_moe_stream: elastic RAM: the rule: give-backs asked because the other programs took RAM %lld (looks that found it "
+            "%lld), on a memory-pressure event %lld; frees during a call by elastic RAM's thread %lld (%lld slots); take-backs while idle %lld, "
+            "at a reply word's end %lld, looks that waited for the settle time %lld; the thread: %lld looks (%lld with no request running, "
+            "%lld at the fastest pace), %.3f s of CPU over %.1f s\n",
+            (long long) el_n_need_a, (long long) el_n_trigger, (long long) el_n_need_psi, (long long) el_n_now_give, (long long) el_n_now_slots,
+            (long long) el_n_idle_take, (long long) el_n_word_take, (long long) el_n_settle_wait, (long long) el_looks.load(),
+            (long long) el_n_looks_idle, (long long) el_n_fast_looks, el_thread_cpu_s, el_thread_wall_s);
     if (el_on) {   // the discardable band
         const int64_t anon_huge = el_own_anon_huge_mib();
         fprintf(stderr, "llama_moe_stream: elastic RAM: discardable band %s (band %.0f %%, age %lld words, at the last upkeep %lld picks): "
@@ -25462,27 +24760,11 @@ void llama_moe_stream::el_print_stats() const {
                 (long long) dz_n_relock_fail, (long long) dz_n_claim, el_dz_touch ? "yes" : "no", (long long) dz_n_taken, (long long) dz_n_probe,
                 (long long) dz_n_probe_slots, dz_n_probe > 0 ? dz_probe_ms_sum/dz_n_probe : 0.0, dz_probe_ms_max, dz_hold_ms_max, (long long) anon_huge);
     }
-    if (el_on) {   // elastic RAM discarding our band itself
-        fprintf(stderr, "llama_moe_stream: our band discarded by elastic RAM itself %s: %lld times, %lld slots, %.1f ms in all; swap-outs "
-                "with plenty free (not answered) %lld\n", el_sd_ok ? "on" : el_sd_n > 0 ? "on, then off" : "off", (long long) el_sd_n,
-                (long long) el_sd_slots, el_sd_ms, (long long) el_sd_n_far);
-    }
-    if (el_on) {   // the trim
-        fprintf(stderr, "llama_moe_stream: elastic RAM: the trim %s: %lld steps (less was there %lld), stopped by a memory stall %lld "
-                "times; asked %.0f MiB, the cache dropped %.0f MiB; the kernel's time %.0f ms of CPU (%.2f ms per 100 MiB), %.0f ms wall, "
-                "the longest step %.1f ms; keep-free short: our empty slots switched off first %lld times (%.0f MiB), trimmed %lld times, the cache -%.0f MiB, still short (a give-back) %lld, held "
-                "(the cache was in use) %lld; the engine's minimum %d slots per layer\n", el_tr_ok ? "on" : el_tr_n > 0 ? "on, then off (see above)" :
-                format("off (%s)", !el_tr_opt ? "trim=0" : el_tr_why.empty() ? "-" : el_tr_why.c_str()).c_str(), (long long) el_tr_n,
-                (long long) el_tr_n_again, (long long) el_tr_n_stop, el_tr_bytes/1048576.0, el_tr_got/1048576.0, el_tr_cpu_ms,
-                el_tr_bytes > 0 ? el_tr_cpu_ms/(el_tr_bytes/1048576.0)*100.0 : 0.0, el_tr_wall_ms, el_tr_wall_max, (long long) el_tr_n_empty, el_tr_empty_bytes/1048576.0, (long long) el_tr_n_keep,
-                el_tr_keep_bytes/1048576.0, (long long) el_tr_keep_short, (long long) el_tr_n_inuse, std::max<int32_t>(el_min_layer, 2*(int32_t) n_expert_used + 4));
-    }
-    fprintf(stderr, "llama_moe_stream: elastic RAM: pacing %s: early give-backs %lld, looks at the fastest pace %lld, the fastest "
-            "other-program rate seen %.0f MiB/s; asks cut to the part still missing %.0f MiB; asked until nothing pending: %lld times, mean "
-            "%.0f ms, max %.0f ms; prompt layer ops gave %lld slots above the start size, %lld below\n", el_pace > 0 && !el_test_pace_off ?
-            format("on (x %.1f, drop %.0f MiB, %d..%d ms)", el_pace, el_drop/1048576.0, el_look_min_ms, el_look_max_ms).c_str() : "off",
-            (long long) el_n_early, (long long) el_n_fast_looks, el_rate_max/1048576.0, el_n_ask_cut/1048576.0, (long long) el_pend_n,
-            el_pend_n > 0 ? el_pend_sum_ms/el_pend_n : 0.0, el_pend_max_ms, (long long) el_n_prompt_hi, (long long) el_n_prompt_lo);
+    fprintf(stderr, "llama_moe_stream: elastic RAM: asks cut to the part still missing %.0f MiB; asked until nothing pending: %lld times, mean "
+            "%.0f ms, max %.0f ms; prompt layer ops gave %lld slots above the start size, %lld below; the layers put back in order after "
+            "a window pass %lld times (%.1f ms in all)\n", el_n_ask_cut/1048576.0,
+            (long long) el_pend_n, el_pend_n > 0 ? el_pend_sum_ms/el_pend_n : 0.0, el_pend_max_ms, (long long) el_n_prompt_hi,
+            (long long) el_n_prompt_lo, (long long) el_n_tidy, el_tidy_ms);
     if (el_test_fake_squeeze > 0) {
         fprintf(stderr, "llama_moe_stream: TEST fake squeeze: the pretend kernel swapped %.0f MiB\n", el_fk_swapped.load()/1048576.0);
         if (el_check && el_fk_swapped.load() > ((int64_t) 256 << 20)) {

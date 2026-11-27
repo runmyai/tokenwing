@@ -12298,9 +12298,10 @@ void llama_moe_stream::win_compact(llama_moe_stream_layer & sl) {
 
 // mtx held, a boundary (no graph in flight). A window pass leaves a layer's experts where they landed: some above its start size, with
 // switched-off holes below. Nothing minds that while the pools stay as they are - the next pass starts from any layout, as with the
-// fixed pools. Elastic RAM gives and takes a layer's slots by their place, and a GPU view copies the low ones: before either, the
-// layers are put back in order here (win_compact: a page move per expert, a copy where the system has none). So a quiet machine never
-// pays for it - after every long prompt it cost Linux 1.5 % of an 8k prompt and Windows, which copies, 8 %
+// fixed pools. A give-back and a take-back count a layer's slots while it is so (el_give's by_count). What does go by place - a prompt's
+// own memory lend, a slot-share move, a GPU view of the low slots - puts the layers back in order here first (win_compact: a page move
+// per expert, a copy where the system has none). So a quiet machine never pays for it - after every long prompt it cost Linux 1.5 % of
+// an 8k prompt and Windows, which copies, 8 % - and neither does a machine where another program takes or releases RAM
 void llama_moe_stream::el_tidy() {
     if (!el_untidy) {
         return;
@@ -22126,7 +22127,7 @@ bool llama_moe_stream::el_givable_any() const {
         for (uint32_t s2 = 0; s2 < sl.n_slots; s2++) {   // the unanswered-alarm check must not count an alarm nothing could answer)
             if (!sl.slot_off[s2]) {
                 const bool d = el_droppable(sl, (int32_t) s2);
-                if (s2 < n_slots) {
+                if (s2 < n_slots || el_untidy) {   // (out of order after a window pass: by count)
                     lo += 1;
                     lo_free += d ? 1 : 0;
                 } else {
@@ -22771,9 +22772,10 @@ void llama_moe_stream::el_wide_off(const char * why) {
     graph_gen += 1;
 }
 
-// the slots a prompt call's guard counts: with wide waves every switched-on slot (the waves use them), else the ones below the start size
+// the slots a prompt call's guard counts: with wide waves every switched-on slot (the waves use them) and out of order after a window
+// pass too (place says nothing, as el_recount's wave width), else the ones below the start size
 uint32_t llama_moe_stream::el_lo_end(const llama_moe_stream_layer & sl, bool prompt) const {
-    return el_wide && prompt ? sl.n_slots : std::min<uint32_t>(sl.n_slots, n_slots);
+    return (el_wide && prompt) || el_untidy ? sl.n_slots : std::min<uint32_t>(sl.n_slots, n_slots);
 }
 
 void llama_moe_stream::el_recount() {
@@ -22869,14 +22871,21 @@ int64_t llama_moe_stream::el_give(int64_t bytes, bool boundary, llama_moe_stream
     if (bytes <= 0 || il_of_moe.empty() || win_active) {
         return 0;
     }
-    if (!boundary && (el_hold_gives || el_untidy)) {
+    if (!boundary && el_hold_gives) {
         // a prompt call with GPU-wave copies runs (tail waves, copy-ahead - they copy from the slots, sized for the call's waves): no slot
-        // is switched off until it ends, where what is pending is given (a prompt call lasts seconds; the band frees RAM meanwhile).
-        // The same while the layers are out of order after a window pass: they are put back in order at the call's end, then given
+        // is switched off until it ends, where what is pending is given (a prompt call lasts seconds; the band frees RAM meanwhile)
         el_n_held_gives += 1;
         return 0;
     }
-    el_tidy();
+    if (sh_on) {
+        el_tidy();   // (slot shares pick the slots above the start size by their value, one by one)
+    }
+    // Out of order after a window pass a slot's place says nothing, so nothing here goes by place then: a layer's slots "above the start
+    // size" are its count above it, and a slot is switched off wherever it is. No tidy-up first - where pages cannot be moved it copied
+    // every expert out of place under the lock (1.1 s for 2,800 Ling experts on Windows, the reply waiting) before a single page went back
+    const bool    by_count = el_untidy;
+    const int32_t hi_from  = by_count ? 0 : (int32_t) n_slots;    // the slots a cut "above the start size" picks from
+    const int32_t lo_to    = by_count ? -1 : (int32_t) n_slots;   // the end of the slots a cut "below the start size" picks from
 
     const size_t blk = layers[il_of_moe[0]]->block_bytes;
     int64_t n = (bytes + (int64_t) blk - 1)/(int64_t) blk;
@@ -22893,12 +22902,12 @@ int64_t llama_moe_stream::el_give(int64_t bytes, bool boundary, llama_moe_stream
         // the pending as they can at once; below the start size the layer gives its even share of the pending at the start of this
         // pass (el_pass_req: one pass gives it all - before, a share of what was still pending, so one pass gave ~64 %)
         const int64_t mn = std::max<int64_t>(1, el_prompt_min);
-        got = el_drop_layer(*only, n, true, mn, (int32_t) n_slots, -1);
+        got = el_drop_layer(*only, by_count ? std::min<int64_t>(n, (int64_t) only->share - (int64_t) n_slots) : n, true, mn, hi_from, -1);
         el_n_prompt_hi += got;
         if (got < n) {
             const int64_t L = (int64_t) il_of_moe.size();
             const int64_t q = std::min<int64_t>(n - got, ((el_pass_req + (int64_t) blk - 1)/(int64_t) blk + L - 1)/L);
-            const int64_t g2 = q > 0 ? el_drop_layer(*only, q, true, mn, 0, (int32_t) n_slots) : 0;
+            const int64_t g2 = q > 0 ? el_drop_layer(*only, q, true, mn, 0, lo_to) : 0;
             got += g2;
             el_n_prompt_lo += g2;
         }
@@ -22939,6 +22948,12 @@ int64_t llama_moe_stream::el_give(int64_t bytes, bool boundary, llama_moe_stream
                         hi[i] += givable(sl, (int32_t) s2) ? 1 : 0;
                     }
                 }
+            }
+            if (by_count) {
+                const int64_t g = hi[i] + dlo[i];   // every slot that may go now
+                hi[i]  = std::min<int64_t>(g, std::max<int64_t>(0, (int64_t) sl.share - (int64_t) n_slots));
+                dlo[i] = g - hi[i];
+                lo[i]  = std::min<int64_t>((int64_t) sl.share, (int64_t) n_slots);
             }
         }
         // With wide waves a prompt call's waves use every slot - phase A keeps the call's wave width (+ marks / copy-backs) too
@@ -22988,7 +23003,7 @@ int64_t llama_moe_stream::el_give(int64_t bytes, bool boundary, llama_moe_stream
                 el_rr = (best + 1) % L;
             }
             for (size_t i = 0; i < L; i++) {
-                got += cut[i] > 0 ? el_drop_layer(*layers[il_of_moe[i]], cut[i], true, pmin_of(*layers[il_of_moe[i]]), (int32_t) n_slots, -1) : 0;
+                got += cut[i] > 0 ? el_drop_layer(*layers[il_of_moe[i]], cut[i], true, pmin_of(*layers[il_of_moe[i]]), hi_from, -1) : 0;
             }
         }
         // phase B: below the start size, evenly (each slot from the layer with the most left; ties: a rotating start), within each
@@ -23031,10 +23046,10 @@ int64_t llama_moe_stream::el_give(int64_t bytes, bool boundary, llama_moe_stream
                 el_rr = (best + 1) % L;
             }
             for (size_t i = 0; i < L; i++) {
-                got += cut[i] > 0 ? el_drop_layer(*layers[il_of_moe[i]], cut[i], true, pmin[i], 0, (int32_t) n_slots) : 0;
+                got += cut[i] > 0 ? el_drop_layer(*layers[il_of_moe[i]], cut[i], true, pmin[i], 0, lo_to) : 0;
             }
         }
-        if (el_check && got > 0) {   // the rule: no slot below the start size while any layer keeps one above; below it, evenly
+        if (el_check && got > 0 && !by_count) {   // the rule: no slot below the start size while any layer keeps one above; below it, evenly
             int64_t max_lo = 0;
             bool any_hi = false;   // a slot above the start size that could still have been given
             std::vector<int64_t> lo2(L, 0), dlo2(L, 0);
@@ -23167,7 +23182,6 @@ void llama_moe_stream::el_take(int mode, const el_mem & m) {
         }
         return;
     }
-    el_tidy();
     const int64_t step_cap = el_test_keep_skip ? room : std::max<int64_t>((int64_t) blk, el_refill_step);
     int64_t n = std::min<int64_t>(std::min(room, freed), step_cap)/(int64_t) blk;
     std::vector<int32_t> order(il_of_moe.begin(), il_of_moe.end());

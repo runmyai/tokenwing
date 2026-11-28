@@ -97,22 +97,22 @@ The full list, with what each flag measured, is in [Settings](docs/settings.md).
 
 ## FAQ
 
-**Does it change the model's answers or skip experts?**
+**Does it change the model's answers or skip experts?**<br>
 No. Every expert the model picks is computed, with its full weights in the file's own quantization: no expert skipping, no top-k cut. Computers round numbers slightly differently depending on the order they add them in, so no two engines give bit-identical results. Even llama.cpp gives slightly different results from itself when you only change its batch size. We measured ours against llama.cpp: the difference is no bigger than that.
 
-**What SSD do I need?**
+**What SSD do I need?**<br>
 We suggest an NVMe SSD on PCIe 3.0 or above.
 
-**Will it wear out my SSD?**
+**Will it wear out my SSD?**<br>
 No. SSDs wear when they're written, not when they're read. That's why every SSD's endurance rating counts terabytes written (TBW) and nothing else. Running a model only reads.
 
-**Can I use it with Hermes Agent, Pi or my own tools?**
+**Can I use it with Hermes Agent, Pi or my own tools?**<br>
 Yes. `llama-server` serves an OpenAI-compatible API. Hermes Agent, Pi, or any tool that can use an OpenAI-compatible endpoint can use the models it runs.
 
-**Can I add my own model?**
+**Can I add my own model?**<br>
 Yes, with an experts file and code for its architecture. See [Adding a model](docs/adding-a-model.md).
 
-**Does it send anything?**
+**Does it send anything?**<br>
 One anonymous record a day from `llama-server`: a random install id, the date, the engine version, the OS, CPU and GPU names, and whether it was started directly or by an app. No prompts, replies, model names, paths or user names. `--no-stats`, `TOKENWING_NO_STATS=1` or `DO_NOT_TRACK=1` turns it off. When you start `llama-server` yourself (not through the Run My AI app, which checks on its own), it also asks runmyai.org once a day for the newest release, sending only the engine version and the system (e.g. `linux-x64`); the site counts these checks. `TOKENWING_NO_UPDATE_CHECK=1` or `DO_NOT_TRACK=1` turns it off. See [Settings](docs/settings.md#usage-statistics).
 
 ## Build it yourself

@@ -97,11 +97,17 @@ The full list, with what each flag measured, is in [Settings](docs/settings.md).
 
 ## FAQ
 
-**Does it change the model's answers?**
-No. Computers round numbers slightly differently depending on the order they add them in, so no two engines give bit-identical results. Even llama.cpp gives slightly different results from itself when you only change its batch size. On Flint 40B, the KL divergence against official llama.cpp is 0.010 to 0.016 across our three test setups, against 0.016 for llama.cpp against itself when only its batch size changes.
+**Does it change the model's answers or skip experts?**
+No. Every expert the model picks is computed, with its full weights in the file's own quantization: no expert skipping, no top-k cut. Computers round numbers slightly differently depending on the order they add them in, so no two engines give bit-identical results. Even llama.cpp gives slightly different results from itself when you only change its batch size. We measured ours against llama.cpp: the difference is no bigger than that.
+
+**What SSD do I need?**
+We suggest an NVMe SSD on PCIe 3.0 or above.
 
 **Will it wear out my SSD?**
-No. SSDs wear when they're written, not when they're read. Expert streaming only reads.
+No. SSDs wear when they're written, not when they're read. That's why every SSD's endurance rating counts terabytes written (TBW) and nothing else. Running a model only reads.
+
+**Can I use it with Hermes Agent, Pi or my own tools?**
+Yes. `llama-server` serves an OpenAI-compatible API. Hermes Agent, Pi, or any tool that can use an OpenAI-compatible endpoint can use the models it runs.
 
 **Can I add my own model?**
 Yes, with an experts file and code for its architecture. See [Adding a model](docs/adding-a-model.md).

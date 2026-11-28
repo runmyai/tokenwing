@@ -2,7 +2,7 @@
   <img src="docs/images/tokenwing.png" alt="TokenWing" width="720">
 </p>
 
-<p align="center"><b>Run huge AI models on your own PC, even ones bigger than your memory.</b></p>
+<p align="center"><b>The model you want. On the machine you have. Fast, private, no limits.</b></p>
 
 <p align="center">
   <a href="https://github.com/runmyai/tokenwing/releases">Download</a> ·
@@ -19,7 +19,18 @@ TokenWing is the engine inside [Run My AI](https://github.com/runmyai/run-my-ai)
 
 You download a 50 GB game, yet while you play it uses maybe 8 GB of RAM and 4 GB of VRAM. The engine never holds the whole world in memory: it streams in what's about to appear and evicts what you've left behind.
 
-A Mixture-of-Experts model works the same way: for each token only a few of its experts are needed, so only those are read. TokenWing predicts the experts of the next layers and reads them from the SSD into a RAM cache while the current layer computes, so compute rarely waits on the disk. Memory size stops being the limit. It doesn't raise your memory bandwidth, though: your CPU and GPU still read every expert from RAM or VRAM.
+A Mixture-of-Experts model is built in a way that fits this: it's split into many small experts, and each token uses only a few of them, so most of the model sits unused at any moment. The difference is that a game knows what lies around the next corner, while a model decides which experts it needs at the last moment, right before it uses them. TokenWing works that out two layers early: it predicts the next layers' experts and reads them from the SSD into RAM and VRAM while the current layer computes, so the compute rarely waits on the disk.
+
+Your memory's size stops being the limit, but not its speed: your CPU and GPU still read every expert they use from RAM or VRAM.
+
+### This isn't magic
+
+With TokenWing you could technically run even a trillion-parameter model, if the math checks out with:
+
+- the active parameters per token;
+- how fast your SSD reads;
+- how much of the model your memory can already hold;
+- how many layers ahead the prefetcher looks, and how accurate it is.
 
 [Inside TokenWing](docs/how-it-works.md) covers the whole pipeline.
 

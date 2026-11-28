@@ -74,30 +74,6 @@ Every size is computed at startup from what the machine has free. For lack of RA
 
 The full list, with what each flag measured, is in [Settings](docs/settings.md).
 
-## Speed
-
-Reply speed in tokens per second, TokenWing against plain llama.cpp on the same machine. Measured on an earlier build.
-
-A desktop with an RTX 4090 (Ryzen 9 7950X), its GPU and RAM limited to match smaller PCs. Replies to a 1,600-token story prompt.
-
-| Model | PC | TokenWing | llama.cpp |
-|---|---|---|---|
-| Flint 40B | 24 GB GPU | 147.9 | 127.1 |
-| Flint 40B | 12 GB GPU, 16 GB RAM | 76.2 | 38.5 |
-| Flint 40B | 8 GB GPU, 16 GB RAM | 53.7 | 20.4 |
-| Flint 40B | No GPU, 16 GB RAM | 15.9 | 8.2 |
-| Ling 3.0 Flash | 24 GB GPU, 16 GB RAM | 64.7 | 14.3 |
-| Ling 3.0 Flash | 12 GB GPU, 16 GB RAM | 42.6 | 8.9 |
-| Ling 3.0 Flash | 8 GB GPU, 16 GB RAM | 29.3 | 7.7 |
-| Ling 3.0 Flash | No GPU, 16 GB RAM | 7.5 | 3.6 |
-
-Qwen 3.8 Flash Next (84 GB) on a laptop with an RTX 5070 Ti Laptop 12 GB and 32 GB of RAM.
-
-| | TokenWing | llama.cpp |
-|---|---|---|
-| Replies | 32.1 | 3.15 |
-| A 10,000-token prompt | 259 | about 10 |
-
 ## Known limits
 
 - After a very long prompt (16k tokens and more), the first reply tokens are slower while the RAM cache moves from the prompt's experts to the reply's.

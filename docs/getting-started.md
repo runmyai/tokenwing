@@ -104,7 +104,7 @@ The full reference, including internal micro-flags hidden under `--help-internal
 | `--moe-stream model` | Enables Direct-I/O streaming, activates all 5 feature umbrella groups below (`auto`), sets server `-np 1` / `-cram 0`, and auto-budgets whole GPU layers + VRAM expert pool. |
 | `--moe-stream-fast-prefill` | Enables layer-major prompt waves, GPU wave-gather (`512` waves), prompt-split, copy-ahead, CUDA prefill fast kernels, and auto `-ub 2048` (`1024` at `-c >= 262144`). |
 | `--moe-stream-fast-decode` | Enables overlapped Direct-I/O + router plan lookahead, prediction correction (`model`), fused routing/norms, and GPU backend sampling (`-bs` on server). |
-| `--moe-stream-fast-cpu` | Enables fused SIMD CPU MoE matmuls (`iqk 8`, `x4`, `mmid-merge`, `cpu-topk`, `cpu-fa`, `small-ops`, `weighted-sum`). |
+| `--moe-stream-fast-cpu` | Enables fused SIMD CPU MoE matmuls (`iqk 8`, `x4`, `mmid-merge`, `cpu-topk`, `cpu-fa`, `small-ops`, `weighted-sum`) and the linear-attention state read and written in place (`cpu-state-inplace`). |
 | `--moe-stream-vram-cache` | Manages the VRAM hot-expert pool (`vram-free 200MiB`, `vram-follow`, `vram-copyback`, `vram-experts-file model`) and falls back silently on CPU-only runs. |
 | `--moe-stream-ram-cache` | Configures RAM decay eviction, prompt-end recency retention, and startup RAM warm-fill (`--moe-stream-idle-load 2`). |
 | `--moe-stream-ram-free SIZE` | Keeps `SIZE` of system RAM free outside the expert pools (use `0.5GiB` on dedicated servers or `1GiB`–`2GiB` on desktops). |

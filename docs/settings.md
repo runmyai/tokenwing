@@ -10,7 +10,7 @@ All 5 groups default to `auto` (`on` whenever `--moe-stream` is active). Pass `0
 |---|---|---|
 | `--moe-stream-fast-prefill 0\|1\|auto` | `on` | Layer-major prompt batching, GPU wave-gather (`512`), wave plan, read-ahead, windowing, prompt-split, copy-ahead, CUDA prefill kernels, and auto `-ub 2048` (`1024` at `-c >= 262144`). |
 | `--moe-stream-fast-decode 0\|1\|auto` | `on` | Overlapped Direct-I/O + router plan lookahead, prediction correction (`model` when `--moe-stream model`), fused GPU routing/norm/conv kernels, ROCm auto-tuning, and GPU backend sampling (`llama-server`). |
-| `--moe-stream-fast-cpu 0\|1\|auto` | `on` | Fused SIMD CPU MoE matmuls (`iqk 8`, `x4`, `mmid-merge`, `cpu-topk`, `cpu-fa`, `small-ops`, `weighted-sum`). |
+| `--moe-stream-fast-cpu 0\|1\|auto` | `on` | Fused SIMD CPU MoE matmuls (`iqk 8`, `x4`, `mmid-merge`, `cpu-topk`, `cpu-fa`, `small-ops`, `weighted-sum`) and the linear-attention state read and written in place (`cpu-state-inplace`). |
 | `--moe-stream-vram-cache 0\|1\|auto` | `on` (unless `-ngl 0`, `--moe-stream-uma 1`, or CPU-only) | VRAM expert pool (`vram-free 200MiB`, `vram-follow`, `vram-parallel`, `vram-copyback`, `vram-experts-file model`) and automatic whole-layer budgeting across 1+ GPUs (silent fallback if no GPU exists). |
 | `--moe-stream-ram-cache 0\|1\|auto` | `on` | Decay eviction policy, prompt-end recency retention, startup RAM pool fill (`idle-load 2`), and `--cache-ram 0` on `llama-server`. |
 

@@ -120,6 +120,10 @@ struct clip_hparams {
     int32_t muse_glimmer_patch_temporal = 0;
     int32_t muse_glimmer_sparse_factor  = 0;
 
+    // Inkling-2-Mini vision
+    int32_t inkling2_posemb_grid = 32;
+    int32_t inkling2_tile_size   = 40;
+
     // audio
     int32_t n_mel_bins = 0; // whisper preprocessor
     int32_t proj_stack_factor = 0; // ultravox
@@ -563,6 +567,7 @@ struct clip_model {
 
     // embeddings
     ggml_tensor * class_embedding = nullptr;
+    ggml_tensor * cls_pos_embedding = nullptr;
     ggml_tensor * patch_embeddings_0 = nullptr;
     ggml_tensor * patch_embeddings_1 = nullptr;  // second Conv2D kernel when we decouple Conv3D along temporal dimension (Qwen2VL)
     ggml_tensor * patch_bias = nullptr;

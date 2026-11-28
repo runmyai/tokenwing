@@ -1881,7 +1881,10 @@ private:
         const bool has_draft = params.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end() ||
+                              std::find(params_base.speculative.types.begin(),
+                                        params_base.speculative.types.end(),
+                                        COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
 
         if (callback_state) {
@@ -2026,7 +2029,7 @@ private:
                     return false;
                 }
 
-                if (ctx_dft == nullptr) {
+                if (ctx_dft == nullptr && !llama_model_has_inkling2_mtp(model_tgt)) {
                     SRV_ERR("%s", "failed to create MTP context\n");
                     return false;
                 }

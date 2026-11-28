@@ -6951,6 +6951,66 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_content("Hello, world!\nWhat's up?")
             .run();
     }
+
+    // Thinking Machines Inkling-2-Mini format tests
+    {
+        auto tst = peg_tester("models/templates/thinkingmachines-Inkling-2-Mini.jinja", detailed_debug);
+
+        tst.test("<|message_model|><|content_text|>Hello, world!\nWhat's up?<|end_message|><|content_model_end_sampling|>")
+            .expect(message_assist)
+            .run();
+
+        tst.test(
+               "<|message_model|><|content_thinking|>I'm\nthinking<|end_message|>"
+               "<|message_model|><|content_text|>Hello, world!\nWhat's up?<|end_message|><|content_model_end_sampling|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(message_assist_thoughts)
+            .run();
+
+        tst.test("<|message_model|><|content_thinking|>I'm\nthinking")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .is_partial(true)
+            .expect_reasoning("I'm\nthinking")
+            .run();
+
+        tst.test("<|message_model|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .is_partial(true)
+            .expect_content("")
+            .expect_reasoning("")
+            .run();
+
+        tst.test(
+               "<|message_model|><|content_thinking|>I'm\nthinking<|end_message|>"
+               "<|message_model|>special_function<|content_invoke_tool_json|>{\"name\":\"special_function\",\"args\":{\"arg1\":1}}<|end_message|>"
+               "<|content_model_end_sampling|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .expect(message_assist_call_thoughts)
+            .run();
+
+        tst.test(
+               "<|message_model|>python<|content_invoke_tool_json|>{\"name\":\"python\",\"args\":{\"code\":\"print('x')\"}}<|end_message|>"
+               "<|message_model|>python<|content_invoke_tool_json|>{\"name\":\"python\",\"args\":{\"code\":\"print('y')\"}}<|end_message|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .parallel_tool_calls(true)
+            .tools({ python_tool })
+            .expect_tool_calls({
+                { "python", R"#({"code": "print('x')"})#", {} },
+                { "python", R"#({"code": "print('y')"})#", {} },
+            })
+            .run();
+
+        tst.test(" thinking<|end_message|><|message_model|><|content_text|>Hello, world!\nWhat's up?<|end_message|>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .messages({ message_user, message_assist_prefill_reasoning })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_REASONING)
+            .expect_reasoning("I'm thinking")
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+    }
 }
 
 static void test_template_generation_prompt() {
@@ -7031,6 +7091,35 @@ static void test_template_generation_prompt() {
         check(tmpls, basic(),                  "");
         check(tmpls, continuation_content(),   "[THINK]I'm thinking[/THINK]Hello, ");
         check(tmpls, continuation_reasoning(), "[THINK]I'm");
+    }
+
+    {
+        auto tmpls = read_templates("models/templates/thinkingmachines-Inkling-2-Mini.jinja");
+        check(tmpls, basic(),                  "");
+        check(tmpls, continuation_content(),   "<|message_model|><|content_thinking|>I'm thinking<|end_message|><|message_model|><|content_text|>Hello, ");
+        check(tmpls, continuation_reasoning(), "<|message_model|><|content_thinking|>I'm");
+
+        // enable_thinking=false maps to reasoning_effort="none" -> Thinking effort level: 0
+        common_chat_templates_inputs off_in;
+        off_in.messages              = { system_msg, message_user };
+        off_in.add_generation_prompt = true;
+        off_in.enable_thinking       = false;
+        auto off_res = common_chat_templates_apply(tmpls.get(), off_in);
+        assert_contains(off_res.prompt.str(), "Thinking effort level: 0<|end_message|>");
+
+        // Server media_marker content part renders cleanly without throwing
+        common_chat_msg img_user;
+        img_user.role = "user";
+        img_user.content_parts = {
+            { "media_marker", "<__media__>" },
+            { "text", "Describe this image." },
+        };
+        common_chat_templates_inputs mm_in;
+        mm_in.messages              = { img_user };
+        mm_in.add_generation_prompt = true;
+        auto mm_res = common_chat_templates_apply(tmpls.get(), mm_in);
+        assert_contains(mm_res.prompt.str(), "<|message_user|><|content_image|><__media__><|end_message|>");
+        assert_contains(mm_res.prompt.str(), "<|message_user|><|content_text|>Describe this image.<|end_message|>");
     }
 
     {

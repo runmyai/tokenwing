@@ -211,6 +211,29 @@ struct llama_hparams {
     uint32_t n_hrm_l_cycles = 0;
     bool     hrm_prefix_lm = false;
 
+    // inkling2 (looped 48-visit hybrid SWA + ShortConv + MTP-8 DSpark)
+    uint32_t ink2_unpadded_vocab_size    = 0;
+    uint32_t ink2_padded_head_vocab_size = 0;
+    uint32_t ink2_image_token_id         = 200054;
+    uint32_t ink2_phys_block_count       = 0;
+    uint32_t ink2_loop_start             = 0;
+    uint32_t ink2_loop_end               = 0;
+    uint32_t ink2_loop_passes            = 1;
+    uint32_t ink2_loop_gate_rank         = 64;
+    uint32_t ink2_d_rel                  = 16;
+    uint32_t ink2_rel_extent             = 1024;
+    float    ink2_qk_l2_clip             = 22.627416997969522f;
+    float    ink2_rel_l2_clip            = 8.0f;
+    uint32_t ink2_log_scaling_floor      = 8192;
+    float    ink2_log_scaling_alpha      = 0.1f;
+    uint32_t ink2_sconv_kernel           = 0;
+    uint32_t ink2_mtp_layer_count        = 0;
+    uint32_t ink2_mtp_ff_length          = 0;
+    uint32_t ink2_mtp_block_size         = 8;
+    uint32_t ink2_mtp_markov_rank        = 256;
+    float    ink2_mtp_rope_theta         = 1000000.0f;
+    std::array<int32_t, 4> ink2_mtp_tap_visits = { 5, 23, 41, 47 };
+
     bool ssm_dt_b_c_rms = false;
 
     float f_clamp_kqv      = 0.0f;

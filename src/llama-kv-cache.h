@@ -457,6 +457,13 @@ public:
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
+    const llama_kv_cache * get_kv() const { return kv; }
+    uint32_t get_s0() const { return i_cur < sinfos.size() ? sinfos[i_cur].s0 : 0; }
+    uint32_t get_ns() const { return i_cur < sinfos.size() ? (sinfos[i_cur].s1 - sinfos[i_cur].s0 + 1) : 1; }
+    const std::vector<llama_kv_cells> & get_active_cells() const {
+        return (replay && i_cur < cells_rec.size() && !cells_rec[i_cur].empty()) ? cells_rec[i_cur] : kv->get_cells();
+    }
+
 private:
     llama_memory_status status;
 

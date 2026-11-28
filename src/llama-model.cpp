@@ -321,6 +321,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_minimax_m3(params);
         case LLM_ARCH_HRM_TEXT:
             return new llama_model_hrm_text(params);
+        case LLM_ARCH_INKLING2:
+            return new llama_model_inkling2(params);
         case LLM_ARCH_COGVLM:
             return new llama_model_cogvlm(params);
         case LLM_ARCH_PANGU_EMBED:
@@ -480,7 +482,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
-        if (ud->model->arch == LLM_ARCH_HRM_TEXT) {
+        if (ud->model->arch == LLM_ARCH_HRM_TEXT || ud->model->arch == LLM_ARCH_INKLING2) {
             // aliased cache slots cannot satisfy the meta-split invariants, so replicate all tensors
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
         }
@@ -2200,10 +2202,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (eff_room > vx_floor && wl_cap > 0) {
                     if (distinct_mib.size() == 1) {
                         const int32_t uni_max = params.moe_stream_gpu_layers_uniform_max < 0
-                                              ? std::max<int32_t>(0, params.moe_stream_wordstart)
+                                              ? (hparams.ink2_phys_block_count > 0 ? INT32_MAX : std::max<int32_t>(0, params.moe_stream_wordstart))
                                               : (params.moe_stream_gpu_layers_uniform_max == 0 ? INT32_MAX : params.moe_stream_gpu_layers_uniform_max);
-                        const int64_t uni_budget = params.moe_stream_gpu_layers_uniform_max == 0 ? wl_cap : (eff_room - vx_floor);
-                        for (int x = (int) hparams.n_layer_dense_lead; x < il_end && (int) pool_picked.size() < uni_max; x++) {
+                        const int64_t uni_budget = (params.moe_stream_gpu_layers_uniform_max == 0 || hparams.ink2_phys_block_count > 0) ? wl_cap : (eff_room - vx_floor);
+                        std::vector<int> cand_x;
+                        if (hparams.ink2_phys_block_count > 0) {
+                            for (int x = (int) hparams.ink2_loop_start; x < (int) hparams.ink2_loop_end && x < il_end; x++) { cand_x.push_back(x); }
+                            for (int x = (int) hparams.n_layer_dense_lead; x < (int) hparams.ink2_loop_start && x < il_end; x++) { cand_x.push_back(x); }
+                            for (int x = (int) hparams.ink2_loop_end; x < (int) hparams.ink2_phys_block_count && x < il_end; x++) { cand_x.push_back(x); }
+                        } else {
+                            for (int x = (int) hparams.n_layer_dense_lead; x < il_end; x++) { cand_x.push_back(x); }
+                        }
+                        for (const int x : cand_x) {
+                            if ((int) pool_picked.size() >= uni_max) {
+                                break;
+                            }
                             if (pimpl->dev_layer[x].dev == cpu_dev || exp_b[x] == 0 || whole_dev_flag[x] != nullptr) {
                                 continue;
                             }
@@ -2480,14 +2493,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             // The guess helper's slot buffer (N columns of the decode guess's width + a counter per layer):
             // only with --moe-stream-needed-early 1, at its real size, as the plan counts it (the engine default adds nothing)
+            const int64_t n_moe_layer_slots = hparams.ink2_phys_block_count > 0 ? (int64_t) hparams.ink2_phys_block_count : (int64_t) hparams.n_layer_all;
             int64_t ne_bytes = 0;
             if (params.moe_stream_needed_early == 1) {
                 const int64_t ne_la = params.moe_stream_lookahead > 1 ? params.moe_stream_lookahead : 1;
                 const int64_t ne_w  = params.moe_stream_guess_top > 0 ? params.moe_stream_guess_top
                                                                       : (params.moe_stream_prefetch_m > 0 ? params.moe_stream_prefetch_m : (int32_t) hparams.n_expert_used());   // 0 = the model's top-k
-                ne_bytes = llama_moe_stream_ne_bytes((int64_t) hparams.n_layer_all, ne_la, ne_w)
+                ne_bytes = llama_moe_stream_ne_bytes(n_moe_layer_slots, ne_la, ne_w)
                          // + the GPU producer's pinned buffer (guess slots, call cell, router slots), as the plan counts it
-                         + llama_moe_stream_ne2_bytes((int64_t) hparams.n_layer_all, ne_la, ne_w, (int64_t) hparams.n_embd,
+                         + llama_moe_stream_ne2_bytes(n_moe_layer_slots, ne_la, ne_w, (int64_t) hparams.n_embd,
                                                       (int64_t) hparams.n_expert_used(),
                                                       // + the prompt split's shared router slot (gpu-waves - 1 rows)
                                                       params.moe_stream_prompt_split == 1 && params.moe_stream_gpu_waves > 1
@@ -2515,9 +2529,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     (long long) other_bytes, (long long) ne_bytes);
         }
 
+        const int n_moe_layers = hparams.ink2_phys_block_count > 0 ? (int) hparams.ink2_phys_block_count : n_layer_all;
+
         llama_moe_stream::model_info mi;
         mi.arch          = llm_arch_name(arch);
-        mi.n_layer_all   = (uint32_t) n_layer_all;
+        mi.n_layer_all   = (uint32_t) n_moe_layers;
         mi.n_layer_nextn = hparams.n_layer_nextn;
         mi.n_layer_dense = hparams.n_layer_dense_lead;
         mi.n_expert      = hparams.n_expert;
@@ -2576,7 +2592,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         std::vector<int32_t>                     wl_dev_of;
         // (the auto-fit's or auto-gl-budget's picks are checked per device before the weights load)
         if ((gpu_list || gpu_layers_n > 0 || (gpu_layers_n < 0 && n_gpu_devs > 1) || auto_gl_budget) && !devices.empty()) {
-            wl_dev_of.assign(n_layer_all, -1);
+            wl_dev_of.assign(n_moe_layers, -1);
             const bool pool_on = params.moe_stream_vram_experts > 0 || params.moe_stream_vram_free > 0;
             for (const auto & dv : devices) {
                 const auto t = ggml_backend_dev_type(dv.dev);
@@ -2604,7 +2620,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                             w.ctx += llama_moe_stream_layer_ctx_bytes(hparams, arch, (uint32_t) il, params);
                         }
                     }
-                    if (whole_dev_flag[il] != nullptr ? whole_dev_flag[il] == dv.dev : here) {
+                    if (il < n_moe_layers && (whole_dev_flag[il] != nullptr ? whole_dev_flag[il] == dv.dev : here)) {
                         wl_dev_of[il] = (int32_t) wl_devs.size();
                         has_layer = true;
                     }
@@ -2752,8 +2768,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.read_ahead_min      = params.moe_stream_read_ahead_min > 0 ? params.moe_stream_read_ahead_min : 4096;
         p1.window              = params.moe_stream_window == 1;
         p1.window_keep         = params.moe_stream_window_keep > 0.0f ? std::min(1.0f, params.moe_stream_window_keep) : 1.0f;
+        const bool is_looped_moe = hparams.ink2_loop_passes > 1;
         p1.prompt_defer        = params.moe_stream_prompt_defer == 1;
-        p1.prompt_split        = params.moe_stream_prompt_split == 1;
+        p1.prompt_split        = !is_looped_moe && params.moe_stream_prompt_split == 1;
         p1.prompt_split_places = params.moe_stream_prompt_split_places >= 2 ? params.moe_stream_prompt_split_places : 128;
         p1.tail_wave_w         = params.moe_stream_tail_wave_w > 0 ? params.moe_stream_tail_wave_w : 0;
         const bool pf_fast     = params.moe_stream_prefill_fast == 1;
@@ -2773,7 +2790,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.plan_bind_early     = params.moe_stream_plan_bind_early == 1; // test only
         p1.drop_stale          = params.moe_stream_drop_stale == 1;
         p1.read_threshold_set  = params.moe_stream_read_threshold > 0.0f; // the engine's plan-1 guard
-        p1.needed_early        = params.moe_stream_needed_early == 1;
+        p1.needed_early        = !is_looped_moe && params.moe_stream_needed_early == 1;
         p1.behind_backlog      = params.moe_stream_behind_backlog;
         p1.behind_rank         = params.moe_stream_behind_rank;
         p1.guess_inflight      = params.moe_stream_guess_inflight;
@@ -2784,7 +2801,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.plan_extra_near     = params.moe_stream_plan_extra_near == 1;
         p1.guess_combined      = params.moe_stream_guess_combined == 1;
         p1.protect_named       = params.moe_stream_protect_named == 1;
-        p1.wordstart           = params.moe_stream_wordstart;
+        p1.wordstart           = is_looped_moe ? 0 : params.moe_stream_wordstart;
         p1.proj_ready          = params.moe_stream_proj_ready == 1;
         p1.vram_follow          = params.moe_stream_vram_follow == 1;
         p1.vram_follow_tick     = (uint32_t) params.moe_stream_vram_follow_tick;
@@ -2795,8 +2812,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.vram_follow_margin   = (uint32_t) params.moe_stream_vram_follow_margin;
         p1.vram_follow_fixed    = params.moe_stream_vram_follow_fixed == 1;
         p1.vram_follow_pinned   = params.moe_stream_vram_follow_pinned == 1;
-        p1.vram_parallel        = params.moe_stream_vram_parallel >= 1;
-        p1.vram_parallel_cross  = params.moe_stream_vram_parallel == 2;
+        p1.vram_parallel        = !is_looped_moe && params.moe_stream_vram_parallel >= 1;
+        p1.vram_parallel_cross  = !is_looped_moe && params.moe_stream_vram_parallel == 2;
         p1.vram_copyback        = params.moe_stream_vram_copyback == 1;
         p1.async_h2d            = params.moe_stream_async_h2d == 1;
         p1.vram_chunk           = std::max<int64_t>(0, params.moe_stream_vram_chunk);
@@ -2826,10 +2843,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.shares               = params.moe_stream_shares == 1;
         p1.share_file           = params.moe_stream_share_file ? params.moe_stream_share_file : "";
         p1.share_opts           = params.moe_stream_share_opts ? params.moe_stream_share_opts : "";
-        p1.layer_major          = params.moe_stream_layer_major == 1;
+        p1.layer_major          = !is_looped_moe && params.moe_stream_layer_major == 1;
         p1.layer_major_batch    = params.moe_stream_layer_major_batch > 0 ? (uint32_t) params.moe_stream_layer_major_batch : 0;
         p1.vram_end_fill        = std::max(0, std::min(2, params.moe_stream_vram_end_fill));
-        p1.copy_ahead           = params.moe_stream_copy_ahead;   // copy-ahead for GPU prompts (0 / 1 / 2)
+        p1.copy_ahead           = is_looped_moe ? 0 : params.moe_stream_copy_ahead;   // copy-ahead for GPU prompts (0 / 1 / 2)
         p1.vram_lend_prompt     = params.moe_stream_vram_lend_prompt != 0;
         p1.vram_lend_short      = std::max(1, params.moe_stream_vram_lend_short);
         if ((params.moe_stream_auto_mask & 1u) != 0 && ms_pool_dev == nullptr) {
@@ -2876,7 +2893,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 params.moe_stream_oracle_lead >= 0 ? (uint32_t) params.moe_stream_oracle_lead : 1,
                 params.moe_stream_chunk > 0 ? (uint32_t) params.moe_stream_chunk : 0,
                 params.moe_stream_chunk_prefetch > 0 ? (uint32_t) params.moe_stream_chunk_prefetch : 0,
-                params.moe_stream_gpu_waves > 0 ? (uint32_t) params.moe_stream_gpu_waves : 0,
+                (!is_looped_moe && params.moe_stream_gpu_waves > 0) ? (uint32_t) params.moe_stream_gpu_waves : 0,
                 gpu_layers_n > 0 ? (uint32_t) gpu_layers_n : 0,
                 gl_list_eff,
                 /* gpu_layers_auto = */ gpu_layers_n < 0,
@@ -2907,11 +2924,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 p1);
         {   // the GPUs of the pool and of the whole layers' experts (set before the weights are created: create_tensor reads whole_dev)
             auto & ms = *pimpl->moe_stream;
+            if (hparams.ink2_loop_end > hparams.ink2_loop_start && hparams.ink2_loop_passes > 1) {
+                ms.set_loop_range((int32_t) hparams.ink2_loop_start, (int32_t) hparams.ink2_loop_end);
+            }
             ms.pool_dev     = ms_pool_dev;
             ms.pool_dev_set = ms_pool_dev_set;
-            ms.whole_dev.assign(n_layer_all, nullptr);
+            ms.whole_dev.assign(n_moe_layers, nullptr);
             for (const int32_t il : ms.gpu_layers) {
-                if (il >= 0 && il < n_layer_all) {
+                if (il >= 0 && il < n_moe_layers) {
                     ms.whole_dev[il] = whole_dev_flag[il] != nullptr ? whole_dev_flag[il] : pimpl->dev_layer[il].dev;
                 }
             }
@@ -3400,7 +3420,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         __func__, said.empty() ? "none" : said.c_str());
             }
             pimpl->moe_stream->router_dev_all = router_dev;
-            if (params.moe_stream_needed_early == 1) {
+            if (hparams.ink2_loop_passes <= 1 && params.moe_stream_needed_early == 1) {
                 pimpl->moe_stream->ne_set_router_gpu(router_gpu);
                 pimpl->moe_stream->ne_gpu_setup(router_dev);   // the GPU producers, or the host producer stays
             }
@@ -4066,6 +4086,12 @@ bool llama_moe_stream_get_plan(
         LLAMA_LOG_ERROR("%s: '%s' is not a model with blocks and routed experts\n", __func__, model_path);
         return false;
     }
+    {
+        uint32_t phys_blocks = 0;
+        if (moe_stream_kv_u32(ctx.get(), kv(LLM_KV_INK2_PHYS_BLOCK_COUNT), phys_blocks) && phys_blocks > 0) {
+            mi.n_layer_all = phys_blocks;
+        }
+    }
 
     moe_stream_kv_u32(ctx.get(), kv(LLM_KV_NEXTN_PREDICT_LAYERS),     mi.n_layer_nextn);
     moe_stream_kv_u32(ctx.get(), kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT), mi.n_layer_dense);
@@ -4621,7 +4647,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // a null filter_idx means the GGUF has no indexer tensors
                     llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
                     const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
-                    if (arch == LLM_ARCH_FALCON_H1) {
+                    if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2) {
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
@@ -4657,13 +4683,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                        const ggml_type eff_tk = (arch == LLM_ARCH_INKLING2 && params.type_k == GGML_TYPE_F16) ? GGML_TYPE_BF16 : params.type_k;
+                        const ggml_type eff_tv = (arch == LLM_ARCH_INKLING2 && params.type_v == GGML_TYPE_F16) ? GGML_TYPE_BF16 : params.type_v;
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
                             /* model             */ *this,
                             /* no_alloc          */ params.no_alloc,
-                            /* attn_type_k       */ params.type_k,
-                            /* attn_type_v       */ params.type_v,
-                            /* attn_v_trans      */ !cparams.flash_attn,
+                            /* attn_type_k       */ eff_tk,
+                            /* attn_type_v       */ eff_tv,
+                            /* attn_v_trans      */ (arch == LLM_ARCH_INKLING2 ? false : !cparams.flash_attn),
                             /* attn_swa_full     */ params.swa_full,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
                             /* attn_n_ubatch     */ cparams.n_ubatch,
@@ -5164,6 +5192,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_NEMOTRON_H_MOE:
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_INKLING2:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values

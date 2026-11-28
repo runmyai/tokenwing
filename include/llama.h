@@ -2392,6 +2392,20 @@ extern "C" {
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
 
+    // Inkling-2-Mini embedded MTP-8 (`DSpark`) speculative drafting & CUDA fast-engine hooks:
+    LLAMA_API bool    llama_model_has_inkling2_mtp(const struct llama_model * model);
+    LLAMA_API int32_t llama_inkling2_mtp_draft(
+            struct llama_context * lctx,
+            int32_t                pos0,
+            llama_token            anchor_tok,
+            int32_t                k_draft,
+            llama_token          * out_draft_toks);
+    LLAMA_API void *  llama_inkling2_get_cuda_handle(
+            const struct llama_model * model,
+            int32_t                    b_max,
+            int32_t                    max_seq,
+            bool                       want_full_vram_moe);
+
 #ifdef __cplusplus
 }
 #endif

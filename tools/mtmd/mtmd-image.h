@@ -256,3 +256,9 @@ struct mtmd_image_preprocessor_muse_glimmer : mtmd_image_preprocessor {
     mtmd_image_preprocessor_muse_glimmer(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
 };
+
+// Inkling-2-Mini 40x40 right/bottom `-1.0f`-padded tile grid preprocessor
+struct mtmd_image_preprocessor_inkling2 : mtmd_image_preprocessor {
+    mtmd_image_preprocessor_inkling2(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+};

@@ -1037,6 +1037,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             {
                 builder = std::make_unique<clip_graph_muse_glimmer>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_INKLING2:
+            {
+                builder = std::make_unique<clip_graph_inkling2>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_STEP3VL:
             {
                 builder = std::make_unique<clip_graph_step3vl>(ctx, img);
@@ -1750,6 +1754,21 @@ struct clip_model_loader {
                         get_u32(KEY_SPATIAL_MERGE_SIZE,  hparams.n_merge,             false);
                         hparams.set_limit_image_tokens(1, 4096);
                         hparams.set_warmup_n_tokens(32*32);
+                    } break;
+                case PROJECTOR_TYPE_INKLING2:
+                    {
+                        hparams.n_merge = 2;
+                        hparams.ffn_op  = FFN_GELU_ERF;
+                        log_ffn_op      = "gelu_erf";
+                        hparams.rope_theta = 10000.0f;
+                        get_u32(KEY_SPATIAL_MERGE_SIZE,   hparams.n_merge,              false);
+                        get_u32(KEY_VISION_N_MERGE,       hparams.n_merge,              false);
+                        get_u32(KEY_INKLING2_POSEMB_GRID, hparams.inkling2_posemb_grid, false);
+                        get_u32(KEY_INKLING2_TILE_SIZE,   hparams.inkling2_tile_size,   false);
+                        get_f32(KEY_INKLING2_ROPE_THETA,  hparams.rope_theta,           false);
+                        GGML_ASSERT(hparams.n_merge == 2);
+                        hparams.set_limit_image_tokens(1, 4096);
+                        hparams.set_warmup_n_tokens(7 * 7);
                     } break;
                 case PROJECTOR_TYPE_MIMOVL:
                     {
@@ -2577,6 +2596,14 @@ struct clip_model_loader {
                     model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
                     model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"));
                     model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
+                } break;
+            case PROJECTOR_TYPE_INKLING2:
+                {
+                    model.cls_pos_embedding = get_tensor(TN_CLS_POS_EMBD);
+                    model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
+                    model.mm_0_b = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"), false);
+                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
+                    model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"), false);
                 } break;
             case PROJECTOR_TYPE_STEP3VL:
                 {
@@ -4246,6 +4273,7 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
                 n_patches = x_patch * y_patch;
             } break;
         case PROJECTOR_TYPE_STEP3VL:
+        case PROJECTOR_TYPE_INKLING2:
             {
                 int x_patch = img->nx() / (params.patch_size * params.n_merge);
                 int y_patch = img->ny() / (params.patch_size * params.n_merge);
@@ -5847,6 +5875,77 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                     }
                 }
             } break;
+        case PROJECTOR_TYPE_INKLING2:
+            {
+                const int merge  = hparams.n_merge; // 2
+                const int grid_w = pos_w;           // image_size_width  / patch_size
+                const int grid_h = pos_h;           // image_size_height / patch_size
+                const int rows   = grid_h / merge;
+                const int cols   = grid_w / merge;
+                const int n_tok  = grid_h * grid_w;
+                const int side   = hparams.inkling2_posemb_grid > 0
+                    ? hparams.inkling2_posemb_grid
+                    : (int) std::lround(std::sqrt((double) model.position_embeddings->ne[1]));
+
+                std::vector<int32_t> pos_idx0(n_tok), pos_idx1(n_tok), pos_idx2(n_tok), pos_idx3(n_tok);
+                std::vector<float>   pos_w0(n_tok),   pos_w1(n_tok),   pos_w2(n_tok),   pos_w3(n_tok);
+                std::vector<int32_t> rope_w(1 + n_tok, 0);
+                std::vector<int32_t> rope_h(1 + n_tok, 0);
+
+                auto axis_taps = [&](int idx, int size, int & t0, int & t1, float & w0, float & w1) {
+                    const float src = ((float) idx + 0.5f) * (float) side / (float) size - 0.5f;
+                    const float fl  = std::floor(src);
+                    const int   ifl = (int) fl;
+                    t0 = std::max(0, std::min(side - 1, ifl));
+                    t1 = std::max(0, std::min(side - 1, ifl + 1));
+                    w0 = std::max(0.0f, 1.0f - std::fabs(src - fl));
+                    w1 = std::max(0.0f, 1.0f - std::fabs(src - fl - 1.0f));
+                };
+
+                int p = 0;
+                for (int ty = 0; ty < rows; ++ty) {
+                    for (int tx = 0; tx < cols; ++tx) {
+                        for (int mh = 0; mh < merge; ++mh) {
+                            for (int mw = 0; mw < merge; ++mw) {
+                                const int r = ty * merge + mh;
+                                const int c = tx * merge + mw;
+                                int ht0, ht1, wt0, wt1;
+                                float hw0, hw1, ww0, ww1;
+                                axis_taps(r, grid_h, ht0, ht1, hw0, hw1);
+                                axis_taps(c, grid_w, wt0, wt1, ww0, ww1);
+
+                                pos_idx0[p] = ht0 * side + wt0;
+                                pos_idx1[p] = ht0 * side + wt1;
+                                pos_idx2[p] = ht1 * side + wt0;
+                                pos_idx3[p] = ht1 * side + wt1;
+
+                                pos_w0[p] = hw0 * ww0;
+                                pos_w1[p] = hw0 * ww1;
+                                pos_w2[p] = hw1 * ww0;
+                                pos_w3[p] = hw1 * ww1;
+
+                                rope_w[1 + p] = c + 1;
+                                rope_h[1 + p] = r + 1;
+                                ++p;
+                            }
+                        }
+                    }
+                }
+                GGML_ASSERT(p == n_tok);
+
+                set_input_i32("ink2_pos_idx0", pos_idx0);
+                set_input_i32("ink2_pos_idx1", pos_idx1);
+                set_input_i32("ink2_pos_idx2", pos_idx2);
+                set_input_i32("ink2_pos_idx3", pos_idx3);
+
+                set_input_f32("ink2_pos_w0", pos_w0);
+                set_input_f32("ink2_pos_w1", pos_w1);
+                set_input_f32("ink2_pos_w2", pos_w2);
+                set_input_f32("ink2_pos_w3", pos_w3);
+
+                set_input_i32("ink2_rope_w", rope_w);
+                set_input_i32("ink2_rope_h", rope_h);
+            } break;
         default:
             GGML_ABORT("Unknown projector type");
     }
@@ -6048,6 +6147,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_MINIMAX_M3:
             return ctx->model.mm_merger_fc2_b->ne[0];
         case PROJECTOR_TYPE_MUSE_GLIMMER:
+        case PROJECTOR_TYPE_INKLING2:
             return ctx->model.mm_2_w->ne[1];
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:

@@ -1749,3 +1749,71 @@ mtmd_image_preproc_out mtmd_image_preprocessor_muse_glimmer::preprocess(const cl
     output.append(hparams, resized_image, true);
     return output;
 }
+
+mtmd_image_preproc_out mtmd_image_preprocessor_inkling2::preprocess(const clip_image_u8 & img) const {
+    const int tile = hparams.inkling2_tile_size > 0
+        ? hparams.inkling2_tile_size
+        : (hparams.patch_size * hparams.n_merge);
+    GGML_ASSERT(tile > 0);
+
+    clip_image_u8 work;
+    const clip_image_size orig = img.get_size();
+    const int max_side = 4096;
+    if (std::max(orig.width, orig.height) > max_side) {
+        const float scale = (float) max_side / (float) std::max(orig.width, orig.height);
+        const int nw = std::max(1, (int) std::lround(orig.width  * scale));
+        const int nh = std::max(1, (int) std::lround(orig.height * scale));
+        img_tool::resize(img, work, { nw, nh }, RESIZE_ALGO_BICUBIC, PAD_NONE);
+    } else {
+        work = img;
+    }
+
+    const clip_image_size sz = work.get_size();
+    const int w = sz.width;
+    const int h = sz.height;
+    const int cols  = std::max(1, (w + tile - 1) / tile);
+    const int rows  = std::max(1, (h + tile - 1) / tile);
+    const int w_pad = cols * tile;
+    const int h_pad = rows * tile;
+
+    clip_image_f32 dst;
+    dst.set_size({ w_pad, h_pad }, work.is_placeholder(), false);
+    if (!work.is_placeholder()) {
+        std::vector<float> buf((size_t) w_pad * (size_t) h_pad * 3);
+        const float mean255[3] = {
+            hparams.image_mean[0] * 255.0f,
+            hparams.image_mean[1] * 255.0f,
+            hparams.image_mean[2] * 255.0f,
+        };
+        const float inv_std255[3] = {
+            1.0f / (hparams.image_std[0] * 255.0f),
+            1.0f / (hparams.image_std[1] * 255.0f),
+            1.0f / (hparams.image_std[2] * 255.0f),
+        };
+        const float pad_val[3] = {
+            (-1.0f - mean255[0]) * inv_std255[0],
+            (-1.0f - mean255[1]) * inv_std255[1],
+            (-1.0f - mean255[2]) * inv_std255[2],
+        };
+        for (int y = 0; y < h_pad; ++y) {
+            for (int x = 0; x < w_pad; ++x) {
+                const size_t base = ((size_t) y * (size_t) w_pad + (size_t) x) * 3;
+                if (y < h && x < w) {
+                    const auto px = work.get_pixel(x, y);
+                    buf[base + 0] = ((float) px[0] - mean255[0]) * inv_std255[0];
+                    buf[base + 1] = ((float) px[1] - mean255[1]) * inv_std255[1];
+                    buf[base + 2] = ((float) px[2] - mean255[2]) * inv_std255[2];
+                } else {
+                    buf[base + 0] = pad_val[0];
+                    buf[base + 1] = pad_val[1];
+                    buf[base + 2] = pad_val[2];
+                }
+            }
+        }
+        dst.cpy_buf(buf);
+    }
+
+    mtmd_image_preproc_out output;
+    output.append(hparams, dst, /* normalized = */ false);
+    return output;
+}

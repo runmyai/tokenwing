@@ -63,6 +63,11 @@
 #define KEY_PROJ_SAMPLE_WINDOW_SIDE "clip.vision.projector.window_side"
 #define KEY_PROJ_SPATIAL_OFFSETS    "clip.vision.projector.spatial_offsets"
 #define KEY_SPATIAL_MERGE_SIZE      "clip.vision.spatial_merge_size"
+#define KEY_VISION_N_MERGE          "clip.vision.n_merge"
+#define KEY_INKLING2_POSEMB_GRID    "clip.vision.inkling2.posemb_grid_size"
+#define KEY_INKLING2_PROJ_HIDDEN    "clip.vision.inkling2.projection_hidden_dim"
+#define KEY_INKLING2_TILE_SIZE      "clip.vision.inkling2.tile_size"
+#define KEY_INKLING2_ROPE_THETA     "clip.vision.inkling2.rope_theta"
 
 #define KEY_MM_PATCH_MERGE_TYPE    "clip.vision.mm_patch_merge_type"
 #define KEY_IMAGE_GRID_PINPOINTS   "clip.vision.image_grid_pinpoints"
@@ -104,6 +109,7 @@
 
 #define TN_POS_EMBD        "%s.position_embd.weight"
 #define TN_CLASS_EMBD      "v.class_embd"
+#define TN_CLS_POS_EMBD    "v.cls_pos_embd"
 #define TN_PATCH_EMBD      "v.patch_embd.weight"  // not rename tensor with ".0" postfix for backward compat
 #define TN_PATCH_EMBD_1    "v.patch_embd.weight.1"
 #define TN_PATCH_BIAS      "v.patch_embd.bias"
@@ -505,6 +511,7 @@ enum projector_type {
     PROJECTOR_TYPE_POCKETTTS_SPKENC,
     PROJECTOR_TYPE_POCKETTTS_GEN,
     PROJECTOR_TYPE_MUSE_GLIMMER,
+    PROJECTOR_TYPE_INKLING2,
     PROJECTOR_TYPE_UNKNOWN,
 };
 
@@ -571,6 +578,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_POCKETTTS_SPKENC,  "pockettts_spkenc"},
     { PROJECTOR_TYPE_POCKETTTS_GEN,     "pockettts_gen"},
     { PROJECTOR_TYPE_MUSE_GLIMMER,      "muse-glimmer"},
+    { PROJECTOR_TYPE_INKLING2,          "inkling2"},
 };
 
 static projector_type clip_projector_type_from_string(const std::string & str) {

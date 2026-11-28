@@ -983,6 +983,7 @@ struct llama_moe_stream_wave {
     // Which target an early-guess op aims at - 2 = pred_il2 (the layer two ahead),
     // 3 = pred_il3 (three ahead). The chain's later steps come from remap() as they always did.
     int32_t tlead = 2;
+    int32_t pred_il_override = -2;             // >= -1 overrides sl->pred_il for looped-core wrap visits (e.g. Inkling-2 L17 -> L06)
     const ggml_tensor * tail_gate = nullptr;   // the tail tensor this wave's gate matmul reads in the graph built last (copy-ahead check)
 };
 
@@ -1067,6 +1068,22 @@ struct llama_moe_stream {
     // buffer (llama_model, once the weights are placed). A streamed layer posts its guess to the helper only if its target's
     // router is: the guess is that router's matmul, and it then runs in a GPU split. Prints which layers post.
     void ne_set_router_gpu(const std::vector<uint8_t> & router_gpu);
+    int32_t loop_beg = -1, loop_end = -1;
+    int32_t cur_pred_il_override = -2;
+    int32_t cur_loop_pass        = 0;
+    std::array<llama_moe_stream_wave, 128> loop_wrap_wave_ctx {};
+    void set_loop_range(int32_t beg, int32_t end) { loop_beg = beg; loop_end = end; }
+    llama_moe_stream_wave * wave_ctx_loop_wrap(int32_t il, int32_t w, int32_t next_il, int32_t pass_idx = 0) {
+        if (il < 0 || (size_t) il >= layers.size() || !layers[il]) {
+            return nullptr;
+        }
+        const size_t idx = (((size_t) (pass_idx & 3) * 32u) + (size_t) (w & 31)) & 127u;
+        llama_moe_stream_wave & c = loop_wrap_wave_ctx[idx];
+        c.sl = layers[il].get();
+        c.w = w;
+        c.pred_il_override = (next_il >= 0 && (size_t) next_il < layers.size() && layers[next_il]) ? next_il : -1;
+        return &c;
+    }
 
     // the streaming state of one layer, null when the layer is not streamed
     llama_moe_stream_layer * layer(int32_t il) const {

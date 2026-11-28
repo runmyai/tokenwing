@@ -3248,6 +3248,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 a   = ggml_clamp(ctx0, a, -INFINITY, limit);
                 act = ggml_mul(ctx0, a, u);
             }
+        } else if (type_op == LLM_FFN_SITU) {
+            const float beta = hparams.situ_beta;
+            const float lb   = hparams.situ_linear_beta;
+            g = ggml_cont(ctx0, g);
+            u = ggml_cont(ctx0, u);
+            ggml_tensor * gs = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, g, 1.0f / beta)), beta);
+            gs = ggml_mul(ctx0, gs, ggml_sigmoid(ctx0, g));
+            if (lb > 0.0f) {
+                u = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, u, 1.0f / lb)), lb);
+            }
+            act = ggml_mul(ctx0, gs, u);
         } else {
             act = ggml_swiglu_split(ctx0, g, u);
         }
@@ -3506,7 +3517,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 }
             };
 
-            if (mstream->prefetch_on() && msl->pred_il >= 0 && gate_inp_next) {
+            const int32_t eff_pred_il = (mstream->cur_pred_il_override >= -1) ? mstream->cur_pred_il_override : msl->pred_il;
+            if (mstream->prefetch_on() && eff_pred_il >= 0 && gate_inp_next) {
                 // name_tag "pred": these tensors carry the *predicted* ids of the next layer, and
                 // a trace tool that keys on the name must not record them as that layer's real ones
                 ggml_tensor * pred_logits = nullptr;   // the next layer selects on its logits, too
@@ -3519,7 +3531,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 ggml_tensor * pred_probs = nullptr;
                 if (sep_on) {
                     pred_probs = build_moe_probs(pred_cur, gate_inp_next, /* gate_inp_b = */ nullptr,
-                            /* logits_in = */ nullptr, gating_op, msl->pred_il, &pred_logits,
+                            /* logits_in = */ nullptr, gating_op, eff_pred_il, &pred_logits,
                             /* name_tag = */ "pred");
                     sep_lg[1] = pred_logits;
                     sep_pr[1] = pred_probs;
@@ -3543,7 +3555,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                         ? mstream->prefetch_m2 : mstream->guess_width(n_tokens);
                 if (sep_on) {
                     pred = ggml_cont(ctx0, build_moe_topk(sep_pr[1], sep_lg[1], exp_probs_b_next,
-                                n_expert, width, msl->pred_il, /* name_tag = */ "pred"));
+                                n_expert, width, eff_pred_il, /* name_tag = */ "pred"));
                     sep_id[1] = pred;
                     if (chance16) {
                         pred_p = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, pred_probs, 1, n_expert, n_tokens), pred);   // [1, 16, 1]
@@ -3570,7 +3582,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 // (only in the graph of a one-token decode call with the GPU producer; graph reuse keys on it, llama-context)
                 // (on the FINAL guess tensor - the 1-ahead top-k, plus the far columns or the combined step's ids -
                 // of N columns x the slot's width; only a layer whose targets' routers are all on the producer's GPU)
-                if (mstream->ne_gpu_graph() && n_tokens == 1 && msl->ne_post_on && msl->ne_gpu_ok && !chance16 &&
+                if (mstream->cur_pred_il_override < -1 &&
+                        mstream->ne_gpu_graph() && n_tokens == 1 && msl->ne_post_on && msl->ne_gpu_ok && !chance16 &&
                         !(mstream->prefetch_lead >= 2) &&
                         (int64_t) mstream->ne_width*mstream->la_cols_of(il) == ggml_nelements(pred) &&
                         pred->type == GGML_TYPE_I32 && ggml_is_contiguous(pred)) {   // what the producer copies
@@ -3841,7 +3854,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 // twice). The join stays where it was: ffn_moe_out = the host's weighted sum + this pass's sum, after the CPU split.
                 if (mstream->vp_in_launch(il) && mstream->vram_serves(il)) {
                     const bool vx_ok = !weight_before_ffn && !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps &&
-                                       gate_exps && up_exps && type_op == LLM_FFN_SILU && !up_exps_s && !gate_exps_s &&
+                                       gate_exps && up_exps && (type_op == LLM_FFN_SILU || type_op == LLM_FFN_SITU) && !up_exps_s && !gate_exps_s &&
                                        !down_exps_s && !gate_up_exps_b;
                     if (!vx_ok) {
                         GGML_ABORT("--moe-stream-vram-parallel: layer %d's MoE has no device pass (see --moe-stream-vram-experts)", il);
@@ -3880,7 +3893,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 ggml_build_forward_expand(gf, ids_cont);
                 weights_expanded = true;   // (a source of the mark: computed before it)
                 const bool vx_ok = !weight_before_ffn && !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps &&
-                                   gate_exps && up_exps && type_op == LLM_FFN_SILU && !up_exps_s && !gate_exps_s &&
+                                   gate_exps && up_exps && (type_op == LLM_FFN_SILU || type_op == LLM_FFN_SITU) && !up_exps_s && !gate_exps_s &&
                                    !down_exps_s && !gate_up_exps_b;
                 if (!vx_ok) {
                     GGML_ABORT("--moe-stream-prompt-split: layer %d's MoE has no device pass (see --moe-stream-vram-experts)", il);
@@ -4017,7 +4030,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             };
 
             for (int w = 0; w < n_waves; w++) {
-                auto * wctx = mstream->wave_ctx_of(il, w);
+                auto * wctx = (mstream->cur_pred_il_override >= 0)
+                    ? mstream->wave_ctx_loop_wrap(il, w, mstream->cur_pred_il_override, mstream->cur_loop_pass)
+                    : mstream->wave_ctx_of(il, w);
 
                 wctx->pred8 = pred_tr;   // read by the remap op of this layer, scored by the next
 
@@ -4052,7 +4067,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 // the device chain joins the CUDA region that already runs this layer's weighting, aggregation and shared
                 // expert - expanded on its own it costs a graph split per layer). The chain is expanded after the waves.
                 if (w == 0 && mstream->vram_serves(il) && vram_out_early == nullptr) {
-                    const bool vx_ok = can_wave && !gate_up_exps && gate_exps && up_exps && type_op == LLM_FFN_SILU &&
+                    const bool vx_ok = can_wave && !gate_up_exps && gate_exps && up_exps && (type_op == LLM_FFN_SILU || type_op == LLM_FFN_SITU) &&
                                        !up_exps_s && !gate_exps_s && !down_exps_s && !gate_up_exps_b;
                     if (!vx_ok) {
                         GGML_ABORT("--moe-stream-vram-experts: layer %d's MoE (merged gate_up %d, gate %d, op %d, scales %d/%d/%d, "
@@ -4135,7 +4150,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 }
 
 // input embeddings with optional lora
-ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale) const {
+ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale, ggml_tensor * tok_norm) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
     const int64_t n_embd     = hparams.n_embd;
 
@@ -4214,6 +4229,10 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
 
         if (n_embd_inp != n_embd) {
             cur = ggml_pad(ctx0, cur, hparams.n_embd_inp() - n_embd, 0, 0, 0);
+        }
+
+        if (tok_norm != nullptr) {
+            cur = build_norm(cur, tok_norm, nullptr, LLM_NORM_RMS, -1);
         }
 
         return cur;

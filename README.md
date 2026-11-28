@@ -15,6 +15,65 @@
 
 TokenWing is the engine inside [Run My AI](https://github.com/runmyai/run-my-ai). It streams the routed experts of MoE models from NVMe, so models far larger than your memory run at a usable speed. It is built on [llama.cpp](https://github.com/ggml-org/llama.cpp).
 
+## How it works
+
+You download a 50 GB game, yet while you play it uses maybe 8 GB of RAM and 4 GB of VRAM. The engine never holds the whole world in memory: it streams in what's about to appear and evicts what you've left behind.
+
+A Mixture-of-Experts model works the same way: for each token only a few of its experts are needed, so only those are read. TokenWing predicts the experts of the next layers and reads them from the SSD into a RAM cache while the current layer computes, so compute rarely waits on the disk. Memory size stops being the limit. It doesn't raise your memory bandwidth, though: your CPU and GPU still read every expert from RAM or VRAM.
+
+[Inside TokenWing](docs/how-it-works.md) covers the whole pipeline.
+
+## Models
+
+| Model | What it is | File |
+|---|---|---|
+| [Flint 40B](https://huggingface.co/runmyai/Flint-40B-TokenWing) | Coding model by Recursive. 40B total, about 2.5B active per token. | Q4_K_XL, about 25 GB |
+| [Ling 3.0 Flash](https://huggingface.co/runmyai/Ling-3.0-Flash-TokenWing) | 124B total, 5.1B active per token, 262k context, by Ant Group | MXFP4, about 70 GB |
+| [Qwen 3.8 Flash Next](https://huggingface.co/runmyai/Qwen3.8-Flash-Next-TokenWing) | 180B total, 6B active per token. 262k context, by Alibaba | 3.5 bpw by Grawnch, about 84 GB with its n-gram table |
+
+## What you need
+
+| | |
+|---|---|
+| **SSD** | NVMe, PCIe 3.0 or above. |
+| **Memory** | 16 GB of RAM runs all three models, CPU only. More RAM and a GPU make them faster. |
+| **GPU** | NVIDIA or AMD, one or several, or CPU only. |
+| **System** | Windows or Linux. macOS on Apple Silicon is coming soon. |
+
+## Get started
+
+1. Download the zip for your machine from [Releases](https://github.com/runmyai/tokenwing/releases).
+2. Download a model from the list above.
+3. Run `autotuner --file <model>`. It prints one JSON line. Start `llama-server -m <model> -c 32768` followed by the flags in its `"recommended_args"`, then open http://localhost:8080 for the chat page, or use the API.
+
+`llama-server` serves an OpenAI-compatible API, so any tool that can use one works with it:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Why is the sky blue?"}]}'
+```
+
+The full commands for each model are in [Getting started](docs/getting-started.md).
+
+## Features
+
+| What you get | Flag |
+|---|---|
+| Experts streamed from the SSD into a RAM cache, the next layers' experts predicted and read ahead | `--moe-stream model` |
+| An autotuner that measures your PC and prints the flags for it | `autotuner --file MODEL` |
+| Elastic RAM: uses free RAM for the expert cache and gives it back when other programs need it | `--moe-stream-elastic 1` |
+| The hottest experts kept in VRAM, the set following what the text uses | `--moe-stream-vram-free`, `--moe-stream-vram-follow` |
+| Whole MoE layers kept on the GPU | `--moe-stream-gpu-layers` |
+| Long prompts run layer by layer, so each expert is read about once per prompt | on with `--moe-stream model` |
+| Several GPUs in one PC | `--moe-stream-vram-device`, `--moe-stream-gpu-layers-device` |
+| Chat states saved on disk, so an old chat continues without re-reading its prompt | `--cache-disk` |
+| An OpenAI-compatible server with a built-in web chat page | `llama-server` |
+
+Every size is computed at startup from what the machine has free. For lack of RAM or VRAM, TokenWing falls back to a slower path and prints one line saying what it did. It stops hard only for wrong data, such as a model file that fails its checksums.
+
+The full list, with what each flag measured, is in [Settings](docs/settings.md).
+
 ## Speed
 
 Reply speed in tokens per second, TokenWing against plain llama.cpp on the same machine. Measured on an earlier build.
@@ -39,69 +98,10 @@ Qwen 3.8 Flash Next (84 GB) on a laptop with an RTX 5070 Ti Laptop 12 GB and 32 
 | Replies | 32.1 | 3.15 |
 | A 10,000-token prompt | 259 | about 10 |
 
-## How it works
-
-You download a 50 GB game, yet while you play it uses maybe 8 GB of RAM and 4 GB of VRAM. The engine never holds the whole world in memory: it streams in what's about to appear and evicts what you've left behind.
-
-A Mixture-of-Experts model works the same way: for each token only a few of its experts are needed, so only those are read. TokenWing predicts the experts of the next layers and reads them from the SSD into a RAM cache while the current layer computes, so compute rarely waits on the disk. Memory size stops being the limit. It doesn't raise your memory bandwidth, though: your CPU and GPU still read every expert from RAM or VRAM.
-
-[Inside TokenWing](docs/how-it-works.md) covers the whole pipeline.
-
-## What you need
-
-| | |
-|---|---|
-| **SSD** | NVMe, PCIe 3.0 or above. |
-| **Memory** | 16 GB of RAM runs all three models, CPU only. More RAM and a GPU make them faster. |
-| **GPU** | NVIDIA or AMD, one or several, or CPU only. |
-| **System** | Windows or Linux. macOS on Apple Silicon is coming soon. |
-
-## Models
-
-| Model | What it is | File |
-|---|---|---|
-| [Flint 40B](https://huggingface.co/runmyai/Flint-40B-TokenWing) | Coding model by Recursive. 40B total, about 2.5B active per token. | Q4_K_XL, about 25 GB |
-| [Ling 3.0 Flash](https://huggingface.co/runmyai/Ling-3.0-Flash-TokenWing) | 124B total, 5.1B active per token, 262k context, by Ant Group | MXFP4, about 70 GB |
-| [Qwen 3.8 Flash Next](https://huggingface.co/runmyai/Qwen3.8-Flash-Next-TokenWing) | 180B total, 6B active per token. 262k context, by Alibaba | 3.5 bpw by Grawnch, about 84 GB with its n-gram table |
-
-## Features
-
-| What you get | Flag |
-|---|---|
-| Experts streamed from the SSD into a RAM cache, the next layers' experts predicted and read ahead | `--moe-stream model` |
-| An autotuner that measures your PC and prints the flags for it | `autotuner --file MODEL` |
-| Elastic RAM: uses free RAM for the expert cache and gives it back when other programs need it | `--moe-stream-elastic 1` |
-| The hottest experts kept in VRAM, the set following what the text uses | `--moe-stream-vram-free`, `--moe-stream-vram-follow` |
-| Whole MoE layers kept on the GPU | `--moe-stream-gpu-layers` |
-| Long prompts run layer by layer, so each expert is read about once per prompt | on with `--moe-stream model` |
-| Several GPUs in one PC | `--moe-stream-vram-device`, `--moe-stream-gpu-layers-device` |
-| Chat states saved on disk, so an old chat continues without re-reading its prompt | `--cache-disk` |
-| An OpenAI-compatible server with a built-in web chat page | `llama-server` |
-
-Every size is computed at startup from what the machine has free. For lack of RAM or VRAM, TokenWing falls back to a slower path and prints one line saying what it did. It stops hard only for wrong data, such as a model file that fails its checksums.
-
-The full list, with what each flag measured, is in [Settings](docs/settings.md).
-
 ## Known limits
 
 - After a very long prompt (16k tokens and more), the first reply tokens are slower while the RAM cache moves from the prompt's experts to the reply's.
 - One SSD at a time: the model file is read from a single drive, with no striping across drives.
-
-## Get started
-
-1. Download the zip for your machine from [Releases](https://github.com/runmyai/tokenwing/releases).
-2. Download a model from the list above.
-3. Run `autotuner --file <model>`. It prints one JSON line. Start `llama-server -m <model> -c 32768` followed by the flags in its `"recommended_args"`, then open http://localhost:8080 for the chat page, or use the API.
-
-`llama-server` serves an OpenAI-compatible API, so any tool that can use one works with it:
-
-```bash
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"messages": [{"role": "user", "content": "Why is the sky blue?"}]}'
-```
-
-The full commands for each model are in [Getting started](docs/getting-started.md).
 
 ## FAQ
 
@@ -117,10 +117,6 @@ Yes, with an experts file and code for its architecture. See [Adding a model](do
 **Does it send anything?**
 One anonymous record a day from `llama-server`: a random install id, the date, the engine version, the OS, CPU and GPU names, and whether it was started directly or by an app. No prompts, replies, model names, paths or user names. `--no-stats`, `TOKENWING_NO_STATS=1` or `DO_NOT_TRACK=1` turns it off. When you start `llama-server` yourself (not through the Run My AI app, which checks on its own), it also asks runmyai.org once a day for the newest release, sending only the engine version and the system (e.g. `linux-x64`); the site counts these checks. `TOKENWING_NO_UPDATE_CHECK=1` or `DO_NOT_TRACK=1` turns it off. See [Settings](docs/settings.md#usage-statistics).
 
-## Docs
-
-[Getting started](docs/getting-started.md) · [How it works](docs/how-it-works.md) · [Architecture](docs/architecture.md) · [Design decisions](docs/design-decisions.md) · [Settings](docs/settings.md) · [Hardware](docs/hardware.md) · [Building](docs/building.md) · [Testing](docs/testing.md) · [Adding a model](docs/adding-a-model.md) · [Credits](CREDITS.md)
-
 ## Build it yourself
 
 ```bash
@@ -129,6 +125,10 @@ cmake --build build -j
 ```
 
 That is the NVIDIA build. [Building](docs/building.md) covers the others.
+
+## Docs
+
+[Getting started](docs/getting-started.md) · [How it works](docs/how-it-works.md) · [Architecture](docs/architecture.md) · [Design decisions](docs/design-decisions.md) · [Settings](docs/settings.md) · [Hardware](docs/hardware.md) · [Building](docs/building.md) · [Testing](docs/testing.md) · [Adding a model](docs/adding-a-model.md) · [Credits](CREDITS.md)
 
 ## Contributing
 

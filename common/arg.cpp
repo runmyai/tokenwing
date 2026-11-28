@@ -1014,6 +1014,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             if (!has("--moe-stream-cpu-iqk"))          { params.moe_stream_cpu_iqk        = 8; }
             if (!has("--moe-stream-cpu-weighted-sum")) { params.moe_stream_cpu_wsum       = 1; }
             if (!has("--moe-stream-cpu-small-ops"))    { params.moe_stream_cpu_small_ops  = 1; }
+            if (!has("--moe-stream-cpu-state-inplace")) { params.moe_stream_cpu_state_inplace = 1; }
         }
 
         if (g_ram) {

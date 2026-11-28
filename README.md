@@ -85,6 +85,16 @@ Every size is computed at startup from what the machine has free. For lack of RA
 
 The full list, with what each flag measured, is in [Settings](docs/settings.md).
 
+## Roadmap
+
+- **More hardware.** NVIDIA Blackwell, Ada, Ampere, Turing and Pascal; AMD and Intel GPUs; CUDA, ROCm, HIP and Vulkan; and more multi-GPU setups.
+- **Speculative decoding.** The model drafts a few tokens ahead and checks them in one step, so replies come faster.
+- **Fewer wasted SSD reads.** Fewer wrong guesses among the experts that are still on the SSD, without losing the right ones. With, say, 200 of a layer's 512 experts in memory, a wrong guess for an expert already in memory costs nothing; one that has to be read from the SSD does.
+- **macOS on Apple Silicon.**
+- **Image and video input**, starting with Qwen 3.8 Flash Next.
+- **More models.** Next: Inkling 2 Mini.
+- **Several SSDs at once**, reading a model from two or more drives for more speed.
+
 ## FAQ
 
 **Does it change the model's answers?**

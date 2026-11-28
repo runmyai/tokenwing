@@ -74,11 +74,6 @@ Every size is computed at startup from what the machine has free. For lack of RA
 
 The full list, with what each flag measured, is in [Settings](docs/settings.md).
 
-## Known limits
-
-- After a very long prompt (16k tokens and more), the first reply tokens are slower while the RAM cache moves from the prompt's experts to the reply's.
-- One SSD at a time: the model file is read from a single drive, with no striping across drives.
-
 ## FAQ
 
 **Does it change the model's answers?**

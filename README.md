@@ -6,9 +6,17 @@
 
 <p align="center">
   <a href="https://github.com/runmyai/tokenwing/releases">Download</a> ·
-  <a href="https://github.com/runmyai/tokenwing">Star</a> ·
-  <a href="https://discord.gg/BfpvUFp58">Discord</a> ·
+  <a href="https://github.com/runmyai/tokenwing">⭐ Star us on GitHub</a> ·
   <a href="https://github.com/sponsors/HarinManiK">❤️ Sponsor</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/runmyai">GitHub</a> ·
+  <a href="https://discord.gg/BfpvUFp58">Discord</a> ·
+  <a href="https://www.youtube.com/@RunMyAI">YouTube</a> ·
+  <a href="https://x.com/runmyai7">X</a> ·
+  <a href="https://www.linkedin.com/company/run-my-ai">LinkedIn</a> ·
+  <a href="https://huggingface.co/runmyai">Hugging Face</a>
 </p>
 
 <p align="center"><b>Download:</b> the build for your GPU from the <a href="https://github.com/runmyai/tokenwing/releases/latest">latest release</a>, or get <a href="https://runmyai.org/download.html">Run My AI</a>, which sets it up for you.</p>
